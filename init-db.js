@@ -10,17 +10,12 @@ const pool = new Pool({
 
 async function init() {
   try {
+    // 1. Aplicar schema
     const schema = fs.readFileSync(path.join(__dirname, 'schema-v2.sql'), 'utf8');
     await pool.query(schema);
     console.log('[DB] Schema applied');
 
-    // Create admin if not exists
-    const hash = await bcrypt.hash('admin', 10);
-    await pool.query(`INSERT INTO usuarios (nombre,usuario,password,rol,aprobado,activo,lista_precio_id)
-      VALUES ('Administrador','admin',$1,'admin',true,true,1) ON CONFLICT DO NOTHING`, [hash]);
-    console.log('[DB] Admin user ready');
-
-    // Create default listas if empty
+    // 2. Crear listas de precio PRIMERO
     const { rows } = await pool.query('SELECT COUNT(*) FROM listas_precio');
     if (parseInt(rows[0].count) === 0) {
       const listas = [
@@ -36,6 +31,12 @@ async function init() {
       }
       console.log('[DB] Default listas created');
     }
+
+    // 3. Crear admin DESPUÉS de las listas
+    const hash = await bcrypt.hash('admin', 10);
+    await pool.query(`INSERT INTO usuarios (nombre,usuario,password,rol,aprobado,activo,lista_precio_id)
+      VALUES ('Administrador','admin',$1,'admin',true,true,'may_aaa') ON CONFLICT DO NOTHING`, [hash]);
+    console.log('[DB] Admin user ready');
 
     await pool.end();
     console.log('[DB] Init complete');
