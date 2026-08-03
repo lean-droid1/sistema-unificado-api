@@ -6,6 +6,7 @@ const jwt = require('jsonwebtoken');
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
+const cloudinary = require('cloudinary').v2;
 
 const app = express();
 app.use(cors());
@@ -14,11 +15,18 @@ app.use(express.json({ limit: '10mb' }));
 const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
 const SECRET = process.env.JWT_SECRET || 'su_secret_2025';
 
-// Uploads directory
+// Cloudinary config (falls back to local if not configured)
+const useCloudinary = !!(process.env.CLOUDINARY_CLOUD_NAME && process.env.CLOUDINARY_API_KEY);
+if (useCloudinary) {
+  cloudinary.config({ cloud_name: process.env.CLOUDINARY_CLOUD_NAME, api_key: process.env.CLOUDINARY_API_KEY, api_secret: process.env.CLOUDINARY_API_SECRET });
+  console.log('☁️ Cloudinary configured');
+}
+
+// Local fallback uploads directory
 const uploadsDir = path.join(__dirname, 'uploads');
 if (!fs.existsSync(uploadsDir)) fs.mkdirSync(uploadsDir, { recursive: true });
 app.use('/uploads', express.static(uploadsDir));
-const upload = multer({ storage: multer.diskStorage({ destination: uploadsDir, filename: (_, file, cb) => cb(null, Date.now() + '-' + file.originalname.replace(/\s+/g, '_')) }), limits: { fileSize: 5 * 1024 * 1024 } });
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } });
 
 // Auth middleware
 const auth = (role) => (req, res, next) => {
@@ -58,6 +66,10 @@ async function migrate() {
     `CREATE TABLE IF NOT EXISTS menu_items (id SERIAL PRIMARY KEY, titulo VARCHAR(200), url TEXT DEFAULT '', tipo VARCHAR(30) DEFAULT 'link', visible BOOLEAN DEFAULT true, orden INT DEFAULT 0, seccion_id INT)`,
     `CREATE TABLE IF NOT EXISTS design_config (id SERIAL PRIMARY KEY, clave VARCHAR(100) UNIQUE, valor TEXT DEFAULT '')`,
     `CREATE TABLE IF NOT EXISTS metodos_pago (id SERIAL PRIMARY KEY, nombre VARCHAR(200), descripcion TEXT DEFAULT '', instrucciones TEXT DEFAULT '', icono VARCHAR(50) DEFAULT '💳', seccion_id INT, activo BOOLEAN DEFAULT true, orden INT DEFAULT 0)`,
+    `CREATE TABLE IF NOT EXISTS producto_imagenes (id SERIAL PRIMARY KEY, producto_id INT REFERENCES productos(id) ON DELETE CASCADE, url TEXT NOT NULL, orden INT DEFAULT 0)`,
+    `CREATE TABLE IF NOT EXISTS variantes (id SERIAL PRIMARY KEY, producto_id INT REFERENCES productos(id) ON DELETE CASCADE, nombre VARCHAR(200) DEFAULT '', valor VARCHAR(200) DEFAULT '', stock INT DEFAULT 0, precio_extra NUMERIC(12,2) DEFAULT 0)`,
+    `CREATE INDEX IF NOT EXISTS idx_prod_img ON producto_imagenes(producto_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_variantes ON variantes(producto_id)`,
     // Columns that might be missing on existing installations
     `DO $$ BEGIN ALTER TABLE productos ADD COLUMN IF NOT EXISTS descripcion TEXT DEFAULT ''; EXCEPTION WHEN OTHERS THEN NULL; END $$`,
     `DO $$ BEGIN ALTER TABLE productos ADD COLUMN IF NOT EXISTS sku VARCHAR(100) DEFAULT ''; EXCEPTION WHEN OTHERS THEN NULL; END $$`,
@@ -214,17 +226,37 @@ app.post('/api/secciones', auth('admin'), async (req, res) => {
 });
 app.delete('/api/secciones/:id', auth('admin'), async (req, res) => { try { await pool.query('DELETE FROM secciones WHERE id=$1', [req.params.id]); res.json({ ok: true }); } catch (e) { res.status(500).json({ error: e.message }); } });
 
-// ═══ UPLOAD ═══
-app.post('/api/upload', auth('admin'), upload.single('imagen'), (req, res) => {
-  if (!req.file) return res.status(400).json({ error: 'No file' });
-  const url = `${req.protocol}://${req.get('host')}/uploads/${req.file.filename}`;
-  res.json({ url, filename: req.file.filename });
+// ═══ UPLOAD (Cloudinary first, local fallback) ═══
+const uploadToCloudinary = (buffer, folder = 'productos') => new Promise((resolve, reject) => {
+  const stream = cloudinary.uploader.upload_stream({ folder, resource_type: 'image', quality: 'auto', fetch_format: 'auto' }, (err, result) => {
+    if (err) reject(err); else resolve(result.secure_url);
+  });
+  stream.end(buffer);
 });
-// Upload for config (logo, favicon) - base64
+
+app.post('/api/upload', auth('admin'), upload.single('imagen'), async (req, res) => {
+  if (!req.file) return res.status(400).json({ error: 'No file' });
+  try {
+    if (useCloudinary) {
+      const url = await uploadToCloudinary(req.file.buffer);
+      return res.json({ url, filename: path.basename(url) });
+    }
+    // Local fallback
+    const fname = Date.now() + '-' + req.file.originalname.replace(/\s+/g, '_');
+    fs.writeFileSync(path.join(uploadsDir, fname), req.file.buffer);
+    const url = `${req.protocol}://${req.get('host')}/uploads/${fname}`;
+    res.json({ url, filename: fname });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 app.post('/api/upload-base64', auth('admin'), async (req, res) => {
   try {
     const { data, filename } = req.body;
     const buffer = Buffer.from(data.replace(/^data:image\/\w+;base64,/, ''), 'base64');
+    if (useCloudinary) {
+      const url = await uploadToCloudinary(buffer, 'config');
+      return res.json({ url });
+    }
     const fname = Date.now() + '-' + (filename || 'upload.png').replace(/\s+/g, '_');
     fs.writeFileSync(path.join(uploadsDir, fname), buffer);
     const url = `${req.protocol}://${req.get('host')}/uploads/${fname}`;
@@ -418,6 +450,8 @@ app.post('/api/pedidos', auth(), async (req, res) => {
       await pool.query('INSERT INTO pedido_items (pedido_id,producto_id,categoria,modelo,nombre_producto,cantidad,precio_unitario,precio_base) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)',
         [rows[0].id, item.producto_id, item.categoria || '', item.modelo || '', item.nombre_producto || '', item.cantidad || 1, item.precio_unitario || 0, item.precio_base || 0]);
     }
+    // Increment cupon usage on actual order creation
+    if (cupon_codigo) { await pool.query("UPDATE cupones SET usos_actuales = usos_actuales + 1 WHERE codigo=$1", [cupon_codigo]).catch(() => {}); }
     res.json(rows[0]); } catch (e) { res.status(500).json({ error: e.message }); }
 });
 app.put('/api/pedidos/:id', auth('admin'), async (req, res) => {
@@ -496,8 +530,8 @@ app.post('/api/cupones/validar', async (req, res) => {
     if (c.tipo === 'porcentaje') descuento = Math.round(subtotal * c.valor / 100);
     else if (c.tipo === 'monto_fijo') descuento = c.valor;
     else if (c.tipo === 'envio_gratis') descuento = 0; // handled in frontend
-    await pool.query('UPDATE cupones SET usos_actuales = usos_actuales + 1 WHERE id=$1', [c.id]);
-    res.json({ descuento, tipo: c.tipo, valor: c.valor, codigo: c.codigo });
+    // Don't increment usage here — increment on order creation instead
+    res.json({ descuento, tipo: c.tipo, valor: c.valor, codigo: c.codigo, cupon_id: c.id });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 app.post('/api/cupones', auth('admin'), async (req, res) => {
@@ -671,6 +705,18 @@ app.post('/api/envio/cotizar', async (req, res) => {
     res.json({ costo: cfg.costo_fijo, metodo: cfg.metodo, gratis_desde: cfg.gratis_desde });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
+
+// ═══ PRODUCTO IMAGENES ═══
+app.get('/api/producto-imagenes/:producto_id', async (req, res) => { try { const { rows } = await pool.query('SELECT * FROM producto_imagenes WHERE producto_id=$1 ORDER BY orden', [req.params.producto_id]); res.json(rows); } catch (e) { res.status(500).json({ error: e.message }); } });
+app.post('/api/producto-imagenes', auth('admin'), async (req, res) => { try { const { producto_id, url, orden } = req.body; const { rows } = await pool.query('INSERT INTO producto_imagenes (producto_id,url,orden) VALUES ($1,$2,$3) RETURNING *', [producto_id, url, orden || 0]); res.json(rows[0]); } catch (e) { res.status(500).json({ error: e.message }); } });
+app.delete('/api/producto-imagenes/:id', auth('admin'), async (req, res) => { try { await pool.query('DELETE FROM producto_imagenes WHERE id=$1', [req.params.id]); res.json({ ok: true }); } catch (e) { res.status(500).json({ error: e.message }); } });
+app.put('/api/producto-imagenes/reorder', auth('admin'), async (req, res) => { try { const { items } = req.body; for (const it of items) { await pool.query('UPDATE producto_imagenes SET orden=$1 WHERE id=$2', [it.orden, it.id]); } res.json({ ok: true }); } catch (e) { res.status(500).json({ error: e.message }); } });
+
+// ═══ VARIANTES ═══
+app.get('/api/variantes/:producto_id', async (req, res) => { try { const { rows } = await pool.query('SELECT * FROM variantes WHERE producto_id=$1 ORDER BY id', [req.params.producto_id]); res.json(rows); } catch (e) { res.status(500).json({ error: e.message }); } });
+app.post('/api/variantes', auth('admin'), async (req, res) => { try { const { producto_id, nombre, valor, stock, precio_extra } = req.body; const { rows } = await pool.query('INSERT INTO variantes (producto_id,nombre,valor,stock,precio_extra) VALUES ($1,$2,$3,$4,$5) RETURNING *', [producto_id, nombre, valor || '', stock || 0, precio_extra || 0]); res.json(rows[0]); } catch (e) { res.status(500).json({ error: e.message }); } });
+app.put('/api/variantes/:id', auth('admin'), async (req, res) => { try { const v = req.body; await pool.query('UPDATE variantes SET nombre=$1,valor=$2,stock=$3,precio_extra=$4 WHERE id=$5', [v.nombre, v.valor, v.stock || 0, v.precio_extra || 0, req.params.id]); res.json({ ok: true }); } catch (e) { res.status(500).json({ error: e.message }); } });
+app.delete('/api/variantes/:id', auth('admin'), async (req, res) => { try { await pool.query('DELETE FROM variantes WHERE id=$1', [req.params.id]); res.json({ ok: true }); } catch (e) { res.status(500).json({ error: e.message }); } });
 
 // ═══ BUSQUEDA GLOBAL ═══
 app.get('/api/busqueda-global', optionalAuth, async (req, res) => {
