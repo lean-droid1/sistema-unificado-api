@@ -141,9 +141,9 @@ app.post('/api/maintenance-mode', auth('admin'), async (req, res) => {
 // ═══ AUTH ═══
 app.post('/api/login', async (req, res) => {
   try { const { usuario, password } = req.body;
-    const { rows } = await pool.query('SELECT * FROM usuarios WHERE usuario=$1 AND activo=true', [usuario]);
+    const { rows } = await pool.query('SELECT * FROM usuarios WHERE LOWER(usuario)=LOWER($1) AND activo=true', [usuario]);
     if (!rows[0]) {
-      const { rows: pend } = await pool.query('SELECT * FROM usuarios WHERE usuario=$1 AND aprobado=false', [usuario]);
+      const { rows: pend } = await pool.query('SELECT * FROM usuarios WHERE LOWER(usuario)=LOWER($1) AND aprobado=false', [usuario]);
       if (pend[0]) return res.status(403).json({ error: 'Tu cuenta está pendiente de aprobación' });
       return res.status(401).json({ error: 'Usuario o contraseña incorrectos' });
     }
