@@ -74,10 +74,15 @@ async function migrate() {
     `DO $$ BEGIN ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS descuento_revendedor NUMERIC(5,2) DEFAULT 0; EXCEPTION WHEN OTHERS THEN NULL; END $$`,
     `DO $$ BEGIN ALTER TABLE badges ADD COLUMN IF NOT EXISTS secciones_ids TEXT DEFAULT ''; EXCEPTION WHEN OTHERS THEN NULL; END $$`,
     `DO $$ BEGIN ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS notificar_wa BOOLEAN DEFAULT true; EXCEPTION WHEN OTHERS THEN NULL; END $$`,
+    `DO $$ BEGIN ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS subtotal NUMERIC(12,2) DEFAULT 0; EXCEPTION WHEN OTHERS THEN NULL; END $$`,
+    `DO $$ BEGIN ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS descuento NUMERIC(12,2) DEFAULT 0; EXCEPTION WHEN OTHERS THEN NULL; END $$`,
+    `DO $$ BEGIN ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS cupon_codigo VARCHAR(50) DEFAULT ''; EXCEPTION WHEN OTHERS THEN NULL; END $$`,
+    `DO $$ BEGIN ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS metodo_pago VARCHAR(100) DEFAULT ''; EXCEPTION WHEN OTHERS THEN NULL; END $$`,
+    `DO $$ BEGIN ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS datos_envio TEXT DEFAULT ''; EXCEPTION WHEN OTHERS THEN NULL; END $$`,
     // Default social networks
     `INSERT INTO redes_sociales (tipo, url, activo, orden) VALUES ('facebook','',false,1),('instagram','',false,2),('tiktok','',false,3),('whatsapp_canal','',false,4),('whatsapp_grupo','',false,5) ON CONFLICT DO NOTHING`,
     // Default design config
-    `INSERT INTO design_config (clave, valor) VALUES ('nombre_tienda','Mi Tienda'),('logo_url',''),('favicon_url',''),('plantilla','moderna'),('color_primario','#2563eb'),('color_secundario','#1e40af'),('color_acento','#f59e0b'),('footer_texto',''),('css_custom','') ON CONFLICT (clave) DO NOTHING`,
+    `INSERT INTO design_config (clave, valor) VALUES ('nombre_tienda','Mi Tienda'),('logo_url',''),('favicon_url',''),('plantilla','kicks'),('color_primario','#4A69E2'),('color_secundario','#232321'),('color_acento','#FFA52F'),('fuente','Archivo'),('footer_texto',''),('css_custom','') ON CONFLICT (clave) DO NOTHING`,
     // Default badges (marketing pre-loaded)
     `INSERT INTO badges (icono, texto, visible, secciones_ids, orden) SELECT '🚚', 'Envío gratis en compras +$50.000', true, '', 1 WHERE NOT EXISTS (SELECT 1 FROM badges WHERE texto LIKE '%nvío gratis%')`,
     `INSERT INTO badges (icono, texto, visible, secciones_ids, orden) SELECT '🏪', 'Retiro por sucursal', true, '', 2 WHERE NOT EXISTS (SELECT 1 FROM badges WHERE texto LIKE '%etiro%')`,
