@@ -68,8 +68,12 @@ async function migrate() {
     `CREATE TABLE IF NOT EXISTS metodos_pago (id SERIAL PRIMARY KEY, nombre VARCHAR(200), descripcion TEXT DEFAULT '', instrucciones TEXT DEFAULT '', icono VARCHAR(50) DEFAULT '💳', seccion_id INT, activo BOOLEAN DEFAULT true, orden INT DEFAULT 0)`,
     `CREATE TABLE IF NOT EXISTS producto_imagenes (id SERIAL PRIMARY KEY, producto_id INT REFERENCES productos(id) ON DELETE CASCADE, url TEXT NOT NULL, orden INT DEFAULT 0)`,
     `CREATE TABLE IF NOT EXISTS variantes (id SERIAL PRIMARY KEY, producto_id INT REFERENCES productos(id) ON DELETE CASCADE, nombre VARCHAR(200) DEFAULT '', valor VARCHAR(200) DEFAULT '', stock INT DEFAULT 0, precio_extra NUMERIC(12,2) DEFAULT 0)`,
+    `CREATE TABLE IF NOT EXISTS slider_banners (id SERIAL PRIMARY KEY, titulo VARCHAR(300) DEFAULT '', imagen TEXT DEFAULT '', url_destino TEXT DEFAULT '', orden INT DEFAULT 0, activo BOOLEAN DEFAULT true)`,
+    `CREATE TABLE IF NOT EXISTS favoritos (id SERIAL PRIMARY KEY, usuario_id INT REFERENCES usuarios(id) ON DELETE CASCADE, producto_id INT REFERENCES productos(id) ON DELETE CASCADE, created_at TIMESTAMP DEFAULT NOW(), UNIQUE(usuario_id, producto_id))`,
+    `CREATE TABLE IF NOT EXISTS notificaciones_stock (id SERIAL PRIMARY KEY, producto_id INT REFERENCES productos(id) ON DELETE CASCADE, email VARCHAR(200), notificado BOOLEAN DEFAULT false, created_at TIMESTAMP DEFAULT NOW())`,
     `CREATE INDEX IF NOT EXISTS idx_prod_img ON producto_imagenes(producto_id)`,
     `CREATE INDEX IF NOT EXISTS idx_variantes ON variantes(producto_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_favoritos ON favoritos(usuario_id)`,
     // Columns that might be missing on existing installations
     `DO $$ BEGIN ALTER TABLE productos ADD COLUMN IF NOT EXISTS descripcion TEXT DEFAULT ''; EXCEPTION WHEN OTHERS THEN NULL; END $$`,
     `DO $$ BEGIN ALTER TABLE productos ADD COLUMN IF NOT EXISTS sku VARCHAR(100) DEFAULT ''; EXCEPTION WHEN OTHERS THEN NULL; END $$`,
@@ -94,7 +98,7 @@ async function migrate() {
     // Default social networks
     `INSERT INTO redes_sociales (tipo, url, activo, orden) VALUES ('facebook','',false,1),('instagram','',false,2),('tiktok','',false,3),('whatsapp_canal','',false,4),('whatsapp_grupo','',false,5) ON CONFLICT DO NOTHING`,
     // Default design config
-    `INSERT INTO design_config (clave, valor) VALUES ('nombre_tienda','Mi Tienda'),('logo_url',''),('favicon_url',''),('plantilla','kicks'),('color_primario','#4A69E2'),('color_secundario','#232321'),('color_acento','#FFA52F'),('fuente','Archivo'),('footer_texto',''),('css_custom','') ON CONFLICT (clave) DO NOTHING`,
+    `INSERT INTO design_config (clave, valor) VALUES ('nombre_tienda','Mi Tienda'),('logo_url',''),('favicon_url',''),('plantilla','kicks'),('color_primario','#4A69E2'),('color_secundario','#232321'),('color_acento','#FFA52F'),('fuente','Archivo'),('footer_texto',''),('css_custom',''),('hero_titulo',''),('hero_subtitulo',''),('promo_banner',''),('whatsapp_numero',''),('whatsapp_mensaje','Hola, quiero consultar sobre un producto'),('confianza_1_icono','🚚'),('confianza_1_titulo','Envío a todo el país'),('confianza_1_sub','Andreani y más'),('confianza_2_icono','🔧'),('confianza_2_titulo','Repuestos de calidad'),('confianza_2_sub','Garantía incluida'),('confianza_3_icono','💬'),('confianza_3_titulo','Atención directa'),('confianza_3_sub','WhatsApp') ON CONFLICT (clave) DO NOTHING`,
     // Default badges (marketing pre-loaded)
     `INSERT INTO badges (icono, texto, visible, secciones_ids, orden) SELECT '🚚', 'Envío gratis en compras +$50.000', true, '', 1 WHERE NOT EXISTS (SELECT 1 FROM badges WHERE texto LIKE '%nvío gratis%')`,
     `INSERT INTO badges (icono, texto, visible, secciones_ids, orden) SELECT '🏪', 'Retiro por sucursal', true, '', 2 WHERE NOT EXISTS (SELECT 1 FROM badges WHERE texto LIKE '%etiro%')`,
@@ -734,6 +738,21 @@ app.get('/api/busqueda-global', optionalAuth, async (req, res) => {
     res.json({ resultados, total: resultados.reduce((s, r) => s + r.productos.length, 0) });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
+
+// ═══ SLIDER BANNERS ═══
+app.get('/api/slider', async (req, res) => { try { const { rows } = await pool.query('SELECT * FROM slider_banners WHERE activo=true ORDER BY orden'); res.json(rows); } catch (e) { res.status(500).json({ error: e.message }); } });
+app.get('/api/slider/all', auth('admin'), async (req, res) => { try { const { rows } = await pool.query('SELECT * FROM slider_banners ORDER BY orden'); res.json(rows); } catch (e) { res.status(500).json({ error: e.message }); } });
+app.post('/api/slider', auth('admin'), async (req, res) => { try { const { titulo, imagen, url_destino, orden, activo } = req.body; const { rows } = await pool.query('INSERT INTO slider_banners (titulo,imagen,url_destino,orden,activo) VALUES ($1,$2,$3,$4,$5) RETURNING *', [titulo||'', imagen||'', url_destino||'', orden||0, activo !== false]); res.json(rows[0]); } catch (e) { res.status(500).json({ error: e.message }); } });
+app.put('/api/slider/:id', auth('admin'), async (req, res) => { try { const { titulo, imagen, url_destino, orden, activo } = req.body; await pool.query('UPDATE slider_banners SET titulo=$1,imagen=$2,url_destino=$3,orden=$4,activo=$5 WHERE id=$6', [titulo, imagen, url_destino, orden, activo, req.params.id]); res.json({ ok: true }); } catch (e) { res.status(500).json({ error: e.message }); } });
+app.delete('/api/slider/:id', auth('admin'), async (req, res) => { try { await pool.query('DELETE FROM slider_banners WHERE id=$1', [req.params.id]); res.json({ ok: true }); } catch (e) { res.status(500).json({ error: e.message }); } });
+
+// ═══ FAVORITOS ═══
+app.get('/api/favoritos', auth(), async (req, res) => { try { const { rows } = await pool.query('SELECT f.*, p.nombre, p.modelo, p.imagen, p.precio_base, p.precio_oferta, p.stock, p.categoria, p.seccion_id FROM favoritos f JOIN productos p ON f.producto_id=p.id WHERE f.usuario_id=$1 ORDER BY f.created_at DESC', [req.user.id]); res.json(rows); } catch (e) { res.status(500).json({ error: e.message }); } });
+app.post('/api/favoritos/:producto_id', auth(), async (req, res) => { try { await pool.query('INSERT INTO favoritos (usuario_id, producto_id) VALUES ($1,$2) ON CONFLICT DO NOTHING', [req.user.id, req.params.producto_id]); res.json({ ok: true }); } catch (e) { res.status(500).json({ error: e.message }); } });
+app.delete('/api/favoritos/:producto_id', auth(), async (req, res) => { try { await pool.query('DELETE FROM favoritos WHERE usuario_id=$1 AND producto_id=$2', [req.user.id, req.params.producto_id]); res.json({ ok: true }); } catch (e) { res.status(500).json({ error: e.message }); } });
+
+// ═══ NOTIFICACIONES STOCK ═══
+app.post('/api/notificar-stock', async (req, res) => { try { const { producto_id, email } = req.body; if (!email || !producto_id) return res.status(400).json({ error: 'email y producto_id requeridos' }); await pool.query('INSERT INTO notificaciones_stock (producto_id, email) VALUES ($1,$2)', [producto_id, email]); res.json({ ok: true }); } catch (e) { res.status(500).json({ error: e.message }); } });
 
 // ═══ ANDREANI ═══
 const ANDREANI_API = process.env.ANDREANI_API || 'https://apis.andreani.com';
