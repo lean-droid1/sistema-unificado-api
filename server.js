@@ -9,8 +9,31 @@ const fs = require('fs');
 const cloudinary = require('cloudinary').v2;
 
 const app = express();
-app.use(cors());
+
+// ═══ SECURITY ═══
+// Helmet — HTTP security headers
+const helmet = require('helmet');
+app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));
+
+// CORS — restrict to your domains only
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '').split(',').filter(Boolean);
+app.use(cors({
+  origin: (origin, cb) => {
+    if (!origin || ALLOWED_ORIGINS.length === 0 || ALLOWED_ORIGINS.includes(origin)) cb(null, true);
+    else cb(null, true); // permisivo por ahora, cambiar a cb(new Error('CORS')) cuando configures
+  },
+  credentials: true
+}));
+
 app.use(express.json({ limit: '10mb' }));
+
+// Rate limiting — prevent brute force + DDoS
+const rateLimit = require('express-rate-limit');
+app.use('/api/auth', rateLimit({ windowMs: 15 * 60 * 1000, max: 20, message: { error: 'Demasiados intentos, esperá 15 minutos' } }));
+app.use('/api/', rateLimit({ windowMs: 1 * 60 * 1000, max: 200, message: { error: 'Demasiadas solicitudes, esperá un momento' } }));
+
+// Trust proxy (Railway runs behind proxy)
+app.set('trust proxy', 1);
 
 const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
 const SECRET = process.env.JWT_SECRET || 'su_secret_2025';
@@ -28,14 +51,25 @@ if (!fs.existsSync(uploadsDir)) fs.mkdirSync(uploadsDir, { recursive: true });
 app.use('/uploads', express.static(uploadsDir));
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } });
 
-// Auth middleware
-const auth = (role) => (req, res, next) => {
+// Auth middleware — verifies JWT, checks token not revoked, verifies current role from DB
+const crypto = require('crypto');
+const hashToken = (t) => crypto.createHash('sha256').update(t).digest('hex').slice(0, 64);
+
+const auth = (role) => async (req, res, next) => {
   try {
     const t = req.headers.authorization?.split(' ')[1];
     if (!t) return res.status(401).json({ error: 'Token requerido' });
+    // Check if token is revoked
+    const revoked = await pool.query('SELECT 1 FROM tokens_revocados WHERE token_hash=$1', [hashToken(t)]).catch(() => ({ rows: [] }));
+    if (revoked.rows.length) return res.status(401).json({ error: 'Sesión cerrada. Ingresá de nuevo.' });
     const d = jwt.verify(t, SECRET);
-    if (role && d.rol !== role && d.rol !== 'admin') return res.status(403).json({ error: 'Sin permiso' });
-    req.user = d; next();
+    // Verify current role from DB (not just from token)
+    if (role) {
+      const { rows } = await pool.query('SELECT rol, activo FROM usuarios WHERE id=$1', [d.id]).catch(() => ({ rows: [] }));
+      if (!rows[0] || !rows[0].activo) return res.status(401).json({ error: 'Cuenta desactivada' });
+      if (role === 'admin' && rows[0].rol !== 'admin') return res.status(403).json({ error: 'Sin permiso' });
+    }
+    req.user = d; req._token = t; next();
   } catch { res.status(401).json({ error: 'Token inválido' }); }
 };
 const optionalAuth = (req, res, next) => {
@@ -71,6 +105,9 @@ async function migrate() {
     `CREATE TABLE IF NOT EXISTS slider_banners (id SERIAL PRIMARY KEY, titulo VARCHAR(300) DEFAULT '', imagen TEXT DEFAULT '', url_destino TEXT DEFAULT '', orden INT DEFAULT 0, activo BOOLEAN DEFAULT true)`,
     `CREATE TABLE IF NOT EXISTS favoritos (id SERIAL PRIMARY KEY, usuario_id INT REFERENCES usuarios(id) ON DELETE CASCADE, producto_id INT REFERENCES productos(id) ON DELETE CASCADE, created_at TIMESTAMP DEFAULT NOW(), UNIQUE(usuario_id, producto_id))`,
     `CREATE TABLE IF NOT EXISTS notificaciones_stock (id SERIAL PRIMARY KEY, producto_id INT REFERENCES productos(id) ON DELETE CASCADE, email VARCHAR(200), notificado BOOLEAN DEFAULT false, created_at TIMESTAMP DEFAULT NOW())`,
+    `CREATE TABLE IF NOT EXISTS otp_codes (id SERIAL PRIMARY KEY, usuario_id INT REFERENCES usuarios(id) ON DELETE CASCADE, codigo VARCHAR(10), expira TIMESTAMP, usado BOOLEAN DEFAULT false)`,
+    `CREATE TABLE IF NOT EXISTS tokens_revocados (id SERIAL PRIMARY KEY, token_hash VARCHAR(64) UNIQUE, expira TIMESTAMP, created_at TIMESTAMP DEFAULT NOW())`,
+    `DO $$ BEGIN ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS otp_activo BOOLEAN DEFAULT false; EXCEPTION WHEN OTHERS THEN NULL; END $$`,
     `CREATE INDEX IF NOT EXISTS idx_prod_img ON producto_imagenes(producto_id)`,
     `CREATE INDEX IF NOT EXISTS idx_variantes ON variantes(producto_id)`,
     `CREATE INDEX IF NOT EXISTS idx_favoritos ON favoritos(usuario_id)`,
@@ -160,23 +197,108 @@ app.post('/api/maintenance-mode', auth('admin'), async (req, res) => {
 });
 
 // ═══ AUTH ═══
+// Resend for OTP emails
+let resend = null;
+if (process.env.RESEND_API_KEY) {
+  const { Resend } = require('resend');
+  resend = new Resend(process.env.RESEND_API_KEY);
+  console.log('📧 Resend configured for OTP');
+}
+
+// Password strength validation
+const validatePassword = (pw) => {
+  if (!pw || pw.length < 8) return 'La contraseña debe tener al menos 8 caracteres';
+  if (!/[A-Z]/.test(pw)) return 'La contraseña debe tener al menos una mayúscula';
+  if (!/[0-9]/.test(pw)) return 'La contraseña debe tener al menos un número';
+  return null;
+};
+
+// Login brute force tracking
+const loginAttempts = {};
 app.post('/api/login', async (req, res) => {
-  try { const { usuario, password } = req.body;
+  try {
+    const { usuario, password, otp_code } = req.body;
+    if (!usuario || !password) return res.status(400).json({ error: 'Usuario y contraseña requeridos' });
+    const ip = req.ip;
+    const key = `${ip}_${usuario.toLowerCase()}`;
+    if (loginAttempts[key] && loginAttempts[key].count >= 5 && Date.now() - loginAttempts[key].last < 15 * 60 * 1000) {
+      return res.status(429).json({ error: 'Cuenta temporalmente bloqueada. Intentá en 15 minutos.' });
+    }
     const { rows } = await pool.query('SELECT * FROM usuarios WHERE LOWER(usuario)=LOWER($1) AND activo=true', [usuario]);
     if (!rows[0]) {
       const { rows: pend } = await pool.query('SELECT * FROM usuarios WHERE LOWER(usuario)=LOWER($1) AND aprobado=false', [usuario]);
       if (pend[0]) return res.status(403).json({ error: 'Tu cuenta está pendiente de aprobación' });
+      loginAttempts[key] = { count: (loginAttempts[key]?.count || 0) + 1, last: Date.now() };
       return res.status(401).json({ error: 'Usuario o contraseña incorrectos' });
     }
     const valid = await bcrypt.compare(password, rows[0].password);
-    if (!valid) return res.status(401).json({ error: 'Usuario o contraseña incorrectos' });
-    const token = jwt.sign({ id: rows[0].id, rol: rows[0].rol, usuario: rows[0].usuario }, SECRET, { expiresIn: '30d' });
+    if (!valid) {
+      loginAttempts[key] = { count: (loginAttempts[key]?.count || 0) + 1, last: Date.now() };
+      return res.status(401).json({ error: 'Usuario o contraseña incorrectos' });
+    }
+    // 2FA check
+    if (rows[0].otp_activo && resend) {
+      if (!otp_code) {
+        // Send OTP
+        const code = Math.floor(100000 + Math.random() * 900000).toString();
+        await pool.query('INSERT INTO otp_codes (usuario_id, codigo, expira) VALUES ($1,$2, NOW() + INTERVAL \'10 minutes\')', [rows[0].id, code]);
+        const emailTo = rows[0].email;
+        if (emailTo) {
+          await resend.emails.send({ from: process.env.RESEND_FROM || 'noreply@resend.dev', to: emailTo, subject: 'Código de verificación', html: `<h2>Tu código: <strong>${code}</strong></h2><p>Expira en 10 minutos.</p>` });
+        }
+        return res.json({ requires_otp: true, message: 'Código enviado a tu email' });
+      }
+      // Verify OTP
+      const { rows: otps } = await pool.query('SELECT * FROM otp_codes WHERE usuario_id=$1 AND codigo=$2 AND expira > NOW() AND usado=false ORDER BY id DESC LIMIT 1', [rows[0].id, otp_code]);
+      if (!otps[0]) return res.status(401).json({ error: 'Código incorrecto o expirado' });
+      await pool.query('UPDATE otp_codes SET usado=true WHERE id=$1', [otps[0].id]);
+    }
+    delete loginAttempts[key];
+    const token = jwt.sign({ id: rows[0].id, rol: rows[0].rol, usuario: rows[0].usuario }, SECRET, { expiresIn: '7d' });
     res.json({ token, user: { ...rows[0], password: undefined } });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
+
+// Logout — revoke token
+app.post('/api/logout', auth(), async (req, res) => {
+  try {
+    const decoded = jwt.decode(req._token);
+    const expira = new Date(decoded.exp * 1000);
+    await pool.query('INSERT INTO tokens_revocados (token_hash, expira) VALUES ($1,$2) ON CONFLICT DO NOTHING', [hashToken(req._token), expira]);
+    // Cleanup expired revocations
+    await pool.query('DELETE FROM tokens_revocados WHERE expira < NOW()').catch(() => {});
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Refresh token
+app.post('/api/refresh-token', auth(), async (req, res) => {
+  try {
+    const { rows } = await pool.query('SELECT id, rol, usuario, activo FROM usuarios WHERE id=$1', [req.user.id]);
+    if (!rows[0] || !rows[0].activo) return res.status(401).json({ error: 'Cuenta desactivada' });
+    // Revoke old token
+    const decoded = jwt.decode(req._token);
+    await pool.query('INSERT INTO tokens_revocados (token_hash, expira) VALUES ($1,$2) ON CONFLICT DO NOTHING', [hashToken(req._token), new Date(decoded.exp * 1000)]);
+    const newToken = jwt.sign({ id: rows[0].id, rol: rows[0].rol, usuario: rows[0].usuario }, SECRET, { expiresIn: '7d' });
+    res.json({ token: newToken });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Toggle 2FA
+app.put('/api/me/otp', auth(), async (req, res) => {
+  try {
+    const { activo } = req.body;
+    await pool.query('UPDATE usuarios SET otp_activo=$1 WHERE id=$2', [activo, req.user.id]);
+    res.json({ ok: true, otp_activo: activo });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 app.post('/api/register', async (req, res) => {
   try { const { nombre, usuario, password, telefono, email, direccion, nombre_fantasia } = req.body;
-    const hash = await bcrypt.hash(password || '1234', 10);
+    if (!usuario || usuario.length < 3) return res.status(400).json({ error: 'El usuario debe tener al menos 3 caracteres' });
+    const pwError = validatePassword(password);
+    if (pwError) return res.status(400).json({ error: pwError });
+    const hash = await bcrypt.hash(password, 12);
     const { rows } = await pool.query('INSERT INTO usuarios (nombre,usuario,password,telefono,email,direccion,nombre_fantasia,aprobado,activo) VALUES ($1,$2,$3,$4,$5,$6,$7,false,false) RETURNING *',
       [nombre, usuario, hash, telefono || '', email || '', direccion || '', nombre_fantasia || '']);
     res.json(rows[0]);
@@ -240,6 +362,9 @@ const uploadToCloudinary = (buffer, folder = 'productos') => new Promise((resolv
 
 app.post('/api/upload', auth('admin'), upload.single('imagen'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'No file' });
+  // Validate file type
+  const allowed = ['image/jpeg', 'image/png', 'image/gif', 'image/webp', 'image/svg+xml'];
+  if (!allowed.includes(req.file.mimetype)) return res.status(400).json({ error: 'Tipo de archivo no permitido. Solo imágenes.' });
   try {
     if (useCloudinary) {
       const url = await uploadToCloudinary(req.file.buffer);
