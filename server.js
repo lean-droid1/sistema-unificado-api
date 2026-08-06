@@ -134,7 +134,8 @@ async function migrate(){
     `ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS reset_expira TIMESTAMP`,
     `ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS otp_activo BOOLEAN DEFAULT false`,
     `ALTER TABLE config_envio ADD COLUMN IF NOT EXISTS cp_origen VARCHAR(20) DEFAULT '1888'`,
-    `ALTER TABLE badges ADD COLUMN IF NOT EXISTS color VARCHAR(20) DEFAULT '#2563eb'`,
+    // === ALL MISSING ALTERS FOR EXISTING DBS ===
+    // secciones
     `ALTER TABLE secciones ADD COLUMN IF NOT EXISTS orden INT DEFAULT 0`,
     `ALTER TABLE secciones ADD COLUMN IF NOT EXISTS slug VARCHAR(100) DEFAULT ''`,
     `ALTER TABLE secciones ADD COLUMN IF NOT EXISTS visible BOOLEAN DEFAULT true`,
@@ -143,21 +144,77 @@ async function migrate(){
     `ALTER TABLE secciones ADD COLUMN IF NOT EXISTS permitir_sin_stock BOOLEAN DEFAULT false`,
     `ALTER TABLE secciones ADD COLUMN IF NOT EXISTS cp_origen VARCHAR(20) DEFAULT '1888'`,
     `ALTER TABLE secciones ADD COLUMN IF NOT EXISTS imagen TEXT DEFAULT ''`,
+    `ALTER TABLE secciones ADD COLUMN IF NOT EXISTS color VARCHAR(20) DEFAULT '#2563eb'`,
+    `ALTER TABLE secciones ADD COLUMN IF NOT EXISTS whatsapp VARCHAR(50) DEFAULT ''`,
+    `ALTER TABLE secciones ADD COLUMN IF NOT EXISTS cbu VARCHAR(100) DEFAULT ''`,
+    `ALTER TABLE secciones ADD COLUMN IF NOT EXISTS direccion_despacho TEXT DEFAULT ''`,
+    `ALTER TABLE secciones ADD COLUMN IF NOT EXISTS metodos_pago TEXT DEFAULT ''`,
+    `ALTER TABLE secciones ADD COLUMN IF NOT EXISTS activa BOOLEAN DEFAULT true`,
+    `ALTER TABLE secciones ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW()`,
+    // badges
+    `ALTER TABLE badges ADD COLUMN IF NOT EXISTS color VARCHAR(20) DEFAULT '#2563eb'`,
+    `ALTER TABLE badges ADD COLUMN IF NOT EXISTS secciones_ids TEXT DEFAULT ''`,
+    `ALTER TABLE badges ADD COLUMN IF NOT EXISTS orden INT DEFAULT 0`,
+    // cupones
     `ALTER TABLE cupones ADD COLUMN IF NOT EXISTS monto_minimo NUMERIC(12,2) DEFAULT 0`,
     `ALTER TABLE cupones ADD COLUMN IF NOT EXISTS secciones_ids TEXT DEFAULT ''`,
+    `ALTER TABLE cupones ADD COLUMN IF NOT EXISTS productos_ids TEXT DEFAULT ''`,
     `ALTER TABLE cupones ADD COLUMN IF NOT EXISTS activo BOOLEAN DEFAULT true`,
+    // promociones
     `ALTER TABLE promociones ADD COLUMN IF NOT EXISTS activo BOOLEAN DEFAULT true`,
     `ALTER TABLE promociones ADD COLUMN IF NOT EXISTS secciones_ids TEXT DEFAULT ''`,
     `ALTER TABLE promociones ADD COLUMN IF NOT EXISTS productos_ids TEXT DEFAULT ''`,
+    // pedido_items
     `ALTER TABLE pedido_items ADD COLUMN IF NOT EXISTS categoria VARCHAR(200) DEFAULT ''`,
     `ALTER TABLE pedido_items ADD COLUMN IF NOT EXISTS modelo VARCHAR(200) DEFAULT ''`,
+    `ALTER TABLE pedido_items ADD COLUMN IF NOT EXISTS imagen TEXT DEFAULT ''`,
+    `ALTER TABLE pedido_items ADD COLUMN IF NOT EXISTS seccion_nombre VARCHAR(200) DEFAULT ''`,
+    // pedidos
+    `ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS datos_envio TEXT DEFAULT ''`,
+    `ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS archivado BOOLEAN DEFAULT false`,
+    `ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS is_test BOOLEAN DEFAULT false`,
+    `ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS costo_envio NUMERIC(12,2) DEFAULT 0`,
+    `ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS metodo_envio VARCHAR(100) DEFAULT ''`,
+    `ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS cp_destino VARCHAR(20) DEFAULT ''`,
+    // productos
     `ALTER TABLE productos ADD COLUMN IF NOT EXISTS notas TEXT DEFAULT ''`,
     `ALTER TABLE productos ADD COLUMN IF NOT EXISTS compatibilidad TEXT DEFAULT ''`,
+    `ALTER TABLE productos ADD COLUMN IF NOT EXISTS marca VARCHAR(200) DEFAULT ''`,
     `ALTER TABLE productos ADD COLUMN IF NOT EXISTS modelo VARCHAR(200) DEFAULT ''`,
+    `ALTER TABLE productos ADD COLUMN IF NOT EXISTS envio_gratis BOOLEAN DEFAULT false`,
+    `ALTER TABLE productos ADD COLUMN IF NOT EXISTS permitir_sin_stock BOOLEAN DEFAULT false`,
+    `ALTER TABLE productos ADD COLUMN IF NOT EXISTS es_digital BOOLEAN DEFAULT false`,
     `ALTER TABLE productos ADD COLUMN IF NOT EXISTS peso NUMERIC(8,2) DEFAULT 0`,
     `ALTER TABLE productos ADD COLUMN IF NOT EXISTS alto NUMERIC(8,2) DEFAULT 0`,
     `ALTER TABLE productos ADD COLUMN IF NOT EXISTS ancho NUMERIC(8,2) DEFAULT 0`,
     `ALTER TABLE productos ADD COLUMN IF NOT EXISTS largo NUMERIC(8,2) DEFAULT 0`,
+    // usuarios
+    `ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS reset_codigo VARCHAR(20) DEFAULT ''`,
+    `ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS reset_expira TIMESTAMP`,
+    `ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS otp_activo BOOLEAN DEFAULT false`,
+    `ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS nombre_fantasia VARCHAR(200) DEFAULT ''`,
+    `ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS lista_precio_id VARCHAR(50) DEFAULT ''`,
+    // listas_precio
+    `ALTER TABLE listas_precio ADD COLUMN IF NOT EXISTS color VARCHAR(20) DEFAULT '#2563eb'`,
+    `ALTER TABLE listas_precio ADD COLUMN IF NOT EXISTS compra_minima NUMERIC(12,2) DEFAULT 0`,
+    `ALTER TABLE listas_precio ADD COLUMN IF NOT EXISTS promo_msg TEXT DEFAULT ''`,
+    `ALTER TABLE listas_precio ADD COLUMN IF NOT EXISTS modo VARCHAR(20) DEFAULT 'porcentaje'`,
+    // popups
+    `ALTER TABLE popups ADD COLUMN IF NOT EXISTS secciones_ids TEXT DEFAULT ''`,
+    // menu_items
+    `ALTER TABLE menu_items ADD COLUMN IF NOT EXISTS seccion_id INT`,
+    `ALTER TABLE menu_items ADD COLUMN IF NOT EXISTS orden INT DEFAULT 0`,
+    // metodos_pago
+    `ALTER TABLE metodos_pago ADD COLUMN IF NOT EXISTS seccion_id INT`,
+    `ALTER TABLE metodos_pago ADD COLUMN IF NOT EXISTS orden INT DEFAULT 0`,
+    `ALTER TABLE metodos_pago ADD COLUMN IF NOT EXISTS instrucciones TEXT DEFAULT ''`,
+    // redes_sociales
+    `ALTER TABLE redes_sociales ADD COLUMN IF NOT EXISTS orden INT DEFAULT 0`,
+    // paginas_info
+    `ALTER TABLE paginas_info ADD COLUMN IF NOT EXISTS slug VARCHAR(100) DEFAULT ''`,
+    `ALTER TABLE paginas_info ADD COLUMN IF NOT EXISTS seccion_id INT`,
+    `ALTER TABLE paginas_info ADD COLUMN IF NOT EXISTS visible BOOLEAN DEFAULT true`,
+    `ALTER TABLE paginas_info ADD COLUMN IF NOT EXISTS orden INT DEFAULT 0`,
   ];
   for(const a of alters) await pool.query(a).catch(()=>{});
   // Design defaults
