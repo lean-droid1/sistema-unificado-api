@@ -54,7 +54,7 @@ if (!SECRET) {
 const JWT_SECRET = SECRET || 'dev-only-secret-cambiar-en-prod-2026';
 
 // Cloudinary - obligatorio
-const useCloudinary = !!(process.env.CLOUDINARY_CLOUD_NAME && process.env.CLOUDINARY_API_KEY);
+const useCloudinary = !!(process.env.CLOUDINARY_CLOUD_NAME && process.env.CLOUDINARY_API_KEY && process.env.CLOUDINARY_API_SECRET);
 if (useCloudinary) {
   cloudinary.config({ cloud_name: process.env.CLOUDINARY_CLOUD_NAME, api_key: process.env.CLOUDINARY_API_KEY, api_secret: process.env.CLOUDINARY_API_SECRET });
   console.log('☁️ Cloudinary OK');
@@ -258,6 +258,16 @@ async function migrate(){
   // Design defaults
   const defs = {nombre_tienda:'Mi Tienda',logo_url:'',favicon_url:'',color_primario:'#4A69E2',color_secundario:'#232321',color_acento:'#FFA52F',fuente:'Archivo',footer_texto:'',css_custom:'',hero_titulo:'',hero_subtitulo:'',promo_banner:'',whatsapp_numero:'',whatsapp_mensaje:'Hola, quiero consultar sobre un producto',confianza_1_icono:'truck',confianza_1_titulo:'Envío a todo el país',confianza_1_sub:'Andreani y más',confianza_2_icono:'shield',confianza_2_titulo:'Compra segura',confianza_2_sub:'Garantía incluida',confianza_3_icono:'message-circle',confianza_3_titulo:'Atención directa',confianza_3_sub:'WhatsApp'};
   for(const [k,v] of Object.entries(defs)){ await pool.query("INSERT INTO design_config (clave,valor) VALUES ($1,$2) ON CONFLICT (clave) DO NOTHING", [k,v]).catch(()=>{}); }
+  // FIX #5: seed admin si no existe ninguno
+  try{
+    const {rows:admins}=await pool.query("SELECT id FROM usuarios WHERE rol='admin' LIMIT 1");
+    if(!admins.length){
+      const adminPass=process.env.ADMIN_PASSWORD||'Admin1234';
+      const hash=await bcrypt.hash(adminPass,12);
+      await pool.query("INSERT INTO usuarios (nombre,usuario,password,rol,aprobado,activo) VALUES ('Administrador','admin',$1,'admin',true,true) ON CONFLICT (usuario) DO NOTHING", [hash]);
+      console.log('✅ Admin creado -> usuario: admin  password: '+adminPass+'  (cambialo en Mi Cuenta)');
+    }
+  }catch(e){ console.log('seed admin warn', e.message); }
   console.log('✅ Migrate V4 OK');
 }
 
@@ -420,14 +430,13 @@ app.post('/api/upload', auth('admin'), upload.single('imagen'), async (req,res)=
   try{
     if(!req.file) return res.status(400).json({error:'No file'});
     if(useCloudinary){
-      const r=await uploadToCloudinary(req.file.buffer);
-      return res.json({url:r.secure_url});
-    }else{
-      const ext=path.extname(req.file.originalname)||'.jpg';
-      const name=uuidv4()+ext;
-      fs.writeFileSync(path.join(uploadsDir,name), req.file.buffer);
-      return res.json({url:`/uploads/${name}`});
+      try{ const r=await uploadToCloudinary(req.file.buffer); return res.json({url:r.secure_url}); }
+      catch(ce){ console.error('Cloudinary falló, guardo en disco:', ce.message); }
     }
+    const ext=path.extname(req.file.originalname)||'.jpg';
+    const name=uuidv4()+ext;
+    fs.writeFileSync(path.join(uploadsDir,name), req.file.buffer);
+    return res.json({url:`/uploads/${name}`});
   }catch(e){ res.status(500).json({error:e.message}); }
 });
 app.post('/api/upload-base64', auth('admin'), async (req,res)=>{
@@ -507,9 +516,9 @@ app.post('/api/productos/bulk', auth('admin'), async (req,res)=>{
     const {productos, reemplazar} = req.body;
     if(reemplazar){ await pool.query('DELETE FROM producto_imagenes'); await pool.query('DELETE FROM pedido_items'); await pool.query('DELETE FROM productos'); }
     for(const p of (productos||[])){
-      await pool.query(`INSERT INTO productos (seccion_id,categoria,modelo,nombre,precio_base,stock,imagen,visible,permitir_sin_stock,es_digital) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT DO NOTHING`, [p.seccion_id||1, p.categoria||'', p.modelo||'', p.nombre||p.modelo||'', p.precio_base||0, p.stock||0, p.imagen||'', true, p.permitir_sin_stock||false, p.es_digital||false]);
+      await pool.query(`INSERT INTO productos (seccion_id,categoria,modelo,nombre,precio_base,stock,imagen,sku,descripcion,compatibilidad,peso,alto,ancho,largo,visible,permitir_sin_stock,es_digital) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) ON CONFLICT DO NOTHING`, [p.seccion_id||1, p.categoria||'', p.modelo||'', p.nombre||p.modelo||'', p.precio_base||0, p.stock||0, p.imagen||'', p.sku||'', p.descripcion||'', p.compatibilidad||'', p.peso||0, p.alto||0, p.ancho||0, p.largo||0, true, p.permitir_sin_stock||false, p.es_digital||false]);
     }
-    res.json({ok:true, count: productos.length});
+    res.json({ok:true, count: productos.length, insertados: productos.length});
   }catch(e){ res.status(500).json({error:e.message}); }
 });
 app.delete('/api/categorias/:categoria', auth('admin'), async (req,res)=>{ try{ await pool.query('DELETE FROM productos WHERE categoria=$1', [req.params.categoria]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
@@ -632,11 +641,26 @@ app.post('/api/pedidos/multi', auth(), async (req,res)=>{
     const creados=[];
     for(const ped of pedidos){
       const {seccion_id, items, subtotal, descuento, total, metodo_pago, notas, cupon_codigo, datos_envio, costo_envio, metodo_envio, cp_destino}=ped;
+      // Validar stock por seccion antes de crear (transaccional)
+      for(const item of (items||[])){
+        const {rows:prod}=await client.query('SELECT stock, permitir_sin_stock, es_digital, seccion_id FROM productos WHERE id=$1', [item.producto_id]);
+        if(!prod[0]) continue;
+        const sec=await client.query('SELECT ignorar_stock, permitir_sin_stock FROM secciones WHERE id=$1', [prod[0].seccion_id]).then(r=>r.rows[0]).catch(()=>null);
+        const puedeSinStock = prod[0].permitir_sin_stock || prod[0].es_digital || sec?.permitir_sin_stock || sec?.ignorar_stock;
+        if(!puedeSinStock && prod[0].stock < (item.cantidad||1)){
+          await client.query('ROLLBACK');
+          return res.status(400).json({error:`Sin stock: ${item.nombre_producto||''} (disponible: ${prod[0].stock})`});
+        }
+      }
       const {rows}=await client.query('INSERT INTO pedidos (usuario_id,seccion_id,tipo,metodo_pago,notas,cupon_codigo,subtotal,descuento,total,datos_envio,costo_envio,metodo_envio,cp_destino,is_test) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING *',
         [req.user.id, seccion_id, 'pedido', metodo_pago||'', notas||'', cupon_codigo||'', subtotal||0, descuento||0, total||0, datos_envio||'', costo_envio||0, metodo_envio||'', cp_destino||'', is_test||false]);
       for(const item of (items||[])){
         await client.query('INSERT INTO pedido_items (pedido_id,producto_id,categoria,modelo,nombre_producto,cantidad,precio_unitario,precio_base) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)',
           [rows[0].id, item.producto_id, item.categoria||'', item.modelo||'', item.nombre_producto||'', item.cantidad||1, item.precio_unitario||0, item.precio_base||0]);
+        const {rows:pr}=await client.query('SELECT permitir_sin_stock, es_digital FROM productos WHERE id=$1', [item.producto_id]);
+        if(pr[0] && !pr[0].permitir_sin_stock && !pr[0].es_digital){
+          await client.query('UPDATE productos SET stock = GREATEST(0, stock - $1) WHERE id=$2 AND permitir_sin_stock=false AND es_digital=false', [item.cantidad||1, item.producto_id]);
+        }
       }
       creados.push(rows[0]);
     }
