@@ -680,6 +680,11 @@ app.post('/api/pedidos/multi', auth(), async (req,res)=>{
 app.put('/api/pedidos/:id', auth('admin'), async (req,res)=>{
   try{
     const p=req.body; const sets=[]; const params=[]; let pi=1;
+    // Capturar estado + items ANTES de cambios (para devolver stock)
+    const {rows:oldItemsRows}=await pool.query('SELECT producto_id, cantidad FROM pedido_items WHERE pedido_id=$1', [req.params.id]);
+    const oldMap={}; for(const it of oldItemsRows){ if(it.producto_id) oldMap[it.producto_id]=(oldMap[it.producto_id]||0)+(it.cantidad||0); }
+    const {rows:oldPedRows}=await pool.query('SELECT estado FROM pedidos WHERE id=$1', [req.params.id]);
+    const oldEstado=String((oldPedRows[0]||{}).estado||'').toLowerCase();
     const fields=['estado','tipo','metodo_pago','notas','total','subtotal','descuento','datos_envio','usuario_id','notificar_wa','is_test','costo_envio','metodo_envio','cp_destino'];
     for(const f of fields){ if(p[f]!==undefined){ sets.push(`${f}=$${pi++}`); params.push(p[f]); } }
     sets.push(`updated_at=NOW()`);
@@ -687,12 +692,22 @@ app.put('/api/pedidos/:id', auth('admin'), async (req,res)=>{
     params.push(req.params.id);
     await pool.query(`UPDATE pedidos SET ${sets.join(',')} WHERE id=$${pi}`, params);
     if(p.items){ await pool.query('DELETE FROM pedido_items WHERE pedido_id=$1', [req.params.id]); for(const item of p.items){ await pool.query('INSERT INTO pedido_items (pedido_id,producto_id,categoria,modelo,nombre_producto,cantidad,precio_unitario,precio_base) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)', [req.params.id, item.producto_id||item.id, item.categoria||'', item.modelo||'', item.nombre_producto||`${item.categoria} - ${item.modelo}`, item.cantidad||item.qty||1, item.precio_unitario||0, item.precio_base||0]); } }
+    // Reconciliar stock: devolver al cancelar, ajustar delta al editar items
+    const nuevoEstado=(p.estado!==undefined)?String(p.estado).toLowerCase():oldEstado;
+    const cancelSt=['cancelado','anulado','rechazado'];
+    const seCancela=cancelSt.includes(nuevoEstado)&&!cancelSt.includes(oldEstado);
+    const seReactiva=!cancelSt.includes(nuevoEstado)&&cancelSt.includes(oldEstado);
+    const stockAdd={};
+    if(seCancela){ for(const pid in oldMap) stockAdd[pid]=(stockAdd[pid]||0)+oldMap[pid]; }
+    else if(seReactiva){ const base=p.items||oldItemsRows.map(it=>({producto_id:it.producto_id,cantidad:it.cantidad})); for(const it of base){ const pid=it.producto_id||it.id; if(pid) stockAdd[pid]=(stockAdd[pid]||0)-(it.cantidad||it.qty||0); } }
+    else if(p.items){ const newMap={}; for(const it of p.items){ const pid=it.producto_id||it.id; if(pid) newMap[pid]=(newMap[pid]||0)+(it.cantidad||it.qty||0); } const pids=new Set([...Object.keys(oldMap),...Object.keys(newMap)]); for(const pid of pids){ const d=(oldMap[pid]||0)-(newMap[pid]||0); if(d!==0) stockAdd[pid]=(stockAdd[pid]||0)+d; } }
+    for(const pid in stockAdd){ const q=stockAdd[pid]; if(q) await pool.query('UPDATE productos SET stock=GREATEST(0, stock + $1) WHERE id=$2 AND permitir_sin_stock=false AND es_digital=false', [q, pid]); }
     res.json({ok:true});
   }catch(e){ res.status(500).json({error:e.message}); }
 });
 app.post('/api/pedidos/:id/archivar', auth('admin'), async (req,res)=>{ try{ await pool.query('UPDATE pedidos SET archivado=true WHERE id=$1', [req.params.id]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 app.post('/api/pedidos/:id/desarchivar', auth('admin'), async (req,res)=>{ try{ await pool.query('UPDATE pedidos SET archivado=false WHERE id=$1', [req.params.id]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
-app.delete('/api/pedidos/:id', auth('admin'), async (req,res)=>{ try{ await pool.query('DELETE FROM pedido_items WHERE pedido_id=$1', [req.params.id]); await pool.query('DELETE FROM pedidos WHERE id=$1', [req.params.id]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.delete('/api/pedidos/:id', auth('admin'), async (req,res)=>{ try{ const {rows:oep}=await pool.query('SELECT estado FROM pedidos WHERE id=$1',[req.params.id]); const oe=String((oep[0]||{}).estado||'').toLowerCase(); if(!['cancelado','anulado','rechazado'].includes(oe)){ const {rows:its}=await pool.query('SELECT producto_id, cantidad FROM pedido_items WHERE pedido_id=$1',[req.params.id]); for(const it of its){ if(it.producto_id) await pool.query('UPDATE productos SET stock=GREATEST(0, stock + $1) WHERE id=$2 AND permitir_sin_stock=false AND es_digital=false',[it.cantidad||0, it.producto_id]); } } await pool.query('DELETE FROM pedido_items WHERE pedido_id=$1', [req.params.id]); await pool.query('DELETE FROM pedidos WHERE id=$1', [req.params.id]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 
 // STATS
 app.get('/api/stats', auth('admin'), async (req,res)=>{
