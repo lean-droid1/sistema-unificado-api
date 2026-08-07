@@ -248,6 +248,9 @@ async function migrate(){
     `ALTER TABLE metodos_pago ADD COLUMN IF NOT EXISTS instrucciones TEXT DEFAULT ''`,
     `ALTER TABLE metodos_pago ADD COLUMN IF NOT EXISTS icono VARCHAR(50) DEFAULT '💳'`,
     `ALTER TABLE metodos_pago ALTER COLUMN icono TYPE TEXT`,
+    `ALTER TABLE metodos_envio_custom ADD COLUMN IF NOT EXISTS icono VARCHAR(50) DEFAULT '🚚'`,
+    `ALTER TABLE metodos_envio_custom ALTER COLUMN icono TYPE TEXT`,
+    `ALTER TABLE badges ALTER COLUMN icono TYPE TEXT`,
     `ALTER TABLE metodos_pago ADD COLUMN IF NOT EXISTS descripcion TEXT DEFAULT ''`,
     // redes_sociales
     `ALTER TABLE redes_sociales ADD COLUMN IF NOT EXISTS orden INT DEFAULT 0`,
