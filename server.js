@@ -596,11 +596,11 @@ app.get('/api/pedidos', auth(), async (req,res)=>{
     else{ where.push('p.usuario_id=$1'); params.push(req.user.id); }
     if(seccion_id){ where.push(`p.seccion_id=$${params.length+1}`); params.push(seccion_id); }
     if(tipo){ where.push(`p.tipo=$${params.length+1}`); params.push(tipo); }
-    const {rows}=await pool.query(`SELECT p.*, u.nombre as usuario_nombre, u.telefono as usuario_telefono, u.email as usuario_email, u.nombre_fantasia FROM pedidos p LEFT JOIN usuarios u ON p.usuario_id=u.id WHERE ${where.join(' AND ')} ORDER BY p.created_at DESC LIMIT 500`, params);
+    const {rows}=await pool.query(`SELECT p.*, u.nombre as usuario_nombre, u.telefono as usuario_telefono, u.email as usuario_email, u.nombre_fantasia, s.nombre as seccion_nombre, s.color as seccion_color FROM pedidos p LEFT JOIN usuarios u ON p.usuario_id=u.id LEFT JOIN secciones s ON p.seccion_id=s.id WHERE ${where.join(' AND ')} ORDER BY p.created_at DESC LIMIT 500`, params);
     res.json(rows);
   }catch(e){ res.status(500).json({error:e.message}); }
 });
-app.get('/api/pedidos/:id', auth(), async (req,res)=>{ try{ const {rows}=await pool.query('SELECT p.*, u.nombre as usuario_nombre, u.telefono as usuario_telefono, u.email as usuario_email, u.nombre_fantasia, u.direccion as usuario_direccion FROM pedidos p LEFT JOIN usuarios u ON p.usuario_id=u.id WHERE p.id=$1', [req.params.id]); if(!rows[0]) return res.status(404).json({error:'No encontrado'}); const {rows:items}=await pool.query('SELECT * FROM pedido_items WHERE pedido_id=$1', [req.params.id]); res.json({...rows[0], items}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.get('/api/pedidos/:id', auth(), async (req,res)=>{ try{ const {rows}=await pool.query('SELECT p.*, u.nombre as usuario_nombre, u.telefono as usuario_telefono, u.email as usuario_email, u.nombre_fantasia, u.direccion as usuario_direccion, s.nombre as seccion_nombre, s.color as seccion_color FROM pedidos p LEFT JOIN usuarios u ON p.usuario_id=u.id LEFT JOIN secciones s ON p.seccion_id=s.id WHERE p.id=$1', [req.params.id]); if(!rows[0]) return res.status(404).json({error:'No encontrado'}); const {rows:items}=await pool.query('SELECT * FROM pedido_items WHERE pedido_id=$1', [req.params.id]); res.json({...rows[0], items}); }catch(e){ res.status(500).json({error:e.message}); } });
 
 // Pedido simple + pedido multi-tienda con transaccion
 app.post('/api/pedidos', auth(), async (req,res)=>{
