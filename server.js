@@ -155,6 +155,8 @@ async function migrate(){
     `ALTER TABLE badges ADD COLUMN IF NOT EXISTS color VARCHAR(20) DEFAULT '#2563eb'`,
     `ALTER TABLE badges ADD COLUMN IF NOT EXISTS secciones_ids TEXT DEFAULT ''`,
     `ALTER TABLE badges ADD COLUMN IF NOT EXISTS orden INT DEFAULT 0`,
+    `ALTER TABLE slider_banners ADD COLUMN IF NOT EXISTS subtitulo VARCHAR(500) DEFAULT ''`,
+    `ALTER TABLE slider_banners ADD COLUMN IF NOT EXISTS etiqueta VARCHAR(100) DEFAULT ''`,
     // cupones
     `ALTER TABLE cupones ADD COLUMN IF NOT EXISTS monto_minimo NUMERIC(12,2) DEFAULT 0`,
     `ALTER TABLE cupones ADD COLUMN IF NOT EXISTS secciones_ids TEXT DEFAULT ''`,
@@ -830,8 +832,8 @@ app.get('/api/busqueda-global', optionalAuth, async (req,res)=>{
 // SLIDER, FAVORITOS, NOTIF STOCK
 app.get('/api/slider', async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM slider_banners WHERE activo=true ORDER BY orden'); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
 app.get('/api/slider/all', auth('admin'), async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM slider_banners ORDER BY orden'); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
-app.post('/api/slider', auth('admin'), async (req,res)=>{ try{ const {titulo,imagen,url_destino,orden,activo}=req.body; const {rows}=await pool.query('INSERT INTO slider_banners (titulo,imagen,url_destino,orden,activo) VALUES ($1,$2,$3,$4,$5) RETURNING *', [titulo||'',imagen||'',url_destino||'',orden||0,activo!==false]); res.json(rows[0]); }catch(e){ res.status(500).json({error:e.message}); } });
-app.put('/api/slider/:id', auth('admin'), async (req,res)=>{ try{ const {titulo,imagen,url_destino,orden,activo}=req.body; await pool.query('UPDATE slider_banners SET titulo=$1,imagen=$2,url_destino=$3,orden=$4,activo=$5 WHERE id=$6', [titulo,imagen,url_destino,orden,activo,req.params.id]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.post('/api/slider', auth('admin'), async (req,res)=>{ try{ const {titulo,subtitulo,etiqueta,imagen,url_destino,orden,activo}=req.body; const {rows}=await pool.query('INSERT INTO slider_banners (titulo,subtitulo,etiqueta,imagen,url_destino,orden,activo) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *', [titulo||'',subtitulo||'',etiqueta||'',imagen||'',url_destino||'',orden||0,activo!==false]); res.json(rows[0]); }catch(e){ res.status(500).json({error:e.message}); } });
+app.put('/api/slider/:id', auth('admin'), async (req,res)=>{ try{ const {titulo,subtitulo,etiqueta,imagen,url_destino,orden,activo}=req.body; await pool.query('UPDATE slider_banners SET titulo=$1,subtitulo=$2,etiqueta=$3,imagen=$4,url_destino=$5,orden=$6,activo=$7 WHERE id=$8', [titulo,subtitulo||'',etiqueta||'',imagen,url_destino,orden,activo,req.params.id]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 app.delete('/api/slider/:id', auth('admin'), async (req,res)=>{ try{ await pool.query('DELETE FROM slider_banners WHERE id=$1', [req.params.id]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 
 app.get('/api/favoritos', auth(), async (req,res)=>{ try{ const {rows}=await pool.query('SELECT f.*, p.nombre, p.modelo, p.imagen, p.precio_base, p.precio_oferta, p.stock, p.categoria, p.seccion_id FROM favoritos f JOIN productos p ON f.producto_id=p.id WHERE f.usuario_id=$1 ORDER BY f.created_at DESC', [req.user.id]); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
