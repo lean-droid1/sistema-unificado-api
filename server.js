@@ -536,6 +536,25 @@ app.delete('/api/categorias/:categoria', auth('admin'), async (req,res)=>{ try{ 
 app.delete('/api/productos/all', auth('admin'), async (req,res)=>{ try{ await pool.query('DELETE FROM productos'); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 app.get('/api/productos/buscar', async (req,res)=>{ try{ const {q}=req.query; if(!q) return res.json([]); const {rows}=await pool.query("SELECT id,nombre,modelo,categoria,precio_base,stock,imagen FROM productos WHERE nombre ILIKE $1 OR modelo ILIKE $1 OR categoria ILIKE $1 OR sku ILIKE $1 ORDER BY nombre LIMIT 20", [`%${q}%`]); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
 
+// Validar presupuesto antes de convertir: chequear stock y precios actuales
+app.post('/api/pedidos/:id/validar-conversion', auth('admin'), async (req,res)=>{
+  try{
+    const {rows:items}=await pool.query('SELECT * FROM pedido_items WHERE pedido_id=$1', [req.params.id]);
+    if(!items.length) return res.status(400).json({error:'Sin items'});
+    const prodIds=items.map(i=>i.producto_id).filter(Boolean);
+    const {rows:prods}=await pool.query(`SELECT id,nombre,modelo,precio_base,stock FROM productos WHERE id = ANY($1)`, [prodIds]);
+    const prodMap={}; prods.forEach(p=>prodMap[p.id]=p);
+    const cambios=[];
+    items.forEach(it=>{
+      const prod=prodMap[it.producto_id];
+      if(!prod){ cambios.push({item:it.nombre_producto, tipo:'eliminado', detalle:'Producto ya no existe'}); return; }
+      if(prod.stock<it.cantidad) cambios.push({item:it.nombre_producto, tipo:'stock', detalle:`Stock actual: ${prod.stock}, pedido: ${it.cantidad}`, stock_actual:prod.stock});
+      if(Number(prod.precio_base)!==Number(it.precio_unitario)) cambios.push({item:it.nombre_producto, tipo:'precio', detalle:`Precio actual: ${prod.precio_base}, presupuesto: ${it.precio_unitario}`, precio_actual:prod.precio_base, precio_presup:it.precio_unitario});
+    });
+    res.json({ok:true, cambios, tiene_cambios:cambios.length>0});
+  }catch(e){ res.status(500).json({error:e.message}); }
+});
+
 // IMAGENES y VARIANTES (igual que antes)
 app.get('/api/producto-imagenes/:producto_id', async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM producto_imagenes WHERE producto_id=$1 ORDER BY orden', [req.params.producto_id]); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
 app.post('/api/producto-imagenes', auth('admin'), async (req,res)=>{ try{ const {producto_id,url,orden}=req.body; const {rows}=await pool.query('INSERT INTO producto_imagenes (producto_id,url,orden) VALUES ($1,$2,$3) RETURNING *', [producto_id,url,orden||0]); res.json(rows[0]); }catch(e){ res.status(500).json({error:e.message}); } });
@@ -611,9 +630,14 @@ app.get('/api/pedidos/:id', auth(), async (req,res)=>{ try{ const {rows}=await p
 app.post('/api/pedidos', auth(), async (req,res)=>{
   const client=await pool.connect();
   try{
-    const {seccion_id,items,tipo,metodo_pago,notas,cupon_codigo,subtotal,descuento,total,datos_envio,notificar_wa,costo_envio,metodo_envio,cp_destino,is_test}=req.body;
+    const {seccion_id,items,tipo,metodo_pago,notas,cupon_codigo,subtotal,descuento,total,datos_envio,notificar_wa,costo_envio,metodo_envio,cp_destino,is_test,usuario_id}=req.body;
     await client.query('BEGIN');
-    // Validar stock si corresponde
+    const esPresupuesto = tipo === 'presupuesto';
+    // Si es admin/subadmin y manda usuario_id (ej presupuesto para un cliente), usarlo; si no, el usuario logueado
+    const esAdmin = ['admin','subadmin'].includes(req.user.rol);
+    const pedidoUserId = (esAdmin && usuario_id !== undefined) ? usuario_id : req.user.id;
+    // Validar stock solo si NO es presupuesto
+    if (!esPresupuesto) {
     for(const item of (items||[])){
       const {rows:prod}=await client.query('SELECT stock, permitir_sin_stock, es_digital, seccion_id FROM productos WHERE id=$1', [item.producto_id]);
       if(!prod[0]) continue;
@@ -624,15 +648,18 @@ app.post('/api/pedidos', auth(), async (req,res)=>{
         return res.status(400).json({error:`Sin stock: ${item.nombre_producto||''} stock:${prod[0].stock}`});
       }
     }
+    }
     const {rows}=await client.query('INSERT INTO pedidos (usuario_id,seccion_id,tipo,metodo_pago,notas,cupon_codigo,subtotal,descuento,total,datos_envio,notificar_wa,costo_envio,metodo_envio,cp_destino,is_test) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING *',
-      [req.user.id, seccion_id, tipo||'pedido', metodo_pago||'', notas||'', cupon_codigo||'', subtotal||0, descuento||0, total||0, datos_envio||'', notificar_wa!==false, costo_envio||0, metodo_envio||'', cp_destino||'', is_test||false]);
+      [pedidoUserId, seccion_id, tipo||'pedido', metodo_pago||'', notas||'', cupon_codigo||'', subtotal||0, descuento||0, total||0, datos_envio||'', notificar_wa!==false, costo_envio||0, metodo_envio||'', cp_destino||'', is_test||false]);
     for(const item of (items||[])){
       await client.query('INSERT INTO pedido_items (pedido_id,producto_id,categoria,modelo,nombre_producto,cantidad,precio_unitario,precio_base) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)',
         [rows[0].id, item.producto_id, item.categoria||'', item.modelo||'', item.nombre_producto||'', item.cantidad||1, item.precio_unitario||0, item.precio_base||0]);
-      // Descontar stock si no es sin stock
+      // Descontar stock solo si NO es presupuesto
+      if (!esPresupuesto) {
       const {rows:prod}=await client.query('SELECT permitir_sin_stock, es_digital FROM productos WHERE id=$1', [item.producto_id]);
       if(prod[0] && !prod[0].permitir_sin_stock && !prod[0].es_digital){
         await client.query('UPDATE productos SET stock = GREATEST(0, stock - $1) WHERE id=$2 AND permitir_sin_stock=false AND es_digital=false', [item.cantidad||1, item.producto_id]);
+      }
       }
     }
     if(cupon_codigo) await client.query("UPDATE cupones SET usos_actuales = usos_actuales + 1 WHERE codigo=$1", [cupon_codigo]).catch(()=>{});
@@ -702,10 +729,17 @@ app.put('/api/pedidos/:id', auth('admin'), async (req,res)=>{
     const cancelSt=['cancelado','anulado','rechazado'];
     const seCancela=cancelSt.includes(nuevoEstado)&&!cancelSt.includes(oldEstado);
     const seReactiva=!cancelSt.includes(nuevoEstado)&&cancelSt.includes(oldEstado);
+    // Detectar conversión presupuesto → pedido (descontar stock)
+    const {rows:tipoPrev}=await pool.query('SELECT tipo FROM pedidos WHERE id=$1', [req.params.id]);
+    const oldTipo=String((tipoPrev[0]||{}).tipo||'');
+    const nuevoTipo=p.tipo||oldTipo;
+    const seConvierte=oldTipo==='presupuesto'&&nuevoTipo==='pedido';
     const stockAdd={};
     if(seCancela){ for(const pid in oldMap) stockAdd[pid]=(stockAdd[pid]||0)+oldMap[pid]; }
     else if(seReactiva){ const base=p.items||oldItemsRows.map(it=>({producto_id:it.producto_id,cantidad:it.cantidad})); for(const it of base){ const pid=it.producto_id||it.id; if(pid) stockAdd[pid]=(stockAdd[pid]||0)-(it.cantidad||it.qty||0); } }
     else if(p.items){ const newMap={}; for(const it of p.items){ const pid=it.producto_id||it.id; if(pid) newMap[pid]=(newMap[pid]||0)+(it.cantidad||it.qty||0); } const pids=new Set([...Object.keys(oldMap),...Object.keys(newMap)]); for(const pid of pids){ const d=(oldMap[pid]||0)-(newMap[pid]||0); if(d!==0) stockAdd[pid]=(stockAdd[pid]||0)+d; } }
+    // Conversión presupuesto→pedido: descontar stock de todos los items
+    if(seConvierte){ const itemsActuales=p.items||oldItemsRows; for(const it of itemsActuales){ const pid=it.producto_id||it.id; if(pid) stockAdd[pid]=(stockAdd[pid]||0)-(it.cantidad||it.qty||0); } }
     for(const pid in stockAdd){ const q=stockAdd[pid]; if(q) await pool.query('UPDATE productos SET stock=GREATEST(0, stock + $1) WHERE id=$2 AND permitir_sin_stock=false AND es_digital=false', [q, pid]); }
     res.json({ok:true});
   }catch(e){ res.status(500).json({error:e.message}); }
