@@ -79,8 +79,29 @@ const auth = (role) => async (req,res,next)=>{
       const {rows} = await pool.query('SELECT rol, activo FROM usuarios WHERE id=$1', [d.id]).catch(()=>({rows:[]}));
       if(!rows[0] || !rows[0].activo) return res.status(401).json({error:'Cuenta desactivada'});
       if(role==='admin' && rows[0].rol!=='admin') return res.status(403).json({error:'Sin permiso'});
+      req._rol = rows[0].rol;
     }
     req.user=d; req._token=t; next();
+  }catch{ res.status(401).json({error:'Token inválido'}); }
+};
+// Middleware que exige un permiso específico: admin pasa siempre; subadmin solo si tiene el permiso; cliente NO
+const authPerm = (permiso) => async (req,res,next)=>{
+  try{
+    const t = req.headers.authorization?.split(' ')[1];
+    if(!t) return res.status(401).json({error:'Token requerido'});
+    const revoked = await pool.query('SELECT 1 FROM tokens_revocados WHERE token_hash=$1', [hashToken(t)]).catch(()=>({rows:[]}));
+    if(revoked.rows.length) return res.status(401).json({error:'Sesión cerrada'});
+    const d = jwt.verify(t, JWT_SECRET);
+    const {rows} = await pool.query('SELECT rol, activo, permisos FROM usuarios WHERE id=$1', [d.id]).catch(()=>({rows:[]}));
+    if(!rows[0] || !rows[0].activo) return res.status(401).json({error:'Cuenta desactivada'});
+    const rol = rows[0].rol;
+    if(rol === 'admin'){ req.user=d; req._token=t; req._rol=rol; return next(); }
+    if(rol === 'subadmin'){
+      const perms = String(rows[0].permisos||'').split(',').filter(Boolean);
+      if(perms.includes(permiso)){ req.user=d; req._token=t; req._rol=rol; return next(); }
+      return res.status(403).json({error:`Sin permiso: ${permiso}`});
+    }
+    return res.status(403).json({error:'Sin permiso'});
   }catch{ res.status(401).json({error:'Token inválido'}); }
 };
 const optionalAuth = (req,res,next)=>{ try{ const t=req.headers.authorization?.split(' ')[1]; if(t) req.user=jwt.verify(t,JWT_SECRET);}catch{} next(); };
@@ -309,7 +330,7 @@ app.get('/api/dolar-blue', async (req,res)=>{
 app.get('/api/maintenance-status', async (req,res)=>{
   try{ const {rows}=await pool.query("SELECT clave,valor FROM configuracion WHERE clave IN ('mantenimiento_activo','mantenimiento_mensaje','mantenimiento_countdown')"); const cfg={}; rows.forEach(r=>cfg[r.clave]=r.valor); res.json({activo:cfg.mantenimiento_activo==='true', mensaje:cfg.mantenimiento_mensaje||'', countdown:cfg.mantenimiento_countdown||''}); }catch{ res.json({activo:false}); }
 });
-app.post('/api/maintenance-mode', auth('admin'), async (req,res)=>{
+app.post('/api/maintenance-mode', authPerm('config'), async (req,res)=>{
   try{ const {activo,mensaje,countdown}=req.body; await pool.query("INSERT INTO configuracion (clave,valor) VALUES ('mantenimiento_activo',$1) ON CONFLICT (clave) DO UPDATE SET valor=$1", [activo?'true':'false']); await pool.query("INSERT INTO configuracion (clave,valor) VALUES ('mantenimiento_mensaje',$1) ON CONFLICT (clave) DO UPDATE SET valor=$1", [mensaje||'']); await pool.query("INSERT INTO configuracion (clave,valor) VALUES ('mantenimiento_countdown',$1) ON CONFLICT (clave) DO UPDATE SET valor=$1", [countdown||'']); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); }
 });
 
@@ -404,40 +425,40 @@ app.put('/api/me', auth(), async (req,res)=>{
 
 // CONFIG
 app.get('/api/config', async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM configuracion'); const cfg={}; rows.forEach(r=>cfg[r.clave]=r.valor); res.json(cfg); }catch(e){ res.status(500).json({error:e.message}); } });
-app.put('/api/config', auth('admin'), async (req,res)=>{ try{ for(const [k,v] of Object.entries(req.body)){ await pool.query("INSERT INTO configuracion (clave,valor) VALUES ($1,$2) ON CONFLICT (clave) DO UPDATE SET valor=$2", [k,v]); } res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.put('/api/config', authPerm('config'), async (req,res)=>{ try{ for(const [k,v] of Object.entries(req.body)){ await pool.query("INSERT INTO configuracion (clave,valor) VALUES ($1,$2) ON CONFLICT (clave) DO UPDATE SET valor=$2", [k,v]); } res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 
 // LISTAS
 app.get('/api/listas', async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM listas_precio ORDER BY multiplicador'); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
-app.put('/api/listas', auth('admin'), async (req,res)=>{ try{ const {listas}=req.body; for(const l of listas){ await pool.query('INSERT INTO listas_precio (id,nombre,multiplicador,modo,color,compra_minima,promo_msg) VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT (id) DO UPDATE SET nombre=$2,multiplicador=$3,modo=$4,color=$5,compra_minima=$6,promo_msg=$7', [l.id,l.nombre,l.multiplicador,l.modo||'porcentaje',l.color||'#2563eb',l.compra_minima||0,l.promo_msg||'']); } res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
-app.post('/api/listas', auth('admin'), async (req,res)=>{ try{ const l=req.body; const {rows}=await pool.query('INSERT INTO listas_precio (id,nombre,multiplicador,modo,color,compra_minima,promo_msg) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *', [l.id,l.nombre,l.multiplicador||1,l.modo||'porcentaje',l.color||'#2563eb',l.compra_minima||0,l.promo_msg||'']); res.json(rows[0]); }catch(e){ res.status(400).json({error:e.message}); } });
-app.put('/api/listas/:id', auth('admin'), async (req,res)=>{ try{ const l=req.body; await pool.query('UPDATE listas_precio SET nombre=$1,multiplicador=$2,modo=$3,color=$4,compra_minima=$5,promo_msg=$6 WHERE id=$7', [l.nombre,l.multiplicador,l.modo,l.color,l.compra_minima||0,l.promo_msg||'',req.params.id]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
-app.delete('/api/listas/:id', auth('admin'), async (req,res)=>{ try{ await pool.query('DELETE FROM listas_precio WHERE id=$1', [req.params.id]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.put('/api/listas', authPerm('listas'), async (req,res)=>{ try{ const {listas}=req.body; for(const l of listas){ await pool.query('INSERT INTO listas_precio (id,nombre,multiplicador,modo,color,compra_minima,promo_msg) VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT (id) DO UPDATE SET nombre=$2,multiplicador=$3,modo=$4,color=$5,compra_minima=$6,promo_msg=$7', [l.id,l.nombre,l.multiplicador,l.modo||'porcentaje',l.color||'#2563eb',l.compra_minima||0,l.promo_msg||'']); } res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.post('/api/listas', authPerm('listas'), async (req,res)=>{ try{ const l=req.body; const {rows}=await pool.query('INSERT INTO listas_precio (id,nombre,multiplicador,modo,color,compra_minima,promo_msg) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *', [l.id,l.nombre,l.multiplicador||1,l.modo||'porcentaje',l.color||'#2563eb',l.compra_minima||0,l.promo_msg||'']); res.json(rows[0]); }catch(e){ res.status(400).json({error:e.message}); } });
+app.put('/api/listas/:id', authPerm('listas'), async (req,res)=>{ try{ const l=req.body; await pool.query('UPDATE listas_precio SET nombre=$1,multiplicador=$2,modo=$3,color=$4,compra_minima=$5,promo_msg=$6 WHERE id=$7', [l.nombre,l.multiplicador,l.modo,l.color,l.compra_minima||0,l.promo_msg||'',req.params.id]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.delete('/api/listas/:id', authPerm('listas'), async (req,res)=>{ try{ await pool.query('DELETE FROM listas_precio WHERE id=$1', [req.params.id]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 
 // SECCIONES V4 con ignorar_stock
 app.get('/api/secciones', async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM secciones ORDER BY orden, id'); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
 app.get('/api/secciones/:id', async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM secciones WHERE id=$1', [req.params.id]); if(!rows[0]) return res.status(404).json({error:'No encontrada'}); res.json(rows[0]); }catch(e){ res.status(500).json({error:e.message}); } });
-app.put('/api/secciones/:id', auth('admin'), async (req,res)=>{
+app.put('/api/secciones/:id', authPerm('config'), async (req,res)=>{
   try{
     const {nombre,slug,descripcion,imagen,requiere_aprobacion,visible,orden,ignorar_stock,cp_origen,permitir_sin_stock}=req.body;
     await pool.query('UPDATE secciones SET nombre=$1,slug=$2,descripcion=$3,imagen=$4,requiere_aprobacion=$5,visible=$6,orden=$7,ignorar_stock=$8,cp_origen=$9,permitir_sin_stock=$10 WHERE id=$11', [nombre,slug,descripcion,imagen,requiere_aprobacion,visible,orden||0,ignorar_stock||false,cp_origen||'1888',permitir_sin_stock||false,req.params.id]);
     res.json({ok:true});
   }catch(e){ res.status(500).json({error:e.message}); }
 });
-app.post('/api/secciones', auth('admin'), async (req,res)=>{
+app.post('/api/secciones', authPerm('config'), async (req,res)=>{
   try{
     const {nombre,slug,descripcion,imagen,requiere_aprobacion,ignorar_stock,cp_origen}=req.body;
     const {rows}=await pool.query('INSERT INTO secciones (nombre,slug,descripcion,imagen,requiere_aprobacion,ignorar_stock,cp_origen) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *', [nombre,slug,descripcion||'',imagen||'',requiere_aprobacion||false,ignorar_stock||false,cp_origen||'1888']);
     res.json(rows[0]);
   }catch(e){ res.status(400).json({error:e.message}); }
 });
-app.delete('/api/secciones/:id', auth('admin'), async (req,res)=>{ try{ await pool.query('DELETE FROM secciones WHERE id=$1', [req.params.id]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.delete('/api/secciones/:id', authPerm('config'), async (req,res)=>{ try{ await pool.query('DELETE FROM secciones WHERE id=$1', [req.params.id]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 
 // UPLOAD
 const uploadToCloudinary = (buffer, folder='productos')=> new Promise((resolve,reject)=>{
   const stream=cloudinary.uploader.upload_stream({folder, resource_type:'image', quality:'auto', fetch_format:'auto'}, (err,result)=>{ if(err) reject(err); else resolve(result); });
   stream.end(buffer);
 });
-app.post('/api/upload', auth('admin'), upload.single('imagen'), async (req,res)=>{
+app.post('/api/upload', authPerm('config'), upload.single('imagen'), async (req,res)=>{
   try{
     if(!req.file) return res.status(400).json({error:'No file'});
     if(useCloudinary){
@@ -450,7 +471,7 @@ app.post('/api/upload', auth('admin'), upload.single('imagen'), async (req,res)=
     return res.json({url:`/uploads/${name}`});
   }catch(e){ res.status(500).json({error:e.message}); }
 });
-app.post('/api/upload-base64', auth('admin'), async (req,res)=>{
+app.post('/api/upload-base64', authPerm('config'), async (req,res)=>{
   try{
     const {data, filename} = req.body;
     if(!data) return res.status(400).json({error:'No data'});
@@ -494,7 +515,7 @@ app.get('/api/productos', optionalAuth, async (req,res)=>{
   }catch(e){ res.status(500).json({error:e.message}); }
 });
 app.get('/api/categorias', async (req,res)=>{ try{ const {seccion_id}=req.query; let q='SELECT DISTINCT categoria FROM productos WHERE visible=true'; const params=[]; if(seccion_id){ q+=' AND seccion_id=$1'; params.push(seccion_id); } q+=' ORDER BY categoria'; const {rows}=await pool.query(q, params); res.json(rows.map(r=>r.categoria).filter(Boolean)); }catch(e){ res.status(500).json({error:e.message}); } });
-app.post('/api/productos', auth('admin'), async (req,res)=>{
+app.post('/api/productos', authPerm('productos'), async (req,res)=>{
   try{
     const p=req.body;
     const {rows}=await pool.query(`INSERT INTO productos (seccion_id,categoria,modelo,nombre,precio_base,precio_original,stock,stock_minimo,imagen,notas,compatibilidad,descripcion,sku,tipo,moneda,precio_oferta,envio_gratis,visible,peso,alto,ancho,largo,permitir_sin_stock,es_digital) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24) RETURNING *`,
@@ -502,7 +523,7 @@ app.post('/api/productos', auth('admin'), async (req,res)=>{
     res.json(rows[0]);
   }catch(e){ res.status(500).json({error:e.message}); }
 });
-app.put('/api/productos/:id', auth('admin'), async (req,res)=>{
+app.put('/api/productos/:id', authPerm('productos'), async (req,res)=>{
   try{
     const p=req.body;
     const fields=['seccion_id','categoria','modelo','nombre','precio_base','precio_original','stock','stock_minimo','imagen','notas','compatibilidad','descripcion','sku','tipo','moneda','precio_oferta','envio_gratis','visible','peso','alto','ancho','largo','permitir_sin_stock','es_digital'];
@@ -521,8 +542,8 @@ app.put('/api/productos/:id', auth('admin'), async (req,res)=>{
     res.json({ok:true});
   }catch(e){ res.status(500).json({error:e.message}); }
 });
-app.delete('/api/productos/:id', auth('admin'), async (req,res)=>{ try{ await pool.query('DELETE FROM productos WHERE id=$1', [req.params.id]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
-app.post('/api/productos/bulk', auth('admin'), async (req,res)=>{
+app.delete('/api/productos/:id', authPerm('productos'), async (req,res)=>{ try{ await pool.query('DELETE FROM productos WHERE id=$1', [req.params.id]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.post('/api/productos/bulk', authPerm('productos'), async (req,res)=>{
   try{
     const {productos, reemplazar} = req.body;
     if(reemplazar){ await pool.query('DELETE FROM producto_imagenes'); await pool.query('DELETE FROM pedido_items'); await pool.query('DELETE FROM productos'); }
@@ -532,12 +553,13 @@ app.post('/api/productos/bulk', auth('admin'), async (req,res)=>{
     res.json({ok:true, count: productos.length, insertados: productos.length});
   }catch(e){ res.status(500).json({error:e.message}); }
 });
-app.delete('/api/categorias/:categoria', auth('admin'), async (req,res)=>{ try{ await pool.query('DELETE FROM productos WHERE categoria=$1', [req.params.categoria]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
-app.delete('/api/productos/all', auth('admin'), async (req,res)=>{ try{ await pool.query('DELETE FROM productos'); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.delete('/api/categorias/:categoria', authPerm('productos'), async (req,res)=>{ try{ await pool.query('DELETE FROM productos WHERE categoria=$1', [req.params.categoria]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.delete('/api/productos/all', authPerm('productos'), async (req,res)=>{ try{ await pool.query('DELETE FROM productos'); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 app.get('/api/productos/buscar', async (req,res)=>{ try{ const {q}=req.query; if(!q) return res.json([]); const {rows}=await pool.query("SELECT id,nombre,modelo,categoria,precio_base,stock,imagen FROM productos WHERE nombre ILIKE $1 OR modelo ILIKE $1 OR categoria ILIKE $1 OR sku ILIKE $1 ORDER BY nombre LIMIT 20", [`%${q}%`]); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
+app.get('/api/productos/id/:id', async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM productos WHERE id=$1', [req.params.id]); if(!rows[0]) return res.status(404).json({error:'No encontrado'}); res.json(rows[0]); }catch(e){ res.status(500).json({error:e.message}); } });
 
 // Validar presupuesto antes de convertir: chequear stock y precios actuales
-app.post('/api/pedidos/:id/validar-conversion', auth('admin'), async (req,res)=>{
+app.post('/api/pedidos/:id/validar-conversion', authPerm('pedidos'), async (req,res)=>{
   try{
     const {rows:items}=await pool.query('SELECT * FROM pedido_items WHERE pedido_id=$1', [req.params.id]);
     if(!items.length) return res.status(400).json({error:'Sin items'});
@@ -557,34 +579,40 @@ app.post('/api/pedidos/:id/validar-conversion', auth('admin'), async (req,res)=>
 
 // IMAGENES y VARIANTES (igual que antes)
 app.get('/api/producto-imagenes/:producto_id', async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM producto_imagenes WHERE producto_id=$1 ORDER BY orden', [req.params.producto_id]); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
-app.post('/api/producto-imagenes', auth('admin'), async (req,res)=>{ try{ const {producto_id,url,orden}=req.body; const {rows}=await pool.query('INSERT INTO producto_imagenes (producto_id,url,orden) VALUES ($1,$2,$3) RETURNING *', [producto_id,url,orden||0]); res.json(rows[0]); }catch(e){ res.status(500).json({error:e.message}); } });
-app.delete('/api/producto-imagenes/:id', auth('admin'), async (req,res)=>{ try{ await pool.query('DELETE FROM producto_imagenes WHERE id=$1', [req.params.id]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
-app.put('/api/producto-imagenes/reorder', auth('admin'), async (req,res)=>{ try{ const {items}=req.body; for(const it of items){ await pool.query('UPDATE producto_imagenes SET orden=$1 WHERE id=$2', [it.orden,it.id]); } res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.post('/api/producto-imagenes', authPerm('productos'), async (req,res)=>{ try{ const {producto_id,url,orden}=req.body; const {rows}=await pool.query('INSERT INTO producto_imagenes (producto_id,url,orden) VALUES ($1,$2,$3) RETURNING *', [producto_id,url,orden||0]); res.json(rows[0]); }catch(e){ res.status(500).json({error:e.message}); } });
+app.delete('/api/producto-imagenes/:id', authPerm('productos'), async (req,res)=>{ try{ await pool.query('DELETE FROM producto_imagenes WHERE id=$1', [req.params.id]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.put('/api/producto-imagenes/reorder', authPerm('productos'), async (req,res)=>{ try{ const {items}=req.body; for(const it of items){ await pool.query('UPDATE producto_imagenes SET orden=$1 WHERE id=$2', [it.orden,it.id]); } res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 app.get('/api/variantes/:producto_id', async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM variantes WHERE producto_id=$1 ORDER BY id', [req.params.producto_id]); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
-app.post('/api/variantes', auth('admin'), async (req,res)=>{ try{ const {producto_id,nombre,valor,stock,precio_extra}=req.body; const {rows}=await pool.query('INSERT INTO variantes (producto_id,nombre,valor,stock,precio_extra) VALUES ($1,$2,$3,$4,$5) RETURNING *', [producto_id,nombre,valor||'',stock||0,precio_extra||0]); res.json(rows[0]); }catch(e){ res.status(500).json({error:e.message}); } });
-app.put('/api/variantes/:id', auth('admin'), async (req,res)=>{ try{ const v=req.body; await pool.query('UPDATE variantes SET nombre=$1,valor=$2,stock=$3,precio_extra=$4 WHERE id=$5', [v.nombre,v.valor,v.stock||0,v.precio_extra||0,req.params.id]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
-app.delete('/api/variantes/:id', auth('admin'), async (req,res)=>{ try{ await pool.query('DELETE FROM variantes WHERE id=$1', [req.params.id]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.post('/api/variantes', authPerm('productos'), async (req,res)=>{ try{ const {producto_id,nombre,valor,stock,precio_extra}=req.body; const {rows}=await pool.query('INSERT INTO variantes (producto_id,nombre,valor,stock,precio_extra) VALUES ($1,$2,$3,$4,$5) RETURNING *', [producto_id,nombre,valor||'',stock||0,precio_extra||0]); res.json(rows[0]); }catch(e){ res.status(500).json({error:e.message}); } });
+app.put('/api/variantes/:id', authPerm('productos'), async (req,res)=>{ try{ const v=req.body; await pool.query('UPDATE variantes SET nombre=$1,valor=$2,stock=$3,precio_extra=$4 WHERE id=$5', [v.nombre,v.valor,v.stock||0,v.precio_extra||0,req.params.id]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.delete('/api/variantes/:id', authPerm('productos'), async (req,res)=>{ try{ await pool.query('DELETE FROM variantes WHERE id=$1', [req.params.id]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 
 // PRECIOS
-app.post('/api/precios/ajustar', auth('admin'), async (req,res)=>{
+app.post('/api/precios/ajustar', authPerm('productos'), async (req,res)=>{
   try{
     const {porcentaje,categoria}=req.body;
-    if(categoria) await pool.query('UPDATE productos SET precio_base = precio_base * (1+$1/100)', [porcentaje]).catch(async()=>{ await pool.query('UPDATE productos SET precio_base = precio_base * $1 WHERE categoria=$2', [1+porcentaje/100, categoria]); });
+    // Capturar precios anteriores para el historial
+    const selQ = categoria ? 'SELECT id, precio_base FROM productos WHERE categoria=$1' : 'SELECT id, precio_base FROM productos';
+    const {rows:antes} = await pool.query(selQ, categoria ? [categoria] : []);
+    if(categoria) await pool.query('UPDATE productos SET precio_base = precio_base * $1 WHERE categoria=$2', [1+porcentaje/100, categoria]);
     else await pool.query('UPDATE productos SET precio_base = precio_base * (1+$1/100)', [porcentaje]);
-    res.json({ok:true});
+    // Registrar historial (masivo)
+    const usr = (req.user.usuario||'admin') + ' (ajuste masivo ' + (porcentaje>0?'+':'') + porcentaje + '%' + (categoria?' '+categoria:'') + ')';
+    for(const a of antes){ const nuevo = Number(a.precio_base) * (1+porcentaje/100); if(Number(a.precio_base)!==nuevo) await pool.query('INSERT INTO historial_precios (producto_id,precio_anterior,precio_nuevo,usuario) VALUES ($1,$2,$3,$4)', [a.id, a.precio_base, nuevo.toFixed(2), usr]).catch(()=>{}); }
+    res.json({ok:true, ajustados:antes.length});
   }catch(e){ res.status(500).json({error:e.message}); }
 });
-app.post('/api/precios/reset', auth('admin'), async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM historial_precios ORDER BY created_at DESC'); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
-app.get('/api/historial-precios', auth('admin'), async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM historial_precios ORDER BY created_at DESC LIMIT 200'); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
-app.get('/api/precios-fijos', auth('admin'), async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM precios_fijos'); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
-app.post('/api/precios-fijos', auth('admin'), async (req,res)=>{ try{ const {producto_id,lista_precio_id,precio_fijo}=req.body; await pool.query('INSERT INTO precios_fijos (producto_id,lista_precio_id,precio_fijo) VALUES ($1,$2,$3) ON CONFLICT (producto_id,lista_precio_id) DO UPDATE SET precio_fijo=$3', [producto_id,lista_precio_id,precio_fijo]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.post('/api/precios/reset', authPerm('productos'), async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM historial_precios ORDER BY created_at DESC'); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.get('/api/historial-precios', authPerm('productos'), async (req,res)=>{ try{ const {rows}=await pool.query('SELECT h.*, p.nombre, p.modelo, p.categoria FROM historial_precios h LEFT JOIN productos p ON h.producto_id=p.id ORDER BY h.created_at DESC LIMIT 200'); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
+app.get('/api/precios-fijos', authPerm('productos'), async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM precios_fijos'); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
+app.post('/api/precios-fijos', authPerm('productos'), async (req,res)=>{ try{ const {producto_id,lista_precio_id,precio_fijo}=req.body; await pool.query('INSERT INTO precios_fijos (producto_id,lista_precio_id,precio_fijo) VALUES ($1,$2,$3) ON CONFLICT (producto_id,lista_precio_id) DO UPDATE SET precio_fijo=$3', [producto_id,lista_precio_id,precio_fijo]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 
 // USUARIOS
-app.get('/api/usuarios', auth('admin'), async (req,res)=>{
+app.get('/api/usuarios', authPerm('usuarios'), async (req,res)=>{
   try{ const {q}=req.query; let query='SELECT * FROM usuarios ORDER BY created_at DESC'; const params=[]; if(q){ query="SELECT * FROM usuarios WHERE nombre ILIKE $1 OR usuario ILIKE $1 OR nombre_fantasia ILIKE $1 OR email ILIKE $1 OR telefono ILIKE $1 ORDER BY created_at DESC"; params.push(`%${q}%`); } const {rows}=await pool.query(query, params); res.json(rows.map(u=>({...u,password:undefined}))); }catch(e){ res.status(500).json({error:e.message}); }
 });
-app.get('/api/usuarios/pendientes/count', auth('admin'), async (req,res)=>{ try{ const {rows}=await pool.query("SELECT COUNT(*) FROM usuarios WHERE aprobado=false AND activo=false"); res.json({count:parseInt(rows[0].count)}); }catch{ res.json({count:0}); } });
-app.put('/api/usuarios/:id', auth('admin'), async (req,res)=>{
+app.get('/api/usuarios/pendientes/count', authPerm('usuarios'), async (req,res)=>{ try{ const {rows}=await pool.query("SELECT COUNT(*) FROM usuarios WHERE aprobado=false AND activo=false"); res.json({count:parseInt(rows[0].count)}); }catch{ res.json({count:0}); } });
+app.put('/api/usuarios/:id', authPerm('usuarios'), async (req,res)=>{
   try{
     const u=req.body; const sets=[]; const params=[]; let pi=1;
     const fields=['nombre','usuario','telefono','email','direccion','nombre_fantasia','rol','lista_precio_id','activo','aprobado','permisos','notas_admin','es_revendedor','descuento_revendedor'];
@@ -596,11 +624,11 @@ app.put('/api/usuarios/:id', auth('admin'), async (req,res)=>{
     res.json({ok:true});
   }catch(e){ res.status(500).json({error:e.message}); }
 });
-app.post('/api/usuarios/:id/aprobar', auth('admin'), async (req,res)=>{ try{ const {lista_precio_id}=req.body; await pool.query('UPDATE usuarios SET aprobado=true, activo=true, lista_precio_id=$1 WHERE id=$2', [lista_precio_id||'', req.params.id]); const {rows}=await pool.query('SELECT * FROM usuarios WHERE id=$1', [req.params.id]); res.json({ok:true, user:{...rows[0], password:undefined}}); }catch(e){ res.status(500).json({error:e.message}); } });
-app.post('/api/usuarios/:id/rechazar', auth('admin'), async (req,res)=>{ try{ await pool.query('UPDATE usuarios SET activo=false WHERE id=$1', [req.params.id]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
-app.post('/api/usuarios/:id/suspender', auth('admin'), async (req,res)=>{ try{ const {activo}=req.body; await pool.query('UPDATE usuarios SET activo=$1 WHERE id=$2', [activo, req.params.id]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.post('/api/usuarios/:id/aprobar', authPerm('usuarios'), async (req,res)=>{ try{ const {lista_precio_id}=req.body; await pool.query('UPDATE usuarios SET aprobado=true, activo=true, lista_precio_id=$1 WHERE id=$2', [lista_precio_id||'', req.params.id]); const {rows}=await pool.query('SELECT * FROM usuarios WHERE id=$1', [req.params.id]); res.json({ok:true, user:{...rows[0], password:undefined}}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.post('/api/usuarios/:id/rechazar', authPerm('usuarios'), async (req,res)=>{ try{ await pool.query('UPDATE usuarios SET activo=false WHERE id=$1', [req.params.id]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.post('/api/usuarios/:id/suspender', authPerm('usuarios'), async (req,res)=>{ try{ const {activo}=req.body; await pool.query('UPDATE usuarios SET activo=$1 WHERE id=$2', [activo, req.params.id]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 // RESET MEJORADO - codigo largo
-app.post('/api/usuarios/:id/reset-password', auth('admin'), async (req,res)=>{
+app.post('/api/usuarios/:id/reset-password', authPerm('usuarios'), async (req,res)=>{
   try{
     const codigo='KICKS-'+crypto.randomBytes(4).toString('hex').toUpperCase();
     const hash=await bcrypt.hash(codigo,10);
@@ -609,14 +637,20 @@ app.post('/api/usuarios/:id/reset-password', auth('admin'), async (req,res)=>{
     res.json({ok:true, codigo, nombre:rows[0]?.nombre, telefono:rows[0]?.telefono, email:rows[0]?.email});
   }catch(e){ res.status(500).json({error:e.message}); }
 });
-app.delete('/api/usuarios/:id', auth('admin'), async (req,res)=>{ try{ await pool.query('DELETE FROM pedido_items WHERE pedido_id IN (SELECT id FROM pedidos WHERE usuario_id=$1)', [req.params.id]); await pool.query('DELETE FROM pedidos WHERE usuario_id=$1', [req.params.id]); await pool.query('DELETE FROM usuarios WHERE id=$1', [req.params.id]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.delete('/api/usuarios/:id', authPerm('usuarios'), async (req,res)=>{ try{ await pool.query('DELETE FROM pedido_items WHERE pedido_id IN (SELECT id FROM pedidos WHERE usuario_id=$1)', [req.params.id]); await pool.query('DELETE FROM pedidos WHERE usuario_id=$1', [req.params.id]); await pool.query('DELETE FROM usuarios WHERE id=$1', [req.params.id]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 
 // PEDIDOS V4 - transaccion + is_test + costo_envio
 app.get('/api/pedidos', auth(), async (req,res)=>{
   try{
     const {all,archivado,seccion_id,tipo,is_test}=req.query;
     let where=[]; const params=[];
-    if(req.user.rol==='admin'){ if(archivado==='true') where.push('p.archivado=true'); else where.push('p.archivado=false'); if(is_test==='false') where.push('p.is_test=false'); }
+    // Leer rol+permisos SIEMPRE de la DB (no del token, que puede estar viejo)
+    const {rows:ur}=await pool.query('SELECT rol, permisos FROM usuarios WHERE id=$1',[req.user.id]).catch(()=>({rows:[]}));
+    const rolActual=String((ur[0]||{}).rol||req.user.rol||'');
+    const permsActual=String((ur[0]||{}).permisos||'').split(',').filter(Boolean);
+    // admin ve todo; subadmin con permiso 'pedidos' también; el resto solo lo suyo
+    const esStaff = rolActual==='admin' || (rolActual==='subadmin' && permsActual.includes('pedidos'));
+    if(esStaff){ if(archivado==='true') where.push('p.archivado=true'); else where.push('p.archivado=false'); if(is_test==='false') where.push('p.is_test=false'); }
     else{ where.push('p.usuario_id=$1'); params.push(req.user.id); }
     if(seccion_id){ where.push(`p.seccion_id=$${params.length+1}`); params.push(seccion_id); }
     if(tipo){ where.push(`p.tipo=$${params.length+1}`); params.push(tipo); }
@@ -709,14 +743,15 @@ app.post('/api/pedidos/multi', auth(), async (req,res)=>{
   finally{ client.release(); }
 });
 
-app.put('/api/pedidos/:id', auth('admin'), async (req,res)=>{
+app.put('/api/pedidos/:id', authPerm('pedidos'), async (req,res)=>{
   try{
     const p=req.body; const sets=[]; const params=[]; let pi=1;
-    // Capturar estado + items ANTES de cambios (para devolver stock)
+    // Capturar estado + tipo + items ANTES de cambios
     const {rows:oldItemsRows}=await pool.query('SELECT producto_id, cantidad FROM pedido_items WHERE pedido_id=$1', [req.params.id]);
     const oldMap={}; for(const it of oldItemsRows){ if(it.producto_id) oldMap[it.producto_id]=(oldMap[it.producto_id]||0)+(it.cantidad||0); }
-    const {rows:oldPedRows}=await pool.query('SELECT estado FROM pedidos WHERE id=$1', [req.params.id]);
+    const {rows:oldPedRows}=await pool.query('SELECT estado, tipo FROM pedidos WHERE id=$1', [req.params.id]);
     const oldEstado=String((oldPedRows[0]||{}).estado||'').toLowerCase();
+    const oldTipo=String((oldPedRows[0]||{}).tipo||'');
     const fields=['estado','tipo','metodo_pago','notas','total','subtotal','descuento','datos_envio','usuario_id','notificar_wa','is_test','costo_envio','metodo_envio','cp_destino'];
     for(const f of fields){ if(p[f]!==undefined){ sets.push(`${f}=$${pi++}`); params.push(p[f]); } }
     sets.push(`updated_at=NOW()`);
@@ -724,32 +759,41 @@ app.put('/api/pedidos/:id', auth('admin'), async (req,res)=>{
     params.push(req.params.id);
     await pool.query(`UPDATE pedidos SET ${sets.join(',')} WHERE id=$${pi}`, params);
     if(p.items){ await pool.query('DELETE FROM pedido_items WHERE pedido_id=$1', [req.params.id]); for(const item of p.items){ await pool.query('INSERT INTO pedido_items (pedido_id,producto_id,categoria,modelo,nombre_producto,cantidad,precio_unitario,precio_base) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)', [req.params.id, item.producto_id||item.id, item.categoria||'', item.modelo||'', item.nombre_producto||`${item.categoria} - ${item.modelo}`, item.cantidad||item.qty||1, item.precio_unitario||0, item.precio_base||0]); } }
-    // Reconciliar stock: devolver al cancelar, ajustar delta al editar items
+
+    // ── RECONCILIACIÓN DE STOCK ──
+    // Regla: el stock SOLO lo afectan PEDIDOS reales activos (no presupuestos, no cancelados).
+    // "afectaStock" = es pedido Y no está cancelado. Comparamos estado ANTES vs DESPUÉS.
     const nuevoEstado=(p.estado!==undefined)?String(p.estado).toLowerCase():oldEstado;
+    const nuevoTipo=(p.tipo!==undefined)?String(p.tipo):oldTipo;
     const cancelSt=['cancelado','anulado','rechazado'];
-    const seCancela=cancelSt.includes(nuevoEstado)&&!cancelSt.includes(oldEstado);
-    const seReactiva=!cancelSt.includes(nuevoEstado)&&cancelSt.includes(oldEstado);
-    // Detectar conversión presupuesto → pedido (descontar stock)
-    const {rows:tipoPrev}=await pool.query('SELECT tipo FROM pedidos WHERE id=$1', [req.params.id]);
-    const oldTipo=String((tipoPrev[0]||{}).tipo||'');
-    const nuevoTipo=p.tipo||oldTipo;
-    const seConvierte=oldTipo==='presupuesto'&&nuevoTipo==='pedido';
+    const afectabaStock = oldTipo==='pedido' && !cancelSt.includes(oldEstado);   // antes descontaba
+    const afectaStock   = nuevoTipo==='pedido' && !cancelSt.includes(nuevoEstado); // ahora descuenta
+    // items nuevos (si se editaron) o los viejos
+    const itemsNuevos = p.items ? p.items.map(it=>({pid:it.producto_id||it.id, qty:it.cantidad||it.qty||0})) : oldItemsRows.map(it=>({pid:it.producto_id, qty:it.cantidad||0}));
+    const newMap={}; for(const it of itemsNuevos){ if(it.pid) newMap[it.pid]=(newMap[it.pid]||0)+it.qty; }
     const stockAdd={};
-    if(seCancela){ for(const pid in oldMap) stockAdd[pid]=(stockAdd[pid]||0)+oldMap[pid]; }
-    else if(seReactiva){ const base=p.items||oldItemsRows.map(it=>({producto_id:it.producto_id,cantidad:it.cantidad})); for(const it of base){ const pid=it.producto_id||it.id; if(pid) stockAdd[pid]=(stockAdd[pid]||0)-(it.cantidad||it.qty||0); } }
-    else if(p.items){ const newMap={}; for(const it of p.items){ const pid=it.producto_id||it.id; if(pid) newMap[pid]=(newMap[pid]||0)+(it.cantidad||it.qty||0); } const pids=new Set([...Object.keys(oldMap),...Object.keys(newMap)]); for(const pid of pids){ const d=(oldMap[pid]||0)-(newMap[pid]||0); if(d!==0) stockAdd[pid]=(stockAdd[pid]||0)+d; } }
-    // Conversión presupuesto→pedido: descontar stock de todos los items
-    if(seConvierte){ const itemsActuales=p.items||oldItemsRows; for(const it of itemsActuales){ const pid=it.producto_id||it.id; if(pid) stockAdd[pid]=(stockAdd[pid]||0)-(it.cantidad||it.qty||0); } }
+    if(!afectabaStock && afectaStock){
+      // Pasó a descontar (presupuesto→pedido, o reactivación de cancelado): restar todo el nuevo
+      for(const pid in newMap) stockAdd[pid]=(stockAdd[pid]||0)-newMap[pid];
+    } else if(afectabaStock && !afectaStock){
+      // Dejó de descontar (pedido→presupuesto, o se canceló): devolver todo lo viejo
+      for(const pid in oldMap) stockAdd[pid]=(stockAdd[pid]||0)+oldMap[pid];
+    } else if(afectabaStock && afectaStock && p.items){
+      // Sigue siendo pedido activo pero cambiaron items: ajustar delta (viejo - nuevo)
+      const pids=new Set([...Object.keys(oldMap),...Object.keys(newMap)]);
+      for(const pid of pids){ const d=(oldMap[pid]||0)-(newMap[pid]||0); if(d!==0) stockAdd[pid]=(stockAdd[pid]||0)+d; }
+    }
+    // Si no afectaba ni afecta (presupuesto→presupuesto), no se toca nada.
     for(const pid in stockAdd){ const q=stockAdd[pid]; if(q) await pool.query('UPDATE productos SET stock=GREATEST(0, stock + $1) WHERE id=$2 AND permitir_sin_stock=false AND es_digital=false', [q, pid]); }
     res.json({ok:true});
   }catch(e){ res.status(500).json({error:e.message}); }
 });
-app.post('/api/pedidos/:id/archivar', auth('admin'), async (req,res)=>{ try{ await pool.query('UPDATE pedidos SET archivado=true WHERE id=$1', [req.params.id]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
-app.post('/api/pedidos/:id/desarchivar', auth('admin'), async (req,res)=>{ try{ await pool.query('UPDATE pedidos SET archivado=false WHERE id=$1', [req.params.id]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
-app.delete('/api/pedidos/:id', auth('admin'), async (req,res)=>{ try{ const {rows:oep}=await pool.query('SELECT estado FROM pedidos WHERE id=$1',[req.params.id]); const oe=String((oep[0]||{}).estado||'').toLowerCase(); if(!['cancelado','anulado','rechazado'].includes(oe)){ const {rows:its}=await pool.query('SELECT producto_id, cantidad FROM pedido_items WHERE pedido_id=$1',[req.params.id]); for(const it of its){ if(it.producto_id) await pool.query('UPDATE productos SET stock=GREATEST(0, stock + $1) WHERE id=$2 AND permitir_sin_stock=false AND es_digital=false',[it.cantidad||0, it.producto_id]); } } await pool.query('DELETE FROM pedido_items WHERE pedido_id=$1', [req.params.id]); await pool.query('DELETE FROM pedidos WHERE id=$1', [req.params.id]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.post('/api/pedidos/:id/archivar', authPerm('pedidos'), async (req,res)=>{ try{ await pool.query('UPDATE pedidos SET archivado=true WHERE id=$1', [req.params.id]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.post('/api/pedidos/:id/desarchivar', authPerm('pedidos'), async (req,res)=>{ try{ await pool.query('UPDATE pedidos SET archivado=false WHERE id=$1', [req.params.id]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.delete('/api/pedidos/:id', authPerm('pedidos'), async (req,res)=>{ try{ const {rows:oep}=await pool.query('SELECT estado, tipo FROM pedidos WHERE id=$1',[req.params.id]); const oe=String((oep[0]||{}).estado||'').toLowerCase(); const ot=String((oep[0]||{}).tipo||''); const afectabaStock = ot==='pedido' && !['cancelado','anulado','rechazado'].includes(oe); if(afectabaStock){ const {rows:its}=await pool.query('SELECT producto_id, cantidad FROM pedido_items WHERE pedido_id=$1',[req.params.id]); for(const it of its){ if(it.producto_id) await pool.query('UPDATE productos SET stock=GREATEST(0, stock + $1) WHERE id=$2 AND permitir_sin_stock=false AND es_digital=false',[it.cantidad||0, it.producto_id]); } } await pool.query('DELETE FROM pedido_items WHERE pedido_id=$1', [req.params.id]); await pool.query('DELETE FROM pedidos WHERE id=$1', [req.params.id]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 
 // STATS
-app.get('/api/stats', auth('admin'), async (req,res)=>{
+app.get('/api/stats', authPerm('stats'), async (req,res)=>{
   try{
     const {seccion_id,desde,hasta,is_test}=req.query;
     let secWhere=''; const params=[];
@@ -771,7 +815,7 @@ app.get('/api/stats', auth('admin'), async (req,res)=>{
 });
 
 // CUPONES, PROMOS, POPUPS, REDES, MENU, DESIGN, PAGOS, PAGINAS, BADGES, ENVIO, BUSQUEDA, SLIDER, FAVORITOS, STOCK, ANDREANI (se mantienen igual + fixes Andreani env)
-app.get('/api/cupones', auth('admin'), async (req,res)=>{ try{ const {rows}=await pool.query('SELECT c.*, array_agg(cp.producto_id) FILTER (WHERE cp.producto_id IS NOT NULL) as productos_ids FROM cupones c LEFT JOIN cupon_productos cp ON c.id=cp.cupon_id GROUP BY c.id ORDER BY c.created_at DESC'); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
+app.get('/api/cupones', authPerm('config'), async (req,res)=>{ try{ const {rows}=await pool.query('SELECT c.*, array_agg(cp.producto_id) FILTER (WHERE cp.producto_id IS NOT NULL) as productos_ids FROM cupones c LEFT JOIN cupon_productos cp ON c.id=cp.cupon_id GROUP BY c.id ORDER BY c.created_at DESC'); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
 app.post('/api/cupones/validar', async (req,res)=>{
   try{
     const {codigo,seccion_id,subtotal,metodo_pago,items}=req.body;
@@ -792,65 +836,65 @@ app.post('/api/cupones/validar', async (req,res)=>{
     res.json({descuento, tipo:c.tipo, valor:c.valor, codigo:c.codigo, cupon_id:c.id});
   }catch(e){ res.status(500).json({error:e.message}); }
 });
-app.post('/api/cupones', auth('admin'), async (req,res)=>{ try{ const c=req.body; const {rows}=await pool.query('INSERT INTO cupones (codigo,tipo,valor,secciones_ids,categoria,uso_maximo,monto_minimo,metodo_pago,activo,fecha_desde,fecha_hasta) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *', [c.codigo,c.tipo||'porcentaje',c.valor||0,c.secciones_ids||'',c.categoria||'',c.uso_maximo||0,c.monto_minimo||0,c.metodo_pago||'',c.activo!==false,c.fecha_desde||null,c.fecha_hasta||null]); if(c.productos_ids){ for(const pid of c.productos_ids){ await pool.query('INSERT INTO cupon_productos (cupon_id,producto_id) VALUES ($1,$2) ON CONFLICT DO NOTHING', [rows[0].id,pid]); } } res.json(rows[0]); }catch(e){ res.status(500).json({error:e.message}); } });
-app.put('/api/cupones/:id', auth('admin'), async (req,res)=>{ try{ const c=req.body; await pool.query('UPDATE cupones SET codigo=$1,tipo=$2,valor=$3,secciones_ids=$4,categoria=$5,uso_maximo=$6,monto_minimo=$7,metodo_pago=$8,activo=$9,fecha_desde=$10,fecha_hasta=$11 WHERE id=$12', [c.codigo,c.tipo,c.valor,c.secciones_ids||'',c.categoria||'',c.uso_maximo||0,c.monto_minimo||0,c.metodo_pago||'',c.activo!==false,c.fecha_desde||null,c.fecha_hasta||null,req.params.id]); await pool.query('DELETE FROM cupon_productos WHERE cupon_id=$1', [req.params.id]); if(c.productos_ids){ for(const pid of c.productos_ids){ await pool.query('INSERT INTO cupon_productos (cupon_id,producto_id) VALUES ($1,$2)', [req.params.id,pid]); } } res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
-app.delete('/api/cupones/:id', auth('admin'), async (req,res)=>{ try{ await pool.query('DELETE FROM cupones WHERE id=$1', [req.params.id]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.post('/api/cupones', authPerm('config'), async (req,res)=>{ try{ const c=req.body; const {rows}=await pool.query('INSERT INTO cupones (codigo,tipo,valor,secciones_ids,categoria,uso_maximo,monto_minimo,metodo_pago,activo,fecha_desde,fecha_hasta) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *', [c.codigo,c.tipo||'porcentaje',c.valor||0,c.secciones_ids||'',c.categoria||'',c.uso_maximo||0,c.monto_minimo||0,c.metodo_pago||'',c.activo!==false,c.fecha_desde||null,c.fecha_hasta||null]); if(c.productos_ids){ for(const pid of c.productos_ids){ await pool.query('INSERT INTO cupon_productos (cupon_id,producto_id) VALUES ($1,$2) ON CONFLICT DO NOTHING', [rows[0].id,pid]); } } res.json(rows[0]); }catch(e){ res.status(500).json({error:e.message}); } });
+app.put('/api/cupones/:id', authPerm('config'), async (req,res)=>{ try{ const c=req.body; await pool.query('UPDATE cupones SET codigo=$1,tipo=$2,valor=$3,secciones_ids=$4,categoria=$5,uso_maximo=$6,monto_minimo=$7,metodo_pago=$8,activo=$9,fecha_desde=$10,fecha_hasta=$11 WHERE id=$12', [c.codigo,c.tipo,c.valor,c.secciones_ids||'',c.categoria||'',c.uso_maximo||0,c.monto_minimo||0,c.metodo_pago||'',c.activo!==false,c.fecha_desde||null,c.fecha_hasta||null,req.params.id]); await pool.query('DELETE FROM cupon_productos WHERE cupon_id=$1', [req.params.id]); if(c.productos_ids){ for(const pid of c.productos_ids){ await pool.query('INSERT INTO cupon_productos (cupon_id,producto_id) VALUES ($1,$2)', [req.params.id,pid]); } } res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.delete('/api/cupones/:id', authPerm('config'), async (req,res)=>{ try{ await pool.query('DELETE FROM cupones WHERE id=$1', [req.params.id]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 
 // PROMOCIONES
-app.get('/api/promociones', auth('admin'), async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM promociones ORDER BY created_at DESC'); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
+app.get('/api/promociones', authPerm('config'), async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM promociones ORDER BY created_at DESC'); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
 app.get('/api/promociones/activas', async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM promociones WHERE activo=true AND (fecha_desde IS NULL OR fecha_desde<=NOW()) AND (fecha_hasta IS NULL OR fecha_hasta>=NOW())'); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
-app.post('/api/promociones', auth('admin'), async (req,res)=>{ try{ const p=req.body; const {rows}=await pool.query('INSERT INTO promociones (nombre,tipo,valor,secciones_ids,categoria,productos_ids,activo,fecha_desde,fecha_hasta) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *', [p.nombre,p.tipo,p.valor,p.secciones_ids||'',p.categoria||'',p.productos_ids||'',p.activo!==false,p.fecha_desde||null,p.fecha_hasta||null]); res.json(rows[0]); }catch(e){ res.status(500).json({error:e.message}); } });
-app.put('/api/promociones/:id', auth('admin'), async (req,res)=>{ try{ const p=req.body; await pool.query('UPDATE promociones SET nombre=$1,tipo=$2,valor=$3,secciones_ids=$4,categoria=$5,productos_ids=$6,activo=$7,fecha_desde=$8,fecha_hasta=$9 WHERE id=$10', [p.nombre,p.tipo,p.valor,p.secciones_ids||'',p.categoria||'',p.productos_ids||'',p.activo!==false,p.fecha_desde||null,p.fecha_hasta||null,req.params.id]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
-app.delete('/api/promociones/:id', auth('admin'), async (req,res)=>{ try{ await pool.query('DELETE FROM promociones WHERE id=$1', [req.params.id]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.post('/api/promociones', authPerm('config'), async (req,res)=>{ try{ const p=req.body; const {rows}=await pool.query('INSERT INTO promociones (nombre,tipo,valor,secciones_ids,categoria,productos_ids,activo,fecha_desde,fecha_hasta) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *', [p.nombre,p.tipo,p.valor,p.secciones_ids||'',p.categoria||'',p.productos_ids||'',p.activo!==false,p.fecha_desde||null,p.fecha_hasta||null]); res.json(rows[0]); }catch(e){ res.status(500).json({error:e.message}); } });
+app.put('/api/promociones/:id', authPerm('config'), async (req,res)=>{ try{ const p=req.body; await pool.query('UPDATE promociones SET nombre=$1,tipo=$2,valor=$3,secciones_ids=$4,categoria=$5,productos_ids=$6,activo=$7,fecha_desde=$8,fecha_hasta=$9 WHERE id=$10', [p.nombre,p.tipo,p.valor,p.secciones_ids||'',p.categoria||'',p.productos_ids||'',p.activo!==false,p.fecha_desde||null,p.fecha_hasta||null,req.params.id]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.delete('/api/promociones/:id', authPerm('config'), async (req,res)=>{ try{ await pool.query('DELETE FROM promociones WHERE id=$1', [req.params.id]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 
 // POPUPS, REDES, MENU, DESIGN, METODOS PAGO, PAGINAS, BADGES, ENVIO CONFIG
 app.get('/api/popups', async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM popups WHERE activo=true ORDER BY created_at DESC'); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
-app.get('/api/popups/all', auth('admin'), async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM popups ORDER BY created_at DESC'); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
-app.post('/api/popups', auth('admin'), async (req,res)=>{ try{ const p=req.body; const {rows}=await pool.query('INSERT INTO popups (titulo,imagen,url_destino,secciones_ids,activo) VALUES ($1,$2,$3,$4,$5) RETURNING *', [p.titulo||'',p.imagen||'',p.url_destino||'',p.secciones_ids||'',p.activo!==false]); res.json(rows[0]); }catch(e){ res.status(500).json({error:e.message}); } });
-app.put('/api/popups/:id', auth('admin'), async (req,res)=>{ try{ const p=req.body; await pool.query('UPDATE popups SET titulo=$1,imagen=$2,url_destino=$3,secciones_ids=$4,activo=$5 WHERE id=$6', [p.titulo,p.imagen,p.url_destino,p.secciones_ids||'',p.activo!==false,req.params.id]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
-app.delete('/api/popups/:id', auth('admin'), async (req,res)=>{ try{ await pool.query('DELETE FROM popups WHERE id=$1', [req.params.id]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.get('/api/popups/all', authPerm('config'), async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM popups ORDER BY created_at DESC'); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
+app.post('/api/popups', authPerm('config'), async (req,res)=>{ try{ const p=req.body; const {rows}=await pool.query('INSERT INTO popups (titulo,imagen,url_destino,secciones_ids,activo) VALUES ($1,$2,$3,$4,$5) RETURNING *', [p.titulo||'',p.imagen||'',p.url_destino||'',p.secciones_ids||'',p.activo!==false]); res.json(rows[0]); }catch(e){ res.status(500).json({error:e.message}); } });
+app.put('/api/popups/:id', authPerm('config'), async (req,res)=>{ try{ const p=req.body; await pool.query('UPDATE popups SET titulo=$1,imagen=$2,url_destino=$3,secciones_ids=$4,activo=$5 WHERE id=$6', [p.titulo,p.imagen,p.url_destino,p.secciones_ids||'',p.activo!==false,req.params.id]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.delete('/api/popups/:id', authPerm('config'), async (req,res)=>{ try{ await pool.query('DELETE FROM popups WHERE id=$1', [req.params.id]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 
 app.get('/api/redes-sociales', async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM redes_sociales ORDER BY orden'); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
-app.put('/api/redes-sociales', auth('admin'), async (req,res)=>{ try{ const {redes}=req.body; for(const r of redes){ await pool.query('INSERT INTO redes_sociales (id,tipo,url,activo,orden) VALUES ($1,$2,$3,$4,$5) ON CONFLICT (id) DO UPDATE SET url=$3,activo=$4,orden=$5', [r.id,r.tipo,r.url,r.activo,r.orden]); } res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.put('/api/redes-sociales', authPerm('config'), async (req,res)=>{ try{ const {redes}=req.body; for(const r of redes){ await pool.query('INSERT INTO redes_sociales (id,tipo,url,activo,orden) VALUES ($1,$2,$3,$4,$5) ON CONFLICT (id) DO UPDATE SET url=$3,activo=$4,orden=$5', [r.id,r.tipo,r.url,r.activo,r.orden]); } res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 
 app.get('/api/menu', async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM menu_items WHERE visible=true ORDER BY orden'); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
-app.get('/api/menu/all', auth('admin'), async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM menu_items ORDER BY orden'); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
-app.post('/api/menu', auth('admin'), async (req,res)=>{ try{ const m=req.body; const {rows}=await pool.query('INSERT INTO menu_items (titulo,url,tipo,visible,orden,seccion_id) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *', [m.titulo,m.url||'',m.tipo||'link',m.visible!==false,m.orden||0,m.seccion_id||null]); res.json(rows[0]); }catch(e){ res.status(500).json({error:e.message}); } });
-app.put('/api/menu/:id', auth('admin'), async (req,res)=>{ try{ const m=req.body; await pool.query('UPDATE menu_items SET titulo=$1,url=$2,tipo=$3,visible=$4,orden=$5,seccion_id=$6 WHERE id=$7', [m.titulo,m.url,m.tipo,m.visible!==false,m.orden||0,m.seccion_id||null,req.params.id]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
-app.delete('/api/menu/:id', auth('admin'), async (req,res)=>{ try{ await pool.query('DELETE FROM menu_items WHERE id=$1', [req.params.id]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.get('/api/menu/all', authPerm('config'), async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM menu_items ORDER BY orden'); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
+app.post('/api/menu', authPerm('config'), async (req,res)=>{ try{ const m=req.body; const {rows}=await pool.query('INSERT INTO menu_items (titulo,url,tipo,visible,orden,seccion_id) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *', [m.titulo,m.url||'',m.tipo||'link',m.visible!==false,m.orden||0,m.seccion_id||null]); res.json(rows[0]); }catch(e){ res.status(500).json({error:e.message}); } });
+app.put('/api/menu/:id', authPerm('config'), async (req,res)=>{ try{ const m=req.body; await pool.query('UPDATE menu_items SET titulo=$1,url=$2,tipo=$3,visible=$4,orden=$5,seccion_id=$6 WHERE id=$7', [m.titulo,m.url,m.tipo,m.visible!==false,m.orden||0,m.seccion_id||null,req.params.id]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.delete('/api/menu/:id', authPerm('config'), async (req,res)=>{ try{ await pool.query('DELETE FROM menu_items WHERE id=$1', [req.params.id]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 
 app.get('/api/design', async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM design_config'); const cfg={}; rows.forEach(r=>cfg[r.clave]=r.valor); res.json(cfg); }catch(e){ res.status(500).json({error:e.message}); } });
-app.put('/api/design', auth('admin'), async (req,res)=>{ try{ for(const [k,v] of Object.entries(req.body)){ await pool.query("INSERT INTO design_config (clave,valor) VALUES ($1,$2) ON CONFLICT (clave) DO UPDATE SET valor=$2", [k,v]); } res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.put('/api/design', authPerm('config'), async (req,res)=>{ try{ for(const [k,v] of Object.entries(req.body)){ await pool.query("INSERT INTO design_config (clave,valor) VALUES ($1,$2) ON CONFLICT (clave) DO UPDATE SET valor=$2", [k,v]); } res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 
 app.get('/api/metodos-pago', async (req,res)=>{ try{ const {seccion_id}=req.query; let q='SELECT * FROM metodos_pago WHERE activo=true'; const params=[]; if(seccion_id){ q+=' AND (seccion_id=$1 OR seccion_id IS NULL)'; params.push(seccion_id); } q+=' ORDER BY orden'; const {rows}=await pool.query(q, params); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
-app.get('/api/metodos-pago/all', auth('admin'), async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM metodos_pago ORDER BY orden'); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
-app.post('/api/metodos-pago', auth('admin'), async (req,res)=>{ try{ const m=req.body; const {rows}=await pool.query('INSERT INTO metodos_pago (nombre,descripcion,instrucciones,icono,seccion_id,activo,orden) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *', [m.nombre,m.descripcion||'',m.instrucciones||'',m.icono||'💳',m.seccion_id||null,m.activo!==false,m.orden||0]); res.json(rows[0]); }catch(e){ res.status(500).json({error:e.message}); } });
-app.put('/api/metodos-pago/:id', auth('admin'), async (req,res)=>{ try{ const m=req.body; await pool.query('UPDATE metodos_pago SET nombre=$1,descripcion=$2,instrucciones=$3,icono=$4,seccion_id=$5,activo=$6,orden=$7 WHERE id=$8', [m.nombre,m.descripcion,m.instrucciones,m.icono,m.seccion_id,m.activo!==false,m.orden||0,req.params.id]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
-app.delete('/api/metodos-pago/:id', auth('admin'), async (req,res)=>{ try{ await pool.query('DELETE FROM metodos_pago WHERE id=$1', [req.params.id]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.get('/api/metodos-pago/all', authPerm('config'), async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM metodos_pago ORDER BY orden'); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
+app.post('/api/metodos-pago', authPerm('config'), async (req,res)=>{ try{ const m=req.body; const {rows}=await pool.query('INSERT INTO metodos_pago (nombre,descripcion,instrucciones,icono,seccion_id,activo,orden) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *', [m.nombre,m.descripcion||'',m.instrucciones||'',m.icono||'💳',m.seccion_id||null,m.activo!==false,m.orden||0]); res.json(rows[0]); }catch(e){ res.status(500).json({error:e.message}); } });
+app.put('/api/metodos-pago/:id', authPerm('config'), async (req,res)=>{ try{ const m=req.body; await pool.query('UPDATE metodos_pago SET nombre=$1,descripcion=$2,instrucciones=$3,icono=$4,seccion_id=$5,activo=$6,orden=$7 WHERE id=$8', [m.nombre,m.descripcion,m.instrucciones,m.icono,m.seccion_id,m.activo!==false,m.orden||0,req.params.id]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.delete('/api/metodos-pago/:id', authPerm('config'), async (req,res)=>{ try{ await pool.query('DELETE FROM metodos_pago WHERE id=$1', [req.params.id]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 
 app.get('/api/paginas', async (req,res)=>{ try{ const {seccion_id}=req.query; let q='SELECT * FROM paginas_info WHERE visible=true'; const params=[]; if(seccion_id){ q+=' AND (seccion_id=$1 OR seccion_id IS NULL)'; params.push(seccion_id); } q+=' ORDER BY orden'; const {rows}=await pool.query(q, params); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
 app.get('/api/paginas/:id', async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM paginas_info WHERE id=$1', [req.params.id]); res.json(rows[0]); }catch(e){ res.status(500).json({error:e.message}); } });
-app.post('/api/paginas', auth('admin'), async (req,res)=>{ try{ const p=req.body; const {rows}=await pool.query('INSERT INTO paginas_info (titulo,slug,contenido,seccion_id,visible,orden) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *', [p.titulo,p.slug,p.contenido||'',p.seccion_id||null,p.visible!==false,p.orden||0]); res.json(rows[0]); }catch(e){ res.status(500).json({error:e.message}); } });
-app.put('/api/paginas/:id', auth('admin'), async (req,res)=>{ try{ const p=req.body; await pool.query('UPDATE paginas_info SET titulo=$1,slug=$2,contenido=$3,seccion_id=$4,visible=$5,orden=$6 WHERE id=$7', [p.titulo,p.slug,p.contenido||'',p.seccion_id||null,p.visible!==false,p.orden||0,req.params.id]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
-app.delete('/api/paginas/:id', auth('admin'), async (req,res)=>{ try{ await pool.query('DELETE FROM paginas_info WHERE id=$1', [req.params.id]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.post('/api/paginas', authPerm('config'), async (req,res)=>{ try{ const p=req.body; const {rows}=await pool.query('INSERT INTO paginas_info (titulo,slug,contenido,seccion_id,visible,orden) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *', [p.titulo,p.slug,p.contenido||'',p.seccion_id||null,p.visible!==false,p.orden||0]); res.json(rows[0]); }catch(e){ res.status(500).json({error:e.message}); } });
+app.put('/api/paginas/:id', authPerm('config'), async (req,res)=>{ try{ const p=req.body; await pool.query('UPDATE paginas_info SET titulo=$1,slug=$2,contenido=$3,seccion_id=$4,visible=$5,orden=$6 WHERE id=$7', [p.titulo,p.slug,p.contenido||'',p.seccion_id||null,p.visible!==false,p.orden||0,req.params.id]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.delete('/api/paginas/:id', authPerm('config'), async (req,res)=>{ try{ await pool.query('DELETE FROM paginas_info WHERE id=$1', [req.params.id]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 
 app.get('/api/badges', async (req,res)=>{ try{ const {seccion_id}=req.query; let q='SELECT * FROM badges WHERE visible=true'; const params=[]; if(seccion_id){ q+=` AND (secciones_ids='' OR secciones_ids IS NULL OR ',' || secciones_ids || ',' LIKE $1)`; params.push(`%,${seccion_id},%`); } q+=' ORDER BY orden'; const {rows}=await pool.query(q, params); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
-app.get('/api/badges/all', auth('admin'), async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM badges ORDER BY orden'); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
-app.post('/api/badges', auth('admin'), async (req,res)=>{ try{ const b=req.body; const {rows}=await pool.query('INSERT INTO badges (icono,texto,color,visible,secciones_ids,orden) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *', [b.icono||'⭐',b.texto||'',b.color||'#2563eb',b.visible!==false,b.secciones_ids||'',b.orden||0]); res.json(rows[0]); }catch(e){ res.status(500).json({error:e.message}); } });
-app.put('/api/badges/:id', auth('admin'), async (req,res)=>{ try{ const b=req.body; await pool.query('UPDATE badges SET icono=$1,texto=$2,color=$3,visible=$4,secciones_ids=$5,orden=$6 WHERE id=$7', [b.icono,b.texto,b.color,b.visible!==false,b.secciones_ids||'',b.orden||0,req.params.id]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
-app.delete('/api/badges/:id', auth('admin'), async (req,res)=>{ try{ await pool.query('DELETE FROM badges WHERE id=$1', [req.params.id]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.get('/api/badges/all', authPerm('config'), async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM badges ORDER BY orden'); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
+app.post('/api/badges', authPerm('config'), async (req,res)=>{ try{ const b=req.body; const {rows}=await pool.query('INSERT INTO badges (icono,texto,color,visible,secciones_ids,orden) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *', [b.icono||'⭐',b.texto||'',b.color||'#2563eb',b.visible!==false,b.secciones_ids||'',b.orden||0]); res.json(rows[0]); }catch(e){ res.status(500).json({error:e.message}); } });
+app.put('/api/badges/:id', authPerm('config'), async (req,res)=>{ try{ const b=req.body; await pool.query('UPDATE badges SET icono=$1,texto=$2,color=$3,visible=$4,secciones_ids=$5,orden=$6 WHERE id=$7', [b.icono,b.texto,b.color,b.visible!==false,b.secciones_ids||'',b.orden||0,req.params.id]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.delete('/api/badges/:id', authPerm('config'), async (req,res)=>{ try{ await pool.query('DELETE FROM badges WHERE id=$1', [req.params.id]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 
 // ENVIO CONFIG + CUSTOM
 app.get('/api/envio/config/:seccion_id', async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM config_envio WHERE seccion_id=$1', [req.params.seccion_id]); res.json(rows[0]||{metodo:'manual',costo_fijo:0,gratis_desde:0,cp_origen:'1888'}); }catch(e){ res.status(500).json({error:e.message}); } });
-app.put('/api/envio/config/:seccion_id', auth('admin'), async (req,res)=>{ try{ const c=req.body; await pool.query('INSERT INTO config_envio (seccion_id,metodo,costo_fijo,gratis_desde,zonas,cp_origen) VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT (seccion_id) DO UPDATE SET metodo=$2,costo_fijo=$3,gratis_desde=$4,zonas=$5,cp_origen=$6', [req.params.seccion_id,c.metodo||'manual',c.costo_fijo||0,c.gratis_desde||0,JSON.stringify(c.zonas||[]),c.cp_origen||'1888']); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.put('/api/envio/config/:seccion_id', authPerm('config'), async (req,res)=>{ try{ const c=req.body; await pool.query('INSERT INTO config_envio (seccion_id,metodo,costo_fijo,gratis_desde,zonas,cp_origen) VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT (seccion_id) DO UPDATE SET metodo=$2,costo_fijo=$3,gratis_desde=$4,zonas=$5,cp_origen=$6', [req.params.seccion_id,c.metodo||'manual',c.costo_fijo||0,c.gratis_desde||0,JSON.stringify(c.zonas||[]),c.cp_origen||'1888']); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 app.post('/api/envio/cotizar', async (req,res)=>{ try{ const {seccion_id,codigo_postal}=req.body; const {rows}=await pool.query('SELECT * FROM config_envio WHERE seccion_id=$1', [seccion_id]); const cfg=rows[0]||{metodo:'manual',costo_fijo:0}; res.json({costo:cfg.costo_fijo, metodo:cfg.metodo, gratis_desde:cfg.gratis_desde}); }catch(e){ res.status(500).json({error:e.message}); } });
 
 // METODOS ENVIO CUSTOM - Uber, Didi, etc
 app.get('/api/envio/custom', async (req,res)=>{ try{ const {seccion_id}=req.query; let q='SELECT * FROM metodos_envio_custom WHERE activo=true'; const params=[]; if(seccion_id){ q+=' AND (seccion_id=$1 OR seccion_id IS NULL)'; params.push(seccion_id); } q+=' ORDER BY orden'; const {rows}=await pool.query(q, params); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
-app.get('/api/envio/custom/all', auth('admin'), async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM metodos_envio_custom ORDER BY seccion_id, orden'); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
-app.post('/api/envio/custom', auth('admin'), async (req,res)=>{ try{ const m=req.body; const {rows}=await pool.query('INSERT INTO metodos_envio_custom (seccion_id,nombre,descripcion,precio,tipo,activo,gratis_desde,tiempo_estimado,icono,orden) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *', [m.seccion_id||null,m.nombre,m.descripcion||'',m.precio||0,m.tipo||'fijo',m.activo!==false,m.gratis_desde||0,m.tiempo_estimado||'',m.icono||'🚚',m.orden||0]); res.json(rows[0]); }catch(e){ res.status(500).json({error:e.message}); } });
-app.put('/api/envio/custom/:id', auth('admin'), async (req,res)=>{ try{ const m=req.body; await pool.query('UPDATE metodos_envio_custom SET seccion_id=$1,nombre=$2,descripcion=$3,precio=$4,tipo=$5,activo=$6,gratis_desde=$7,tiempo_estimado=$8,icono=$9,orden=$10 WHERE id=$11', [m.seccion_id||null,m.nombre,m.descripcion,m.precio,m.tipo,m.activo!==false,m.gratis_desde||0,m.tiempo_estimado||'',m.icono||'🚚',m.orden||0,req.params.id]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
-app.delete('/api/envio/custom/:id', auth('admin'), async (req,res)=>{ try{ await pool.query('DELETE FROM metodos_envio_custom WHERE id=$1', [req.params.id]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.get('/api/envio/custom/all', authPerm('config'), async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM metodos_envio_custom ORDER BY seccion_id, orden'); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
+app.post('/api/envio/custom', authPerm('config'), async (req,res)=>{ try{ const m=req.body; const {rows}=await pool.query('INSERT INTO metodos_envio_custom (seccion_id,nombre,descripcion,precio,tipo,activo,gratis_desde,tiempo_estimado,icono,orden) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *', [m.seccion_id||null,m.nombre,m.descripcion||'',m.precio||0,m.tipo||'fijo',m.activo!==false,m.gratis_desde||0,m.tiempo_estimado||'',m.icono||'🚚',m.orden||0]); res.json(rows[0]); }catch(e){ res.status(500).json({error:e.message}); } });
+app.put('/api/envio/custom/:id', authPerm('config'), async (req,res)=>{ try{ const m=req.body; await pool.query('UPDATE metodos_envio_custom SET seccion_id=$1,nombre=$2,descripcion=$3,precio=$4,tipo=$5,activo=$6,gratis_desde=$7,tiempo_estimado=$8,icono=$9,orden=$10 WHERE id=$11', [m.seccion_id||null,m.nombre,m.descripcion,m.precio,m.tipo,m.activo!==false,m.gratis_desde||0,m.tiempo_estimado||'',m.icono||'🚚',m.orden||0,req.params.id]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.delete('/api/envio/custom/:id', authPerm('config'), async (req,res)=>{ try{ await pool.query('DELETE FROM metodos_envio_custom WHERE id=$1', [req.params.id]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 
 // BUSQUEDA GLOBAL con debounce ready
 app.get('/api/busqueda-global', optionalAuth, async (req,res)=>{
@@ -868,27 +912,27 @@ app.get('/api/busqueda-global', optionalAuth, async (req,res)=>{
 
 // SLIDER, FAVORITOS, NOTIF STOCK
 app.get('/api/slider', async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM slider_banners WHERE activo=true ORDER BY orden'); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
-app.get('/api/slider/all', auth('admin'), async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM slider_banners ORDER BY orden'); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
-app.post('/api/slider', auth('admin'), async (req,res)=>{ try{ const {titulo,subtitulo,etiqueta,imagen,url_destino,orden,activo}=req.body; const {rows}=await pool.query('INSERT INTO slider_banners (titulo,subtitulo,etiqueta,imagen,url_destino,orden,activo) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *', [titulo||'',subtitulo||'',etiqueta||'',imagen||'',url_destino||'',orden||0,activo!==false]); res.json(rows[0]); }catch(e){ res.status(500).json({error:e.message}); } });
-app.put('/api/slider/:id', auth('admin'), async (req,res)=>{ try{ const {titulo,subtitulo,etiqueta,imagen,url_destino,orden,activo}=req.body; await pool.query('UPDATE slider_banners SET titulo=$1,subtitulo=$2,etiqueta=$3,imagen=$4,url_destino=$5,orden=$6,activo=$7 WHERE id=$8', [titulo,subtitulo||'',etiqueta||'',imagen,url_destino,orden,activo,req.params.id]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
-app.delete('/api/slider/:id', auth('admin'), async (req,res)=>{ try{ await pool.query('DELETE FROM slider_banners WHERE id=$1', [req.params.id]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.get('/api/slider/all', authPerm('config'), async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM slider_banners ORDER BY orden'); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
+app.post('/api/slider', authPerm('config'), async (req,res)=>{ try{ const {titulo,subtitulo,etiqueta,imagen,url_destino,orden,activo}=req.body; const {rows}=await pool.query('INSERT INTO slider_banners (titulo,subtitulo,etiqueta,imagen,url_destino,orden,activo) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *', [titulo||'',subtitulo||'',etiqueta||'',imagen||'',url_destino||'',orden||0,activo!==false]); res.json(rows[0]); }catch(e){ res.status(500).json({error:e.message}); } });
+app.put('/api/slider/:id', authPerm('config'), async (req,res)=>{ try{ const {titulo,subtitulo,etiqueta,imagen,url_destino,orden,activo}=req.body; await pool.query('UPDATE slider_banners SET titulo=$1,subtitulo=$2,etiqueta=$3,imagen=$4,url_destino=$5,orden=$6,activo=$7 WHERE id=$8', [titulo,subtitulo||'',etiqueta||'',imagen,url_destino,orden,activo,req.params.id]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.delete('/api/slider/:id', authPerm('config'), async (req,res)=>{ try{ await pool.query('DELETE FROM slider_banners WHERE id=$1', [req.params.id]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 // ── BARRAS DE TEXTO DESLIZANTES ──
 app.get('/api/barras', async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM barras_texto WHERE activo=true ORDER BY id'); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
-app.get('/api/barras/all', auth('admin'), async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM barras_texto ORDER BY id'); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
-app.post('/api/barras', auth('admin'), async (req,res)=>{ try{ const b=req.body; const {rows}=await pool.query('INSERT INTO barras_texto (posicion,frases,estilo,color_fondo,color_texto,velocidad,activo) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *', [b.posicion||'top',b.frases||'',b.estilo||'negro',b.color_fondo||'',b.color_texto||'',b.velocidad||25,b.activo!==false]); res.json(rows[0]); }catch(e){ res.status(500).json({error:e.message}); } });
-app.put('/api/barras/:id', auth('admin'), async (req,res)=>{ try{ const b=req.body; await pool.query('UPDATE barras_texto SET posicion=$1,frases=$2,estilo=$3,color_fondo=$4,color_texto=$5,velocidad=$6,activo=$7 WHERE id=$8', [b.posicion||'top',b.frases||'',b.estilo||'negro',b.color_fondo||'',b.color_texto||'',b.velocidad||25,b.activo!==false,req.params.id]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
-app.delete('/api/barras/:id', auth('admin'), async (req,res)=>{ try{ await pool.query('DELETE FROM barras_texto WHERE id=$1', [req.params.id]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.get('/api/barras/all', authPerm('config'), async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM barras_texto ORDER BY id'); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
+app.post('/api/barras', authPerm('config'), async (req,res)=>{ try{ const b=req.body; const {rows}=await pool.query('INSERT INTO barras_texto (posicion,frases,estilo,color_fondo,color_texto,velocidad,activo) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *', [b.posicion||'top',b.frases||'',b.estilo||'negro',b.color_fondo||'',b.color_texto||'',b.velocidad||25,b.activo!==false]); res.json(rows[0]); }catch(e){ res.status(500).json({error:e.message}); } });
+app.put('/api/barras/:id', authPerm('config'), async (req,res)=>{ try{ const b=req.body; await pool.query('UPDATE barras_texto SET posicion=$1,frases=$2,estilo=$3,color_fondo=$4,color_texto=$5,velocidad=$6,activo=$7 WHERE id=$8', [b.posicion||'top',b.frases||'',b.estilo||'negro',b.color_fondo||'',b.color_texto||'',b.velocidad||25,b.activo!==false,req.params.id]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.delete('/api/barras/:id', authPerm('config'), async (req,res)=>{ try{ await pool.query('DELETE FROM barras_texto WHERE id=$1', [req.params.id]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 // ── CONTACTOS (widget WhatsApp multi-agente) ──
 app.get('/api/contactos', async (req,res)=>{ try{ const {seccion_id}=req.query; let q='SELECT * FROM contactos WHERE activo=true'; const params=[]; if(seccion_id){ q+=' AND (seccion_id IS NULL OR seccion_id=$1)'; params.push(seccion_id); } q+=' ORDER BY orden, id'; const {rows}=await pool.query(q, params); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
-app.get('/api/contactos/all', auth('admin'), async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM contactos ORDER BY orden, id'); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
-app.post('/api/contactos', auth('admin'), async (req,res)=>{ try{ const c=req.body; const {rows}=await pool.query('INSERT INTO contactos (nombre,rol,telefono,avatar,seccion_id,online,mensaje_default,orden,activo) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *', [c.nombre||'',c.rol||'',c.telefono||'',c.avatar||'',c.seccion_id||null,c.online!==false,c.mensaje_default||'',c.orden||0,c.activo!==false]); res.json(rows[0]); }catch(e){ res.status(500).json({error:e.message}); } });
-app.put('/api/contactos/:id', auth('admin'), async (req,res)=>{ try{ const c=req.body; await pool.query('UPDATE contactos SET nombre=$1,rol=$2,telefono=$3,avatar=$4,seccion_id=$5,online=$6,mensaje_default=$7,orden=$8,activo=$9 WHERE id=$10', [c.nombre||'',c.rol||'',c.telefono||'',c.avatar||'',c.seccion_id||null,c.online!==false,c.mensaje_default||'',c.orden||0,c.activo!==false,req.params.id]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
-app.delete('/api/contactos/:id', auth('admin'), async (req,res)=>{ try{ await pool.query('DELETE FROM contactos WHERE id=$1', [req.params.id]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.get('/api/contactos/all', authPerm('config'), async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM contactos ORDER BY orden, id'); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
+app.post('/api/contactos', authPerm('config'), async (req,res)=>{ try{ const c=req.body; const {rows}=await pool.query('INSERT INTO contactos (nombre,rol,telefono,avatar,seccion_id,online,mensaje_default,orden,activo) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *', [c.nombre||'',c.rol||'',c.telefono||'',c.avatar||'',c.seccion_id||null,c.online!==false,c.mensaje_default||'',c.orden||0,c.activo!==false]); res.json(rows[0]); }catch(e){ res.status(500).json({error:e.message}); } });
+app.put('/api/contactos/:id', authPerm('config'), async (req,res)=>{ try{ const c=req.body; await pool.query('UPDATE contactos SET nombre=$1,rol=$2,telefono=$3,avatar=$4,seccion_id=$5,online=$6,mensaje_default=$7,orden=$8,activo=$9 WHERE id=$10', [c.nombre||'',c.rol||'',c.telefono||'',c.avatar||'',c.seccion_id||null,c.online!==false,c.mensaje_default||'',c.orden||0,c.activo!==false,req.params.id]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.delete('/api/contactos/:id', authPerm('config'), async (req,res)=>{ try{ await pool.query('DELETE FROM contactos WHERE id=$1', [req.params.id]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 // ── LEADS (capturados por el widget de contacto) ──
 app.post('/api/leads', async (req,res)=>{ try{ const l=req.body; const {rows}=await pool.query('INSERT INTO leads (nombre,telefono,contacto_id,contacto_nombre,usuario_id) VALUES ($1,$2,$3,$4,$5) RETURNING *', [l.nombre||'',l.telefono||'',l.contacto_id||null,l.contacto_nombre||'',l.usuario_id||null]); res.json(rows[0]); }catch(e){ res.status(500).json({error:e.message}); } });
-app.get('/api/leads', auth('admin'), async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM leads ORDER BY created_at DESC LIMIT 500'); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
-app.put('/api/leads/:id', auth('admin'), async (req,res)=>{ try{ await pool.query('UPDATE leads SET contactado=$1 WHERE id=$2', [req.body.contactado!==false, req.params.id]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
-app.delete('/api/leads/:id', auth('admin'), async (req,res)=>{ try{ await pool.query('DELETE FROM leads WHERE id=$1', [req.params.id]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.get('/api/leads', authPerm('stats'), async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM leads ORDER BY created_at DESC LIMIT 500'); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
+app.put('/api/leads/:id', authPerm('stats'), async (req,res)=>{ try{ await pool.query('UPDATE leads SET contactado=$1 WHERE id=$2', [req.body.contactado!==false, req.params.id]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.delete('/api/leads/:id', authPerm('stats'), async (req,res)=>{ try{ await pool.query('DELETE FROM leads WHERE id=$1', [req.params.id]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 
 app.get('/api/favoritos', auth(), async (req,res)=>{ try{ const {rows}=await pool.query('SELECT f.*, p.nombre, p.modelo, p.imagen, p.precio_base, p.precio_oferta, p.stock, p.categoria, p.seccion_id FROM favoritos f JOIN productos p ON f.producto_id=p.id WHERE f.usuario_id=$1 ORDER BY f.created_at DESC', [req.user.id]); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
 app.post('/api/favoritos/:producto_id', auth(), async (req,res)=>{ try{ await pool.query('INSERT INTO favoritos (usuario_id,producto_id) VALUES ($1,$2) ON CONFLICT DO NOTHING', [req.user.id, req.params.producto_id]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
@@ -898,7 +942,7 @@ app.post('/api/notificar-stock', async (req,res)=>{ try{ const {producto_id,emai
 
 // CARRITOS ABANDONADOS
 app.post('/api/carritos-abandonados', async (req,res)=>{ try{ const {usuario_id,email,telefono,items,total,seccion_id}=req.body; const {rows}=await pool.query('INSERT INTO carritos_abandonados (usuario_id,email,telefono,items,total,seccion_id) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *', [usuario_id||null,email||'',telefono||'',JSON.stringify(items||[]),total||0,seccion_id||null]); res.json(rows[0]); }catch(e){ res.status(500).json({error:e.message}); } });
-app.get('/api/carritos-abandonados', auth('admin'), async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM carritos_abandonados WHERE recuperado=false ORDER BY created_at DESC LIMIT 100'); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
+app.get('/api/carritos-abandonados', authPerm('stats'), async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM carritos_abandonados WHERE recuperado=false ORDER BY created_at DESC LIMIT 100'); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
 
 // ANDREANI V4 - fix env vars CLIENTE vs NRO_CLIENTE
 const ANDREANI_API = process.env.ANDREANI_API || 'https://apis.andreani.com';
@@ -932,7 +976,7 @@ app.post('/api/andreani/cotizar', async (req,res)=>{
   }catch(e){ res.status(500).json({error:e.message}); }
 });
 app.get('/api/andreani/sucursales', async (req,res)=>{ try{ const {cp}=req.query; const token=await andreaniLogin(); if(!token) return res.status(503).json({error:'Andreani no configurado'}); const r=await fetch(`${ANDREANI_API}/v1/sucursales?codigoPostal=${cp}`, {headers:{'x-authorization-token':token}}); res.json(await r.json()); }catch(e){ res.status(500).json({error:e.message}); } });
-app.post('/api/andreani/orden', auth('admin'), async (req,res)=>{ try{ const token=await andreaniLogin(); if(!token) return res.status(503).json({error:'Andreani no configurado'}); const r=await fetch(`${ANDREANI_API}/v1/ordenes-de-envio`, {method:'POST', headers:{'x-authorization-token':token, 'Content-Type':'application/json'}, body:JSON.stringify(req.body)}); res.json(await r.json()); }catch(e){ res.status(500).json({error:e.message}); } });
+app.post('/api/andreani/orden', authPerm('config'), async (req,res)=>{ try{ const token=await andreaniLogin(); if(!token) return res.status(503).json({error:'Andreani no configurado'}); const r=await fetch(`${ANDREANI_API}/v1/ordenes-de-envio`, {method:'POST', headers:{'x-authorization-token':token, 'Content-Type':'application/json'}, body:JSON.stringify(req.body)}); res.json(await r.json()); }catch(e){ res.status(500).json({error:e.message}); } });
 app.get('/api/andreani/tracking/:envio', async (req,res)=>{ try{ const token=await andreaniLogin(); if(!token) return res.status(503).json({error:'Andreani no configurado'}); const r=await fetch(`${ANDREANI_API}/v1/envios/${req.params.envio}/trazas`, {headers:{'x-authorization-token':token}}); res.json(await r.json()); }catch(e){ res.status(500).json({error:e.message}); } });
 app.get('/api/andreani/etiqueta/:envio', async (req,res)=>{ try{ const token=await andreaniLogin(); if(!token) return res.status(503).json({error:'Andreani no configurado'}); const r=await fetch(`${ANDREANI_API}/v1/ordenes-de-envio/${req.params.envio}/etiquetas`, {headers:{'x-authorization-token':token, Accept:'application/pdf'}}); res.set('Content-Type','application/pdf'); const buffer=await r.arrayBuffer(); res.send(Buffer.from(buffer)); }catch(e){ res.status(500).json({error:e.message}); } });
 
