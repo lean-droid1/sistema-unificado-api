@@ -147,6 +147,7 @@ async function migrate(){
   const alters = [
     `ALTER TABLE secciones ADD COLUMN IF NOT EXISTS ignorar_stock BOOLEAN DEFAULT false`,
     `ALTER TABLE secciones ADD COLUMN IF NOT EXISTS cp_origen VARCHAR(20) DEFAULT '1888'`,
+    `ALTER TABLE historial_precios ADD COLUMN IF NOT EXISTS usuario VARCHAR(100) DEFAULT ''`,
     `ALTER TABLE secciones ADD COLUMN IF NOT EXISTS permitir_sin_stock BOOLEAN DEFAULT false`,
     `ALTER TABLE productos ADD COLUMN IF NOT EXISTS permitir_sin_stock BOOLEAN DEFAULT false`,
     `ALTER TABLE productos ADD COLUMN IF NOT EXISTS es_digital BOOLEAN DEFAULT false`,
@@ -534,7 +535,7 @@ app.put('/api/productos/:id', authPerm('productos'), async (req,res)=>{
     if(p.precio_base!==undefined){
       const {rows:old}=await pool.query('SELECT precio_base FROM productos WHERE id=$1', [req.params.id]);
       if(old[0] && old[0].precio_base!=p.precio_base){
-        await pool.query('INSERT INTO historial_precios (producto_id,precio_anterior,precio_nuevo,usuario) VALUES ($1,$2,$3,$4)', [req.params.id, old[0].precio_base, p.precio_base, req.user.usuario]);
+        await pool.query('INSERT INTO historial_precios (producto_id,precio_anterior,precio_nuevo,usuario) VALUES ($1,$2,$3,$4)', [req.params.id, old[0].precio_base, p.precio_base, req.user.usuario||'']).catch(()=>{});
       }
     }
     params.push(req.params.id);
