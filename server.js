@@ -148,6 +148,7 @@ async function migrate(){
     `ALTER TABLE secciones ADD COLUMN IF NOT EXISTS ignorar_stock BOOLEAN DEFAULT false`,
     `ALTER TABLE secciones ADD COLUMN IF NOT EXISTS cp_origen VARCHAR(20) DEFAULT '1888'`,
     `ALTER TABLE historial_precios ADD COLUMN IF NOT EXISTS usuario VARCHAR(100) DEFAULT ''`,
+    `CREATE TABLE IF NOT EXISTS categorias_meta (categoria VARCHAR(200) PRIMARY KEY, orden INT DEFAULT 0, visible BOOLEAN DEFAULT true)`,
     `ALTER TABLE secciones ADD COLUMN IF NOT EXISTS permitir_sin_stock BOOLEAN DEFAULT false`,
     `ALTER TABLE productos ADD COLUMN IF NOT EXISTS permitir_sin_stock BOOLEAN DEFAULT false`,
     `ALTER TABLE productos ADD COLUMN IF NOT EXISTS es_digital BOOLEAN DEFAULT false`,
@@ -516,6 +517,54 @@ app.get('/api/productos', optionalAuth, async (req,res)=>{
   }catch(e){ res.status(500).json({error:e.message}); }
 });
 app.get('/api/categorias', async (req,res)=>{ try{ const {seccion_id}=req.query; let q='SELECT DISTINCT categoria FROM productos WHERE visible=true'; const params=[]; if(seccion_id){ q+=' AND seccion_id=$1'; params.push(seccion_id); } q+=' ORDER BY categoria'; const {rows}=await pool.query(q, params); res.json(rows.map(r=>r.categoria).filter(Boolean)); }catch(e){ res.status(500).json({error:e.message}); } });
+
+// Categorías con metadata (orden, visible, conteo) — para el ABM del panel
+app.get('/api/categorias/admin', authPerm('productos'), async (req,res)=>{
+  try{
+    const {seccion_id}=req.query;
+    let q='SELECT categoria, COUNT(*)::int as cantidad FROM productos'; const params=[];
+    if(seccion_id && seccion_id!=='all'){ q+=' WHERE seccion_id=$1'; params.push(seccion_id); }
+    q+=' GROUP BY categoria ORDER BY categoria';
+    const {rows:cats}=await pool.query(q, params);
+    const {rows:meta}=await pool.query('SELECT * FROM categorias_meta').catch(()=>({rows:[]}));
+    const metaMap={}; meta.forEach(m=>metaMap[m.categoria]=m);
+    const result=cats.filter(c=>c.categoria).map(c=>({ nombre:c.categoria, cantidad:c.cantidad, orden:(metaMap[c.categoria]?.orden??999), visible:(metaMap[c.categoria]?.visible!==false) }));
+    result.sort((a,b)=> a.orden-b.orden || a.nombre.localeCompare(b.nombre));
+    res.json(result);
+  }catch(e){ res.status(500).json({error:e.message}); }
+});
+// Renombrar / reasignar en masa: mueve todos los productos de una categoría a otra
+app.post('/api/categorias/renombrar', authPerm('productos'), async (req,res)=>{
+  try{
+    const {desde, hasta, seccion_id}=req.body;
+    if(!desde || !hasta) return res.status(400).json({error:'Faltan datos'});
+    let q='UPDATE productos SET categoria=$1 WHERE categoria=$2'; const params=[hasta, desde];
+    if(seccion_id && seccion_id!=='all'){ q+=' AND seccion_id=$3'; params.push(seccion_id); }
+    const r=await pool.query(q, params);
+    await pool.query('UPDATE categorias_meta SET categoria=$1 WHERE categoria=$2', [hasta, desde]).catch(()=>{});
+    res.json({ok:true, afectados:r.rowCount});
+  }catch(e){ res.status(500).json({error:e.message}); }
+});
+// Reasignar en masa un conjunto de productos a una categoría
+app.post('/api/categorias/reasignar', authPerm('productos'), async (req,res)=>{
+  try{
+    const {producto_ids, categoria}=req.body;
+    if(!Array.isArray(producto_ids) || !producto_ids.length || !categoria) return res.status(400).json({error:'Faltan datos'});
+    const r=await pool.query('UPDATE productos SET categoria=$1 WHERE id = ANY($2)', [categoria, producto_ids]);
+    res.json({ok:true, afectados:r.rowCount});
+  }catch(e){ res.status(500).json({error:e.message}); }
+});
+// Guardar orden y visibilidad de categorías
+app.post('/api/categorias/meta', authPerm('productos'), async (req,res)=>{
+  try{
+    const {categorias}=req.body; // [{nombre, orden, visible}]
+    for(const c of (categorias||[])){
+      await pool.query(`INSERT INTO categorias_meta (categoria, orden, visible) VALUES ($1,$2,$3)
+        ON CONFLICT (categoria) DO UPDATE SET orden=$2, visible=$3`, [c.nombre, c.orden||0, c.visible!==false]);
+    }
+    res.json({ok:true});
+  }catch(e){ res.status(500).json({error:e.message}); }
+});
 app.post('/api/productos', authPerm('productos'), async (req,res)=>{
   try{
     const p=req.body;
@@ -554,7 +603,7 @@ app.post('/api/productos/bulk', authPerm('productos'), async (req,res)=>{
     res.json({ok:true, count: productos.length, insertados: productos.length});
   }catch(e){ res.status(500).json({error:e.message}); }
 });
-app.delete('/api/categorias/:categoria', authPerm('productos'), async (req,res)=>{ try{ await pool.query('DELETE FROM productos WHERE categoria=$1', [req.params.categoria]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.delete('/api/categorias/:categoria', authPerm('productos'), async (req,res)=>{ try{ const {mover_a}=req.query; const destino = mover_a || 'Sin categoría'; const r=await pool.query('UPDATE productos SET categoria=$1 WHERE categoria=$2', [destino, req.params.categoria]); await pool.query('DELETE FROM categorias_meta WHERE categoria=$1', [req.params.categoria]).catch(()=>{}); res.json({ok:true, movidos:r.rowCount, destino}); }catch(e){ res.status(500).json({error:e.message}); } });
 app.delete('/api/productos/all', authPerm('productos'), async (req,res)=>{ try{ await pool.query('DELETE FROM productos'); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 app.get('/api/productos/buscar', async (req,res)=>{ try{ const {q}=req.query; if(!q) return res.json([]); const {rows}=await pool.query("SELECT id,nombre,modelo,categoria,precio_base,stock,imagen FROM productos WHERE nombre ILIKE $1 OR modelo ILIKE $1 OR categoria ILIKE $1 OR sku ILIKE $1 ORDER BY nombre LIMIT 20", [`%${q}%`]); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
 app.get('/api/productos/id/:id', async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM productos WHERE id=$1', [req.params.id]); if(!rows[0]) return res.status(404).json({error:'No encontrado'}); res.json(rows[0]); }catch(e){ res.status(500).json({error:e.message}); } });
