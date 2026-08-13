@@ -528,9 +528,25 @@ app.get('/api/categorias/admin', authPerm('productos'), async (req,res)=>{
     const {rows:cats}=await pool.query(q, params);
     const {rows:meta}=await pool.query('SELECT * FROM categorias_meta').catch(()=>({rows:[]}));
     const metaMap={}; meta.forEach(m=>metaMap[m.categoria]=m);
+    const catSet=new Set(cats.map(c=>c.categoria).filter(Boolean));
     const result=cats.filter(c=>c.categoria).map(c=>({ nombre:c.categoria, cantidad:c.cantidad, orden:(metaMap[c.categoria]?.orden??999), visible:(metaMap[c.categoria]?.visible!==false) }));
+    // Categorías creadas manualmente (en meta) que todavía no tienen productos
+    meta.forEach(m=>{ if(!catSet.has(m.categoria)) result.push({ nombre:m.categoria, cantidad:0, orden:(m.orden??999), visible:(m.visible!==false) }); });
     result.sort((a,b)=> a.orden-b.orden || a.nombre.localeCompare(b.nombre));
     res.json(result);
+  }catch(e){ res.status(500).json({error:e.message}); }
+});
+// Crear categoría manual (queda en meta hasta que se le asignen productos)
+app.post('/api/categorias/crear', authPerm('productos'), async (req,res)=>{
+  try{
+    const {nombre}=req.body;
+    if(!nombre || !nombre.trim()) return res.status(400).json({error:'Falta el nombre'});
+    const n=nombre.trim();
+    const {rows:ex}=await pool.query('SELECT 1 FROM productos WHERE categoria=$1 LIMIT 1', [n]);
+    const {rows:exM}=await pool.query('SELECT 1 FROM categorias_meta WHERE categoria=$1', [n]);
+    if(ex.length || exM.length) return res.status(400).json({error:'Esa categoría ya existe'});
+    await pool.query('INSERT INTO categorias_meta (categoria, orden, visible) VALUES ($1, 0, true) ON CONFLICT DO NOTHING', [n]);
+    res.json({ok:true, nombre:n});
   }catch(e){ res.status(500).json({error:e.message}); }
 });
 // Renombrar / reasignar en masa: mueve todos los productos de una categoría a otra
@@ -570,6 +586,16 @@ app.post('/api/productos', authPerm('productos'), async (req,res)=>{
     const p=req.body;
     const {rows}=await pool.query(`INSERT INTO productos (seccion_id,categoria,modelo,nombre,precio_base,precio_original,stock,stock_minimo,imagen,notas,compatibilidad,descripcion,sku,tipo,moneda,precio_oferta,envio_gratis,visible,peso,alto,ancho,largo,permitir_sin_stock,es_digital) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24) RETURNING *`,
       [p.seccion_id, p.categoria||'', p.modelo||'', p.nombre||'', p.precio_base||0, p.precio_original||0, p.stock||0, p.stock_minimo||0, p.imagen||'', p.notas||'', p.compatibilidad||'', p.descripcion||'', p.sku||'', p.tipo||'fisico', p.moneda||'ARS', p.precio_oferta||0, p.envio_gratis||false, p.visible!==false, p.peso||0, p.alto||0, p.ancho||0, p.largo||0, p.permitir_sin_stock||false, p.es_digital||false]);
+    res.json(rows[0]);
+  }catch(e){ res.status(500).json({error:e.message}); }
+});
+app.post('/api/productos/:id/duplicar', authPerm('productos'), async (req,res)=>{
+  try{
+    const {rows:orig}=await pool.query('SELECT * FROM productos WHERE id=$1', [req.params.id]);
+    if(!orig[0]) return res.status(404).json({error:'No encontrado'});
+    const p=orig[0];
+    const {rows}=await pool.query(`INSERT INTO productos (seccion_id,categoria,modelo,nombre,precio_base,precio_original,stock,stock_minimo,imagen,notas,compatibilidad,descripcion,sku,tipo,moneda,precio_oferta,envio_gratis,visible,peso,alto,ancho,largo,permitir_sin_stock,es_digital) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24) RETURNING *`,
+      [p.seccion_id, p.categoria, p.modelo, (p.nombre||p.modelo||'')+' (copia)', p.precio_base, p.precio_original, 0, p.stock_minimo, p.imagen, p.notas, p.compatibilidad, p.descripcion, p.sku?p.sku+'-copia':'', p.tipo, p.moneda, p.precio_oferta, p.envio_gratis, false, p.peso, p.alto, p.ancho, p.largo, p.permitir_sin_stock, p.es_digital]);
     res.json(rows[0]);
   }catch(e){ res.status(500).json({error:e.message}); }
 });
