@@ -149,6 +149,8 @@ async function migrate(){
     `ALTER TABLE secciones ADD COLUMN IF NOT EXISTS cp_origen VARCHAR(20) DEFAULT '1888'`,
     `ALTER TABLE historial_precios ADD COLUMN IF NOT EXISTS usuario VARCHAR(100) DEFAULT ''`,
     `CREATE TABLE IF NOT EXISTS categorias_meta (categoria VARCHAR(200) PRIMARY KEY, orden INT DEFAULT 0, visible BOOLEAN DEFAULT true)`,
+    `ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS estado_pago VARCHAR(20) DEFAULT 'impago'`,
+    `ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS sena NUMERIC(12,2) DEFAULT 0`,
     `ALTER TABLE secciones ADD COLUMN IF NOT EXISTS permitir_sin_stock BOOLEAN DEFAULT false`,
     `ALTER TABLE productos ADD COLUMN IF NOT EXISTS permitir_sin_stock BOOLEAN DEFAULT false`,
     `ALTER TABLE productos ADD COLUMN IF NOT EXISTS es_digital BOOLEAN DEFAULT false`,
@@ -684,6 +686,16 @@ app.get('/api/precios-fijos', authPerm('productos'), async (req,res)=>{ try{ con
 app.post('/api/precios-fijos', authPerm('productos'), async (req,res)=>{ try{ const {producto_id,lista_precio_id,precio_fijo}=req.body; await pool.query('INSERT INTO precios_fijos (producto_id,lista_precio_id,precio_fijo) VALUES ($1,$2,$3) ON CONFLICT (producto_id,lista_precio_id) DO UPDATE SET precio_fijo=$3', [producto_id,lista_precio_id,precio_fijo]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 
 // USUARIOS
+app.get('/api/usuarios/:id/historial', authPerm('usuarios'), async (req,res)=>{
+  try{
+    const {rows:pedidos}=await pool.query(`SELECT p.*, s.nombre as seccion_nombre, s.color as seccion_color FROM pedidos p LEFT JOIN secciones s ON p.seccion_id=s.id WHERE p.usuario_id=$1 ORDER BY p.created_at DESC LIMIT 100`, [req.params.id]);
+    const activos=pedidos.filter(p=>p.tipo==='pedido' && !['cancelado','anulado','rechazado'].includes(String(p.estado).toLowerCase()));
+    const totalGastado=activos.reduce((s,p)=>s+Number(p.total||0),0);
+    const cantPedidos=pedidos.filter(p=>p.tipo==='pedido').length;
+    const cantPresup=pedidos.filter(p=>p.tipo==='presupuesto').length;
+    res.json({ pedidos, resumen:{ totalGastado, cantPedidos, cantPresup, ultimaCompra: pedidos.find(p=>p.tipo==='pedido')?.created_at || null } });
+  }catch(e){ res.status(500).json({error:e.message}); }
+});
 app.get('/api/usuarios', authPerm('usuarios'), async (req,res)=>{
   try{ const {q}=req.query; let query='SELECT * FROM usuarios ORDER BY created_at DESC'; const params=[]; if(q){ query="SELECT * FROM usuarios WHERE nombre ILIKE $1 OR usuario ILIKE $1 OR nombre_fantasia ILIKE $1 OR email ILIKE $1 OR telefono ILIKE $1 ORDER BY created_at DESC"; params.push(`%${q}%`); } const {rows}=await pool.query(query, params); res.json(rows.map(u=>({...u,password:undefined}))); }catch(e){ res.status(500).json({error:e.message}); }
 });
@@ -828,7 +840,7 @@ app.put('/api/pedidos/:id', authPerm('pedidos'), async (req,res)=>{
     const {rows:oldPedRows}=await pool.query('SELECT estado, tipo FROM pedidos WHERE id=$1', [req.params.id]);
     const oldEstado=String((oldPedRows[0]||{}).estado||'').toLowerCase();
     const oldTipo=String((oldPedRows[0]||{}).tipo||'');
-    const fields=['estado','tipo','metodo_pago','notas','total','subtotal','descuento','datos_envio','usuario_id','notificar_wa','is_test','costo_envio','metodo_envio','cp_destino'];
+    const fields=['estado','tipo','metodo_pago','notas','total','subtotal','descuento','datos_envio','usuario_id','notificar_wa','is_test','costo_envio','metodo_envio','cp_destino','estado_pago','sena'];
     for(const f of fields){ if(p[f]!==undefined){ sets.push(`${f}=$${pi++}`); params.push(p[f]); } }
     sets.push(`updated_at=NOW()`);
     if(sets.length<=1) return res.json({ok:true});
