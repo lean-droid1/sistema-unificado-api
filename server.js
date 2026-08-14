@@ -151,6 +151,9 @@ async function migrate(){
     `CREATE TABLE IF NOT EXISTS categorias_meta (categoria VARCHAR(200) PRIMARY KEY, orden INT DEFAULT 0, visible BOOLEAN DEFAULT true)`,
     `ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS estado_pago VARCHAR(20) DEFAULT 'impago'`,
     `ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS sena NUMERIC(12,2) DEFAULT 0`,
+    `UPDATE pedidos SET estado_pago='impago' WHERE estado_pago='pendiente' OR estado_pago IS NULL OR estado_pago=''`,
+    `CREATE TABLE IF NOT EXISTS ordenes_compra (id SERIAL PRIMARY KEY, proveedor VARCHAR(200), seccion_id INT, estado VARCHAR(20) DEFAULT 'pendiente', total NUMERIC(12,2) DEFAULT 0, notas TEXT, recibida BOOLEAN DEFAULT false, created_at TIMESTAMP DEFAULT NOW())`,
+    `CREATE TABLE IF NOT EXISTS orden_compra_items (id SERIAL PRIMARY KEY, orden_id INT REFERENCES ordenes_compra(id) ON DELETE CASCADE, producto_id INT, nombre_producto VARCHAR(300), cantidad INT DEFAULT 1, costo_unitario NUMERIC(12,2) DEFAULT 0)`,
     `ALTER TABLE secciones ADD COLUMN IF NOT EXISTS permitir_sin_stock BOOLEAN DEFAULT false`,
     `ALTER TABLE productos ADD COLUMN IF NOT EXISTS permitir_sin_stock BOOLEAN DEFAULT false`,
     `ALTER TABLE productos ADD COLUMN IF NOT EXISTS es_digital BOOLEAN DEFAULT false`,
@@ -682,6 +685,52 @@ app.post('/api/precios/ajustar', authPerm('productos'), async (req,res)=>{
 });
 app.post('/api/precios/reset', authPerm('productos'), async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM historial_precios ORDER BY created_at DESC'); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 app.get('/api/historial-precios', authPerm('productos'), async (req,res)=>{ try{ const {rows}=await pool.query('SELECT h.*, p.nombre, p.modelo, p.categoria FROM historial_precios h LEFT JOIN productos p ON h.producto_id=p.id ORDER BY h.created_at DESC LIMIT 200'); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
+
+// ── ÓRDENES DE COMPRA (compras a proveedores) ──
+app.get('/api/ordenes-compra', authPerm('pedidos'), async (req,res)=>{
+  try{ const {rows}=await pool.query('SELECT o.*, s.nombre as seccion_nombre FROM ordenes_compra o LEFT JOIN secciones s ON o.seccion_id=s.id ORDER BY o.created_at DESC LIMIT 200'); res.json(rows); }
+  catch(e){ res.status(500).json({error:e.message}); }
+});
+app.get('/api/ordenes-compra/:id', authPerm('pedidos'), async (req,res)=>{
+  try{
+    const {rows:o}=await pool.query('SELECT o.*, s.nombre as seccion_nombre FROM ordenes_compra o LEFT JOIN secciones s ON o.seccion_id=s.id WHERE o.id=$1', [req.params.id]);
+    if(!o[0]) return res.status(404).json({error:'No encontrada'});
+    const {rows:items}=await pool.query('SELECT * FROM orden_compra_items WHERE orden_id=$1', [req.params.id]);
+    res.json({ ...o[0], items });
+  }catch(e){ res.status(500).json({error:e.message}); }
+});
+app.post('/api/ordenes-compra', authPerm('pedidos'), async (req,res)=>{
+  try{
+    const {proveedor, seccion_id, notas, items, total}=req.body;
+    const {rows}=await pool.query('INSERT INTO ordenes_compra (proveedor,seccion_id,notas,total,estado,recibida) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *', [proveedor||'', seccion_id||null, notas||'', total||0, 'pendiente', false]);
+    for(const it of (items||[])){
+      await pool.query('INSERT INTO orden_compra_items (orden_id,producto_id,nombre_producto,cantidad,costo_unitario) VALUES ($1,$2,$3,$4,$5)', [rows[0].id, it.producto_id||null, it.nombre_producto||'', it.cantidad||1, it.costo_unitario||0]);
+    }
+    res.json(rows[0]);
+  }catch(e){ res.status(500).json({error:e.message}); }
+});
+// Marcar recibida: SUMA el stock de cada item a los productos
+app.post('/api/ordenes-compra/:id/recibir', authPerm('pedidos'), async (req,res)=>{
+  try{
+    const {rows:o}=await pool.query('SELECT recibida FROM ordenes_compra WHERE id=$1', [req.params.id]);
+    if(!o[0]) return res.status(404).json({error:'No encontrada'});
+    if(o[0].recibida) return res.status(400).json({error:'Ya fue recibida'});
+    const {rows:items}=await pool.query('SELECT * FROM orden_compra_items WHERE orden_id=$1', [req.params.id]);
+    for(const it of items){
+      if(it.producto_id){
+        await pool.query('UPDATE productos SET stock=stock+$1 WHERE id=$2', [it.cantidad||0, it.producto_id]);
+        // Opcional: actualizar costo si vino
+        if(it.costo_unitario>0) await pool.query('UPDATE productos SET precio_original=$1 WHERE id=$2 AND (precio_original IS NULL OR precio_original=0)', [it.costo_unitario, it.producto_id]).catch(()=>{});
+      }
+    }
+    await pool.query('UPDATE ordenes_compra SET recibida=true, estado=$1 WHERE id=$2', ['recibida', req.params.id]);
+    res.json({ok:true, items_recibidos:items.length});
+  }catch(e){ res.status(500).json({error:e.message}); }
+});
+app.delete('/api/ordenes-compra/:id', authPerm('pedidos'), async (req,res)=>{
+  try{ await pool.query('DELETE FROM ordenes_compra WHERE id=$1', [req.params.id]); res.json({ok:true}); }
+  catch(e){ res.status(500).json({error:e.message}); }
+});
 app.get('/api/precios-fijos', authPerm('productos'), async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM precios_fijos'); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
 app.post('/api/precios-fijos', authPerm('productos'), async (req,res)=>{ try{ const {producto_id,lista_precio_id,precio_fijo}=req.body; await pool.query('INSERT INTO precios_fijos (producto_id,lista_precio_id,precio_fijo) VALUES ($1,$2,$3) ON CONFLICT (producto_id,lista_precio_id) DO UPDATE SET precio_fijo=$3', [producto_id,lista_precio_id,precio_fijo]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 
@@ -771,8 +820,8 @@ app.post('/api/pedidos', auth(), async (req,res)=>{
       }
     }
     }
-    const {rows}=await client.query('INSERT INTO pedidos (usuario_id,seccion_id,tipo,metodo_pago,notas,cupon_codigo,subtotal,descuento,total,datos_envio,notificar_wa,costo_envio,metodo_envio,cp_destino,is_test) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING *',
-      [pedidoUserId, seccion_id, tipo||'pedido', metodo_pago||'', notas||'', cupon_codigo||'', subtotal||0, descuento||0, total||0, datos_envio||'', notificar_wa!==false, costo_envio||0, metodo_envio||'', cp_destino||'', is_test||false]);
+    const {rows}=await client.query('INSERT INTO pedidos (usuario_id,seccion_id,tipo,metodo_pago,notas,cupon_codigo,subtotal,descuento,total,datos_envio,notificar_wa,costo_envio,metodo_envio,cp_destino,is_test,estado,estado_pago,sena) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18) RETURNING *',
+      [pedidoUserId, seccion_id, tipo||'pedido', metodo_pago||'', notas||'', cupon_codigo||'', subtotal||0, descuento||0, total||0, datos_envio||'', notificar_wa!==false, costo_envio||0, metodo_envio||'', cp_destino||'', is_test||false, req.body.estado||'pendiente', req.body.estado_pago||'impago', req.body.sena||0]);
     for(const item of (items||[])){
       await client.query('INSERT INTO pedido_items (pedido_id,producto_id,categoria,modelo,nombre_producto,cantidad,precio_unitario,precio_base) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)',
         [rows[0].id, item.producto_id, item.categoria||'', item.modelo||'', item.nombre_producto||'', item.cantidad||1, item.precio_unitario||0, item.precio_base||0]);
