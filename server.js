@@ -458,7 +458,46 @@ app.post('/api/secciones', authPerm('config'), async (req,res)=>{
     res.json(rows[0]);
   }catch(e){ res.status(400).json({error:e.message}); }
 });
-app.delete('/api/secciones/:id', authPerm('config'), async (req,res)=>{ try{ await pool.query('DELETE FROM secciones WHERE id=$1', [req.params.id]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+// Productos con stock bajo el mínimo (para alertas en dashboard)
+app.get('/api/stock-bajo', authPerm('productos'), async (req,res)=>{
+  try{
+    const {rows}=await pool.query(`SELECT p.id, p.nombre, p.modelo, p.categoria, p.stock, p.stock_minimo, s.nombre as seccion_nombre
+      FROM productos p LEFT JOIN secciones s ON p.seccion_id=s.id
+      WHERE p.stock_minimo>0 AND p.stock<=p.stock_minimo AND p.permitir_sin_stock=false AND p.es_digital=false
+      ORDER BY p.stock ASC LIMIT 100`);
+    res.json(rows);
+  }catch(e){ res.status(500).json({error:e.message}); }
+});
+// Contar productos/pedidos de una sección (para borrado seguro)
+app.get('/api/secciones/:id/stats', authPerm('config'), async (req,res)=>{
+  try{
+    const {rows:prod}=await pool.query('SELECT COUNT(*)::int as n FROM productos WHERE seccion_id=$1', [req.params.id]);
+    const {rows:ped}=await pool.query('SELECT COUNT(*)::int as n FROM pedidos WHERE seccion_id=$1', [req.params.id]);
+    res.json({ productos: prod[0].n, pedidos: ped[0].n });
+  }catch(e){ res.status(500).json({error:e.message}); }
+});
+// Borrado SEGURO: opción mover_a (mueve productos/pedidos a otra sección) o borrar_productos
+app.delete('/api/secciones/:id', authPerm('config'), async (req,res)=>{
+  try{
+    const {mover_a, borrar_productos}=req.query;
+    const {rows:total}=await pool.query('SELECT COUNT(*)::int as n FROM secciones');
+    if(total[0].n<=1) return res.status(400).json({error:'No podés eliminar la única tienda que queda'});
+    if(mover_a){
+      await pool.query('UPDATE productos SET seccion_id=$1 WHERE seccion_id=$2', [mover_a, req.params.id]);
+      await pool.query('UPDATE pedidos SET seccion_id=$1 WHERE seccion_id=$2', [mover_a, req.params.id]);
+    } else if(borrar_productos==='true'){
+      await pool.query('DELETE FROM productos WHERE seccion_id=$1', [req.params.id]);
+      // pedidos quedan pero sin sección (histórico)
+      await pool.query('UPDATE pedidos SET seccion_id=NULL WHERE seccion_id=$1', [req.params.id]);
+    } else {
+      // Sin instrucción: solo permitir si está vacía
+      const {rows:p}=await pool.query('SELECT COUNT(*)::int as n FROM productos WHERE seccion_id=$1', [req.params.id]);
+      if(p[0].n>0) return res.status(400).json({error:'La tienda tiene productos. Elegí mover o borrar.'});
+    }
+    await pool.query('DELETE FROM secciones WHERE id=$1', [req.params.id]);
+    res.json({ok:true});
+  }catch(e){ res.status(500).json({error:e.message}); }
+});
 
 // UPLOAD
 const uploadToCloudinary = (buffer, folder='productos')=> new Promise((resolve,reject)=>{
