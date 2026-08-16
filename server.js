@@ -141,6 +141,7 @@ async function migrate(){
     `CREATE TABLE IF NOT EXISTS otp_codes (id SERIAL PRIMARY KEY, usuario_id INT REFERENCES usuarios(id), codigo VARCHAR(10), expira TIMESTAMP, usado BOOLEAN DEFAULT false)`,
     `CREATE TABLE IF NOT EXISTS metodos_envio_custom (id SERIAL PRIMARY KEY, seccion_id INT, nombre VARCHAR(200), descripcion TEXT DEFAULT '', precio NUMERIC(12,2) DEFAULT 0, tipo VARCHAR(30) DEFAULT 'fijo', activo BOOLEAN DEFAULT true, gratis_desde NUMERIC(12,2) DEFAULT 0, tiempo_estimado VARCHAR(100) DEFAULT '', icono VARCHAR(50) DEFAULT '🚚', orden INT DEFAULT 0, created_at TIMESTAMP DEFAULT NOW())`,
     `CREATE TABLE IF NOT EXISTS carritos_abandonados (id SERIAL PRIMARY KEY, usuario_id INT, email VARCHAR(200) DEFAULT '', telefono VARCHAR(50) DEFAULT '', items JSONB DEFAULT '[]', total NUMERIC(12,2) DEFAULT 0, seccion_id INT, created_at TIMESTAMP DEFAULT NOW(), recuperado BOOLEAN DEFAULT false)`,
+    `ALTER TABLE cupones ADD COLUMN IF NOT EXISTS solo_primera_compra BOOLEAN DEFAULT false`,
   ];
   for(const q of queries) await pool.query(q).catch(e=>console.log('migrate warn', e.message.slice(0,100)));
   // Alter columns if not exists
@@ -536,6 +537,17 @@ app.post('/api/upload-base64', authPerm('config'), async (req,res)=>{
 });
 
 // PRODUCTOS V4 con permitir_sin_stock y es_digital
+app.get('/api/productos/novedades', async (req,res)=>{
+  try{
+    const {seccion_id, limit}=req.query;
+    let q='SELECT p.*, s.nombre as seccion_nombre, s.color as seccion_color FROM productos p LEFT JOIN secciones s ON p.seccion_id=s.id WHERE p.visible=true';
+    const params=[];
+    if(seccion_id && seccion_id!=='all'){ params.push(seccion_id); q+=` AND p.seccion_id=$${params.length}`; }
+    q+=` ORDER BY p.created_at DESC LIMIT ${Math.min(Number(limit)||12, 30)}`;
+    const {rows}=await pool.query(q, params);
+    res.json(rows);
+  }catch(e){ res.status(500).json({error:e.message}); }
+});
 app.get('/api/productos', optionalAuth, async (req,res)=>{
   try{
     const {q,categoria,page=1,limit=50,seccion_id,marca}=req.query;
@@ -543,7 +555,7 @@ app.get('/api/productos', optionalAuth, async (req,res)=>{
     if(q){ where.push(`(nombre ILIKE $${pi} OR modelo ILIKE $${pi} OR categoria ILIKE $${pi} OR sku ILIKE $${pi} OR descripcion ILIKE $${pi})`); params.push(`%${q}%`); pi++; }
     if(categoria){ where.push(`categoria=$${pi}`); params.push(categoria); pi++; }
     if(seccion_id){ where.push(`seccion_id=$${pi}`); params.push(seccion_id); pi++; }
-    if(marca){ where.push(`modelo ILIKE $${pi}`); params.push(`%${marca}%`); pi++; }
+    if(marca){ where.push(`marca ILIKE $${pi}`); params.push(`%${marca}%`); pi++; }
     const offset=(parseInt(page)-1)*parseInt(limit);
     const countQ=`SELECT COUNT(*) FROM productos WHERE ${where.join(' AND ')}`;
     const {rows:cRows}=await pool.query(countQ, params);
@@ -628,8 +640,8 @@ app.post('/api/categorias/meta', authPerm('productos'), async (req,res)=>{
 app.post('/api/productos', authPerm('productos'), async (req,res)=>{
   try{
     const p=req.body;
-    const {rows}=await pool.query(`INSERT INTO productos (seccion_id,categoria,modelo,nombre,precio_base,precio_original,stock,stock_minimo,imagen,notas,compatibilidad,descripcion,sku,tipo,moneda,precio_oferta,envio_gratis,visible,peso,alto,ancho,largo,permitir_sin_stock,es_digital) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24) RETURNING *`,
-      [p.seccion_id, p.categoria||'', p.modelo||'', p.nombre||'', p.precio_base||0, p.precio_original||0, p.stock||0, p.stock_minimo||0, p.imagen||'', p.notas||'', p.compatibilidad||'', p.descripcion||'', p.sku||'', p.tipo||'fisico', p.moneda||'ARS', p.precio_oferta||0, p.envio_gratis||false, p.visible!==false, p.peso||0, p.alto||0, p.ancho||0, p.largo||0, p.permitir_sin_stock||false, p.es_digital||false]);
+    const {rows}=await pool.query(`INSERT INTO productos (seccion_id,categoria,modelo,nombre,precio_base,precio_original,stock,stock_minimo,imagen,notas,compatibilidad,descripcion,sku,tipo,moneda,precio_oferta,envio_gratis,visible,peso,alto,ancho,largo,permitir_sin_stock,es_digital,marca) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25) RETURNING *`,
+      [p.seccion_id, p.categoria||'', p.modelo||'', p.nombre||'', p.precio_base||0, p.precio_original||0, p.stock||0, p.stock_minimo||0, p.imagen||'', p.notas||'', p.compatibilidad||'', p.descripcion||'', p.sku||'', p.tipo||'fisico', p.moneda||'ARS', p.precio_oferta||0, p.envio_gratis||false, p.visible!==false, p.peso||0, p.alto||0, p.ancho||0, p.largo||0, p.permitir_sin_stock||false, p.es_digital||false, p.marca||'']);
     res.json(rows[0]);
   }catch(e){ res.status(500).json({error:e.message}); }
 });
@@ -646,7 +658,7 @@ app.post('/api/productos/:id/duplicar', authPerm('productos'), async (req,res)=>
 app.put('/api/productos/:id', authPerm('productos'), async (req,res)=>{
   try{
     const p=req.body;
-    const fields=['seccion_id','categoria','modelo','nombre','precio_base','precio_original','stock','stock_minimo','imagen','notas','compatibilidad','descripcion','sku','tipo','moneda','precio_oferta','envio_gratis','visible','peso','alto','ancho','largo','permitir_sin_stock','es_digital'];
+    const fields=['seccion_id','categoria','modelo','nombre','precio_base','precio_original','stock','stock_minimo','imagen','notas','compatibilidad','descripcion','sku','tipo','moneda','precio_oferta','envio_gratis','visible','peso','alto','ancho','largo','permitir_sin_stock','es_digital','marca'];
     const sets=[]; const params=[]; let pi=1;
     for(const f of fields){ if(p[f]!==undefined){ sets.push(`${f}=$${pi++}`); params.push(p[f]); } }
     if(!sets.length) return res.json({ok:true});
@@ -994,11 +1006,16 @@ app.get('/api/stats', authPerm('stats'), async (req,res)=>{
 app.get('/api/cupones', authPerm('config'), async (req,res)=>{ try{ const {rows}=await pool.query('SELECT c.*, array_agg(cp.producto_id) FILTER (WHERE cp.producto_id IS NOT NULL) as productos_ids FROM cupones c LEFT JOIN cupon_productos cp ON c.id=cp.cupon_id GROUP BY c.id ORDER BY c.created_at DESC'); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
 app.post('/api/cupones/validar', async (req,res)=>{
   try{
-    const {codigo,seccion_id,subtotal,metodo_pago,items}=req.body;
+    const {codigo,seccion_id,subtotal,metodo_pago,items,usuario_id}=req.body;
     const {rows}=await pool.query('SELECT * FROM cupones WHERE codigo=$1 AND activo=true', [codigo]);
     if(!rows[0]) return res.status(404).json({error:'Cupón no válido'});
     const c=rows[0];
     if(c.uso_maximo>0 && c.usos_actuales>=c.uso_maximo) return res.status(400).json({error:'Cupón agotado'});
+    if(c.solo_primera_compra){
+      if(!usuario_id) return res.status(400).json({error:'Iniciá sesión para usar este cupón'});
+      const {rows:prev}=await pool.query("SELECT COUNT(*)::int as n FROM pedidos WHERE usuario_id=$1 AND tipo='pedido'", [usuario_id]);
+      if(prev[0].n>0) return res.status(400).json({error:'Cupón solo para la primera compra'});
+    }
     if(c.fecha_desde && new Date()<new Date(c.fecha_desde)) return res.status(400).json({error:'Aún no vigente'});
     if(c.fecha_hasta && new Date()>new Date(c.fecha_hasta)) return res.status(400).json({error:'Vencido'});
     if(c.secciones_ids){ const sids=c.secciones_ids.split(',').map(Number).filter(Boolean); if(sids.length && !sids.includes(Number(seccion_id))) return res.status(400).json({error:'No aplica a esta sección'}); }
@@ -1012,8 +1029,8 @@ app.post('/api/cupones/validar', async (req,res)=>{
     res.json({descuento, tipo:c.tipo, valor:c.valor, codigo:c.codigo, cupon_id:c.id});
   }catch(e){ res.status(500).json({error:e.message}); }
 });
-app.post('/api/cupones', authPerm('config'), async (req,res)=>{ try{ const c=req.body; const {rows}=await pool.query('INSERT INTO cupones (codigo,tipo,valor,secciones_ids,categoria,uso_maximo,monto_minimo,metodo_pago,activo,fecha_desde,fecha_hasta) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *', [c.codigo,c.tipo||'porcentaje',c.valor||0,c.secciones_ids||'',c.categoria||'',c.uso_maximo||0,c.monto_minimo||0,c.metodo_pago||'',c.activo!==false,c.fecha_desde||null,c.fecha_hasta||null]); if(c.productos_ids){ for(const pid of c.productos_ids){ await pool.query('INSERT INTO cupon_productos (cupon_id,producto_id) VALUES ($1,$2) ON CONFLICT DO NOTHING', [rows[0].id,pid]); } } res.json(rows[0]); }catch(e){ res.status(500).json({error:e.message}); } });
-app.put('/api/cupones/:id', authPerm('config'), async (req,res)=>{ try{ const c=req.body; await pool.query('UPDATE cupones SET codigo=$1,tipo=$2,valor=$3,secciones_ids=$4,categoria=$5,uso_maximo=$6,monto_minimo=$7,metodo_pago=$8,activo=$9,fecha_desde=$10,fecha_hasta=$11 WHERE id=$12', [c.codigo,c.tipo,c.valor,c.secciones_ids||'',c.categoria||'',c.uso_maximo||0,c.monto_minimo||0,c.metodo_pago||'',c.activo!==false,c.fecha_desde||null,c.fecha_hasta||null,req.params.id]); await pool.query('DELETE FROM cupon_productos WHERE cupon_id=$1', [req.params.id]); if(c.productos_ids){ for(const pid of c.productos_ids){ await pool.query('INSERT INTO cupon_productos (cupon_id,producto_id) VALUES ($1,$2)', [req.params.id,pid]); } } res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.post('/api/cupones', authPerm('config'), async (req,res)=>{ try{ const c=req.body; const {rows}=await pool.query('INSERT INTO cupones (codigo,tipo,valor,secciones_ids,categoria,uso_maximo,monto_minimo,metodo_pago,activo,fecha_desde,fecha_hasta,solo_primera_compra) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING *', [c.codigo,c.tipo||'porcentaje',c.valor||0,c.secciones_ids||'',c.categoria||'',c.uso_maximo||0,c.monto_minimo||0,c.metodo_pago||'',c.activo!==false,c.fecha_desde||null,c.fecha_hasta||null,c.solo_primera_compra||false]); if(c.productos_ids){ for(const pid of c.productos_ids){ await pool.query('INSERT INTO cupon_productos (cupon_id,producto_id) VALUES ($1,$2) ON CONFLICT DO NOTHING', [rows[0].id,pid]); } } res.json(rows[0]); }catch(e){ res.status(500).json({error:e.message}); } });
+app.put('/api/cupones/:id', authPerm('config'), async (req,res)=>{ try{ const c=req.body; await pool.query('UPDATE cupones SET codigo=$1,tipo=$2,valor=$3,secciones_ids=$4,categoria=$5,uso_maximo=$6,monto_minimo=$7,metodo_pago=$8,activo=$9,fecha_desde=$10,fecha_hasta=$11,solo_primera_compra=$12 WHERE id=$13', [c.codigo,c.tipo,c.valor,c.secciones_ids||'',c.categoria||'',c.uso_maximo||0,c.monto_minimo||0,c.metodo_pago||'',c.activo!==false,c.fecha_desde||null,c.fecha_hasta||null,c.solo_primera_compra||false,req.params.id]); await pool.query('DELETE FROM cupon_productos WHERE cupon_id=$1', [req.params.id]); if(c.productos_ids){ for(const pid of c.productos_ids){ await pool.query('INSERT INTO cupon_productos (cupon_id,producto_id) VALUES ($1,$2)', [req.params.id,pid]); } } res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 app.delete('/api/cupones/:id', authPerm('config'), async (req,res)=>{ try{ await pool.query('DELETE FROM cupones WHERE id=$1', [req.params.id]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 
 // PROMOCIONES
@@ -1115,10 +1132,26 @@ app.post('/api/favoritos/:producto_id', auth(), async (req,res)=>{ try{ await po
 app.delete('/api/favoritos/:producto_id', auth(), async (req,res)=>{ try{ await pool.query('DELETE FROM favoritos WHERE usuario_id=$1 AND producto_id=$2', [req.user.id, req.params.producto_id]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 
 app.post('/api/notificar-stock', async (req,res)=>{ try{ const {producto_id,email}=req.body; if(!email||!producto_id) return res.status(400).json({error:'email y producto_id requeridos'}); await pool.query('INSERT INTO notificaciones_stock (producto_id,email) VALUES ($1,$2)', [producto_id,email]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+// Admin: ver quién espera stock de qué producto
+app.get('/api/notificaciones-stock', authPerm('productos'), async (req,res)=>{
+  try{ const {rows}=await pool.query(`SELECT n.*, p.nombre, p.modelo, p.stock FROM notificaciones_stock n LEFT JOIN productos p ON n.producto_id=p.id WHERE n.notificado=false ORDER BY n.created_at DESC LIMIT 200`); res.json(rows); }
+  catch(e){ res.status(500).json({error:e.message}); }
+});
+// Admin: marcar una notificación como avisada
+app.post('/api/notificaciones-stock/:id/avisar', authPerm('productos'), async (req,res)=>{
+  try{ await pool.query('UPDATE notificaciones_stock SET notificado=true WHERE id=$1', [req.params.id]); res.json({ok:true}); }
+  catch(e){ res.status(500).json({error:e.message}); }
+});
+app.delete('/api/notificaciones-stock/:id', authPerm('productos'), async (req,res)=>{
+  try{ await pool.query('DELETE FROM notificaciones_stock WHERE id=$1', [req.params.id]); res.json({ok:true}); }
+  catch(e){ res.status(500).json({error:e.message}); }
+});
 
 // CARRITOS ABANDONADOS
 app.post('/api/carritos-abandonados', async (req,res)=>{ try{ const {usuario_id,email,telefono,items,total,seccion_id}=req.body; const {rows}=await pool.query('INSERT INTO carritos_abandonados (usuario_id,email,telefono,items,total,seccion_id) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *', [usuario_id||null,email||'',telefono||'',JSON.stringify(items||[]),total||0,seccion_id||null]); res.json(rows[0]); }catch(e){ res.status(500).json({error:e.message}); } });
-app.get('/api/carritos-abandonados', authPerm('stats'), async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM carritos_abandonados WHERE recuperado=false ORDER BY created_at DESC LIMIT 100'); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
+app.get('/api/carritos-abandonados', authPerm('stats'), async (req,res)=>{ try{ const {rows}=await pool.query('SELECT c.*, u.nombre as usuario_nombre, s.nombre as seccion_nombre FROM carritos_abandonados c LEFT JOIN usuarios u ON c.usuario_id=u.id LEFT JOIN secciones s ON c.seccion_id=s.id WHERE c.recuperado=false ORDER BY c.created_at DESC LIMIT 100'); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
+app.post('/api/carritos-abandonados/:id/recuperar', authPerm('stats'), async (req,res)=>{ try{ await pool.query('UPDATE carritos_abandonados SET recuperado=true WHERE id=$1', [req.params.id]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.delete('/api/carritos-abandonados/:id', authPerm('stats'), async (req,res)=>{ try{ await pool.query('DELETE FROM carritos_abandonados WHERE id=$1', [req.params.id]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 
 // ANDREANI V4 - fix env vars CLIENTE vs NRO_CLIENTE
 const ANDREANI_API = process.env.ANDREANI_API || 'https://apis.andreani.com';
