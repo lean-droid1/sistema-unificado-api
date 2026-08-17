@@ -242,6 +242,12 @@ async function migrate(){
     `ALTER TABLE productos ADD COLUMN IF NOT EXISTS notas TEXT DEFAULT ''`,
     `ALTER TABLE productos ADD COLUMN IF NOT EXISTS compatibilidad TEXT DEFAULT ''`,
     `ALTER TABLE productos ADD COLUMN IF NOT EXISTS marca VARCHAR(200) DEFAULT ''`,
+    `ALTER TABLE productos ADD COLUMN IF NOT EXISTS es_preventa BOOLEAN DEFAULT false`,
+    `ALTER TABLE productos ADD COLUMN IF NOT EXISTS preventa_precio NUMERIC(12,2) DEFAULT 0`,
+    `ALTER TABLE productos ADD COLUMN IF NOT EXISTS preventa_fecha DATE`,
+    `ALTER TABLE productos ADD COLUMN IF NOT EXISTS preventa_mostrar_fecha BOOLEAN DEFAULT false`,
+    `ALTER TABLE notificaciones_stock ADD COLUMN IF NOT EXISTS telefono VARCHAR(50) DEFAULT ''`,
+    `ALTER TABLE notificaciones_stock ADD COLUMN IF NOT EXISTS canal VARCHAR(20) DEFAULT 'email'`,
     `ALTER TABLE productos ADD COLUMN IF NOT EXISTS modelo VARCHAR(200) DEFAULT ''`,
     `ALTER TABLE productos ADD COLUMN IF NOT EXISTS nombre VARCHAR(300) DEFAULT ''`,
     `ALTER TABLE productos ADD COLUMN IF NOT EXISTS envio_gratis BOOLEAN DEFAULT false`,
@@ -537,6 +543,17 @@ app.post('/api/upload-base64', authPerm('config'), async (req,res)=>{
 });
 
 // PRODUCTOS V4 con permitir_sin_stock y es_digital
+app.get('/api/productos/preventa', async (req,res)=>{
+  try{
+    const {seccion_id}=req.query;
+    let q='SELECT p.*, s.nombre as seccion_nombre, s.color as seccion_color FROM productos p LEFT JOIN secciones s ON p.seccion_id=s.id WHERE p.visible=true AND p.es_preventa=true';
+    const params=[];
+    if(seccion_id && seccion_id!=='all'){ params.push(seccion_id); q+=` AND p.seccion_id=$${params.length}`; }
+    q+=' ORDER BY p.preventa_fecha ASC NULLS LAST, p.created_at DESC LIMIT 30';
+    const {rows}=await pool.query(q, params);
+    res.json(rows);
+  }catch(e){ res.status(500).json({error:e.message}); }
+});
 app.get('/api/productos/novedades', async (req,res)=>{
   try{
     const {seccion_id, limit}=req.query;
@@ -640,8 +657,8 @@ app.post('/api/categorias/meta', authPerm('productos'), async (req,res)=>{
 app.post('/api/productos', authPerm('productos'), async (req,res)=>{
   try{
     const p=req.body;
-    const {rows}=await pool.query(`INSERT INTO productos (seccion_id,categoria,modelo,nombre,precio_base,precio_original,stock,stock_minimo,imagen,notas,compatibilidad,descripcion,sku,tipo,moneda,precio_oferta,envio_gratis,visible,peso,alto,ancho,largo,permitir_sin_stock,es_digital,marca) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25) RETURNING *`,
-      [p.seccion_id, p.categoria||'', p.modelo||'', p.nombre||'', p.precio_base||0, p.precio_original||0, p.stock||0, p.stock_minimo||0, p.imagen||'', p.notas||'', p.compatibilidad||'', p.descripcion||'', p.sku||'', p.tipo||'fisico', p.moneda||'ARS', p.precio_oferta||0, p.envio_gratis||false, p.visible!==false, p.peso||0, p.alto||0, p.ancho||0, p.largo||0, p.permitir_sin_stock||false, p.es_digital||false, p.marca||'']);
+    const {rows}=await pool.query(`INSERT INTO productos (seccion_id,categoria,modelo,nombre,precio_base,precio_original,stock,stock_minimo,imagen,notas,compatibilidad,descripcion,sku,tipo,moneda,precio_oferta,envio_gratis,visible,peso,alto,ancho,largo,permitir_sin_stock,es_digital,marca,es_preventa,preventa_precio,preventa_fecha,preventa_mostrar_fecha) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29) RETURNING *`,
+      [p.seccion_id, p.categoria||'', p.modelo||'', p.nombre||'', p.precio_base||0, p.precio_original||0, p.stock||0, p.stock_minimo||0, p.imagen||'', p.notas||'', p.compatibilidad||'', p.descripcion||'', p.sku||'', p.tipo||'fisico', p.moneda||'ARS', p.precio_oferta||0, p.envio_gratis||false, p.visible!==false, p.peso||0, p.alto||0, p.ancho||0, p.largo||0, p.permitir_sin_stock||false, p.es_digital||false, p.marca||'', p.es_preventa||false, p.preventa_precio||0, p.preventa_fecha||null, p.preventa_mostrar_fecha||false]);
     res.json(rows[0]);
   }catch(e){ res.status(500).json({error:e.message}); }
 });
@@ -658,7 +675,7 @@ app.post('/api/productos/:id/duplicar', authPerm('productos'), async (req,res)=>
 app.put('/api/productos/:id', authPerm('productos'), async (req,res)=>{
   try{
     const p=req.body;
-    const fields=['seccion_id','categoria','modelo','nombre','precio_base','precio_original','stock','stock_minimo','imagen','notas','compatibilidad','descripcion','sku','tipo','moneda','precio_oferta','envio_gratis','visible','peso','alto','ancho','largo','permitir_sin_stock','es_digital','marca'];
+    const fields=['seccion_id','categoria','modelo','nombre','precio_base','precio_original','stock','stock_minimo','imagen','notas','compatibilidad','descripcion','sku','tipo','moneda','precio_oferta','envio_gratis','visible','peso','alto','ancho','largo','permitir_sin_stock','es_digital','marca','es_preventa','preventa_precio','preventa_fecha','preventa_mostrar_fecha'];
     const sets=[]; const params=[]; let pi=1;
     for(const f of fields){ if(p[f]!==undefined){ sets.push(`${f}=$${pi++}`); params.push(p[f]); } }
     if(!sets.length) return res.json({ok:true});
@@ -1131,7 +1148,7 @@ app.get('/api/favoritos', auth(), async (req,res)=>{ try{ const {rows}=await poo
 app.post('/api/favoritos/:producto_id', auth(), async (req,res)=>{ try{ await pool.query('INSERT INTO favoritos (usuario_id,producto_id) VALUES ($1,$2) ON CONFLICT DO NOTHING', [req.user.id, req.params.producto_id]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 app.delete('/api/favoritos/:producto_id', auth(), async (req,res)=>{ try{ await pool.query('DELETE FROM favoritos WHERE usuario_id=$1 AND producto_id=$2', [req.user.id, req.params.producto_id]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 
-app.post('/api/notificar-stock', async (req,res)=>{ try{ const {producto_id,email}=req.body; if(!email||!producto_id) return res.status(400).json({error:'email y producto_id requeridos'}); await pool.query('INSERT INTO notificaciones_stock (producto_id,email) VALUES ($1,$2)', [producto_id,email]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.post('/api/notificar-stock', async (req,res)=>{ try{ const {producto_id,email,telefono,canal}=req.body; if(!producto_id||(!email&&!telefono)) return res.status(400).json({error:'Falta email o teléfono'}); await pool.query('INSERT INTO notificaciones_stock (producto_id,email,telefono,canal) VALUES ($1,$2,$3,$4)', [producto_id,email||'',telefono||'',canal||(telefono?'whatsapp':'email')]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 // Admin: ver quién espera stock de qué producto
 app.get('/api/notificaciones-stock', authPerm('productos'), async (req,res)=>{
   try{ const {rows}=await pool.query(`SELECT n.*, p.nombre, p.modelo, p.stock FROM notificaciones_stock n LEFT JOIN productos p ON n.producto_id=p.id WHERE n.notificado=false ORDER BY n.created_at DESC LIMIT 200`); res.json(rows); }
