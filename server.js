@@ -244,6 +244,7 @@ async function migrate(){
     `ALTER TABLE productos ADD COLUMN IF NOT EXISTS marca VARCHAR(200) DEFAULT ''`,
     `ALTER TABLE productos ADD COLUMN IF NOT EXISTS es_preventa BOOLEAN DEFAULT false`,
     `ALTER TABLE productos ADD COLUMN IF NOT EXISTS preventa_precio NUMERIC(12,2) DEFAULT 0`,
+    `ALTER TABLE productos ADD COLUMN IF NOT EXISTS preventa_descuento_pct NUMERIC(5,2) DEFAULT 0`,
     `ALTER TABLE productos ADD COLUMN IF NOT EXISTS preventa_fecha DATE`,
     `ALTER TABLE productos ADD COLUMN IF NOT EXISTS preventa_mostrar_fecha BOOLEAN DEFAULT false`,
     `ALTER TABLE notificaciones_stock ADD COLUMN IF NOT EXISTS telefono VARCHAR(50) DEFAULT ''`,
@@ -657,8 +658,8 @@ app.post('/api/categorias/meta', authPerm('productos'), async (req,res)=>{
 app.post('/api/productos', authPerm('productos'), async (req,res)=>{
   try{
     const p=req.body;
-    const {rows}=await pool.query(`INSERT INTO productos (seccion_id,categoria,modelo,nombre,precio_base,precio_original,stock,stock_minimo,imagen,notas,compatibilidad,descripcion,sku,tipo,moneda,precio_oferta,envio_gratis,visible,peso,alto,ancho,largo,permitir_sin_stock,es_digital,marca,es_preventa,preventa_precio,preventa_fecha,preventa_mostrar_fecha) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29) RETURNING *`,
-      [p.seccion_id, p.categoria||'', p.modelo||'', p.nombre||'', p.precio_base||0, p.precio_original||0, p.stock||0, p.stock_minimo||0, p.imagen||'', p.notas||'', p.compatibilidad||'', p.descripcion||'', p.sku||'', p.tipo||'fisico', p.moneda||'ARS', p.precio_oferta||0, p.envio_gratis||false, p.visible!==false, p.peso||0, p.alto||0, p.ancho||0, p.largo||0, p.permitir_sin_stock||false, p.es_digital||false, p.marca||'', p.es_preventa||false, p.preventa_precio||0, p.preventa_fecha||null, p.preventa_mostrar_fecha||false]);
+    const {rows}=await pool.query(`INSERT INTO productos (seccion_id,categoria,modelo,nombre,precio_base,precio_original,stock,stock_minimo,imagen,notas,compatibilidad,descripcion,sku,tipo,moneda,precio_oferta,envio_gratis,visible,peso,alto,ancho,largo,permitir_sin_stock,es_digital,marca,es_preventa,preventa_precio,preventa_fecha,preventa_mostrar_fecha,preventa_descuento_pct) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30) RETURNING *`,
+      [p.seccion_id, p.categoria||'', p.modelo||'', p.nombre||'', p.precio_base||0, p.precio_original||0, p.stock||0, p.stock_minimo||0, p.imagen||'', p.notas||'', p.compatibilidad||'', p.descripcion||'', p.sku||'', p.tipo||'fisico', p.moneda||'ARS', p.precio_oferta||0, p.envio_gratis||false, p.visible!==false, p.peso||0, p.alto||0, p.ancho||0, p.largo||0, p.permitir_sin_stock||false, p.es_digital||false, p.marca||'', p.es_preventa||false, p.preventa_precio||0, p.preventa_fecha||null, p.preventa_mostrar_fecha||false, p.preventa_descuento_pct||0]);
     res.json(rows[0]);
   }catch(e){ res.status(500).json({error:e.message}); }
 });
@@ -675,7 +676,7 @@ app.post('/api/productos/:id/duplicar', authPerm('productos'), async (req,res)=>
 app.put('/api/productos/:id', authPerm('productos'), async (req,res)=>{
   try{
     const p=req.body;
-    const fields=['seccion_id','categoria','modelo','nombre','precio_base','precio_original','stock','stock_minimo','imagen','notas','compatibilidad','descripcion','sku','tipo','moneda','precio_oferta','envio_gratis','visible','peso','alto','ancho','largo','permitir_sin_stock','es_digital','marca','es_preventa','preventa_precio','preventa_fecha','preventa_mostrar_fecha'];
+    const fields=['seccion_id','categoria','modelo','nombre','precio_base','precio_original','stock','stock_minimo','imagen','notas','compatibilidad','descripcion','sku','tipo','moneda','precio_oferta','envio_gratis','visible','peso','alto','ancho','largo','permitir_sin_stock','es_digital','marca','es_preventa','preventa_precio','preventa_fecha','preventa_mostrar_fecha','preventa_descuento_pct'];
     const sets=[]; const params=[]; let pi=1;
     for(const f of fields){ if(p[f]!==undefined){ sets.push(`${f}=$${pi++}`); params.push(p[f]); } }
     if(!sets.length) return res.json({ok:true});
@@ -1166,7 +1167,7 @@ app.delete('/api/notificaciones-stock/:id', authPerm('productos'), async (req,re
 
 // CARRITOS ABANDONADOS
 app.post('/api/carritos-abandonados', async (req,res)=>{ try{ const {usuario_id,email,telefono,items,total,seccion_id}=req.body; const {rows}=await pool.query('INSERT INTO carritos_abandonados (usuario_id,email,telefono,items,total,seccion_id) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *', [usuario_id||null,email||'',telefono||'',JSON.stringify(items||[]),total||0,seccion_id||null]); res.json(rows[0]); }catch(e){ res.status(500).json({error:e.message}); } });
-app.get('/api/carritos-abandonados', authPerm('stats'), async (req,res)=>{ try{ const {rows}=await pool.query('SELECT c.*, u.nombre as usuario_nombre, s.nombre as seccion_nombre FROM carritos_abandonados c LEFT JOIN usuarios u ON c.usuario_id=u.id LEFT JOIN secciones s ON c.seccion_id=s.id WHERE c.recuperado=false ORDER BY c.created_at DESC LIMIT 100'); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
+app.get('/api/carritos-abandonados', authPerm('stats'), async (req,res)=>{ try{ const {rows}=await pool.query("SELECT c.*, u.nombre as usuario_nombre, COALESCE(NULLIF(c.telefono,''), u.telefono) as telefono, COALESCE(NULLIF(c.email,''), u.email) as email, s.nombre as seccion_nombre FROM carritos_abandonados c LEFT JOIN usuarios u ON c.usuario_id=u.id LEFT JOIN secciones s ON c.seccion_id=s.id WHERE c.recuperado=false ORDER BY c.created_at DESC LIMIT 100"); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
 app.post('/api/carritos-abandonados/:id/recuperar', authPerm('stats'), async (req,res)=>{ try{ await pool.query('UPDATE carritos_abandonados SET recuperado=true WHERE id=$1', [req.params.id]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 app.delete('/api/carritos-abandonados/:id', authPerm('stats'), async (req,res)=>{ try{ await pool.query('DELETE FROM carritos_abandonados WHERE id=$1', [req.params.id]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 
