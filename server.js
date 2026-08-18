@@ -246,6 +246,8 @@ async function migrate(){
     `ALTER TABLE productos ADD COLUMN IF NOT EXISTS marca VARCHAR(200) DEFAULT ''`,
     `ALTER TABLE productos ADD COLUMN IF NOT EXISTS es_preventa BOOLEAN DEFAULT false`,
     `ALTER TABLE productos ADD COLUMN IF NOT EXISTS preventa_precio NUMERIC(12,2) DEFAULT 0`,
+    `ALTER TABLE productos ADD COLUMN IF NOT EXISTS preventa_cupo INT DEFAULT 0`,
+    `ALTER TABLE productos ADD COLUMN IF NOT EXISTS preventa_reservado INT DEFAULT 0`,
     `ALTER TABLE productos ADD COLUMN IF NOT EXISTS preventa_descuento_pct NUMERIC(5,2) DEFAULT 0`,
     `ALTER TABLE productos ADD COLUMN IF NOT EXISTS preventa_fecha DATE`,
     `ALTER TABLE productos ADD COLUMN IF NOT EXISTS preventa_mostrar_fecha BOOLEAN DEFAULT false`,
@@ -565,6 +567,20 @@ app.get('/api/productos/relacionados/:id', async (req,res)=>{
     res.json(rows);
   }catch(e){ res.status(500).json({error:e.message}); }
 });
+// Recibir la preventa: pasa el cupo al stock físico, descuenta lo reservado, desactiva preventa
+app.post('/api/productos/:id/recibir-preventa', authPerm('productos'), async (req,res)=>{
+  try{
+    const {rows}=await pool.query('SELECT stock, preventa_cupo, preventa_reservado FROM productos WHERE id=$1', [req.params.id]);
+    if(!rows[0]) return res.status(404).json({error:'Producto no encontrado'});
+    const cupo=Number(rows[0].preventa_cupo)||0;
+    const reservado=Number(rows[0].preventa_reservado)||0;
+    const cantidadRecibida = req.body.cantidad!==undefined ? Number(req.body.cantidad) : cupo;
+    // stock nuevo = stock actual + (recibido - reservado). Lo reservado ya se vendió.
+    const aStock = Math.max(0, cantidadRecibida - reservado);
+    await pool.query('UPDATE productos SET stock = stock + $1, es_preventa=false, preventa_cupo=0, preventa_reservado=0, preventa_descuento_pct=0 WHERE id=$2', [aStock, req.params.id]);
+    res.json({ ok:true, sumado_a_stock: aStock, reservas_tomadas: reservado });
+  }catch(e){ res.status(500).json({error:e.message}); }
+});
 app.get('/api/productos/preventa', async (req,res)=>{
   try{
     const {seccion_id}=req.query;
@@ -679,8 +695,8 @@ app.post('/api/categorias/meta', authPerm('productos'), async (req,res)=>{
 app.post('/api/productos', authPerm('productos'), async (req,res)=>{
   try{
     const p=req.body;
-    const {rows}=await pool.query(`INSERT INTO productos (seccion_id,categoria,modelo,nombre,precio_base,precio_original,stock,stock_minimo,imagen,notas,compatibilidad,descripcion,sku,tipo,moneda,precio_oferta,envio_gratis,visible,peso,alto,ancho,largo,permitir_sin_stock,es_digital,marca,es_preventa,preventa_precio,preventa_fecha,preventa_mostrar_fecha,preventa_descuento_pct) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30) RETURNING *`,
-      [p.seccion_id, p.categoria||'', p.modelo||'', p.nombre||'', p.precio_base||0, p.precio_original||0, p.stock||0, p.stock_minimo||0, p.imagen||'', p.notas||'', p.compatibilidad||'', p.descripcion||'', p.sku||'', p.tipo||'fisico', p.moneda||'ARS', p.precio_oferta||0, p.envio_gratis||false, p.visible!==false, p.peso||0, p.alto||0, p.ancho||0, p.largo||0, p.permitir_sin_stock||false, p.es_digital||false, p.marca||'', p.es_preventa||false, p.preventa_precio||0, p.preventa_fecha||null, p.preventa_mostrar_fecha||false, p.preventa_descuento_pct||0]);
+    const {rows}=await pool.query(`INSERT INTO productos (seccion_id,categoria,modelo,nombre,precio_base,precio_original,stock,stock_minimo,imagen,notas,compatibilidad,descripcion,sku,tipo,moneda,precio_oferta,envio_gratis,visible,peso,alto,ancho,largo,permitir_sin_stock,es_digital,marca,es_preventa,preventa_precio,preventa_fecha,preventa_mostrar_fecha,preventa_descuento_pct,preventa_cupo) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31) RETURNING *`,
+      [p.seccion_id, p.categoria||'', p.modelo||'', p.nombre||'', p.precio_base||0, p.precio_original||0, p.stock||0, p.stock_minimo||0, p.imagen||'', p.notas||'', p.compatibilidad||'', p.descripcion||'', p.sku||'', p.tipo||'fisico', p.moneda||'ARS', p.precio_oferta||0, p.envio_gratis||false, p.visible!==false, p.peso||0, p.alto||0, p.ancho||0, p.largo||0, p.permitir_sin_stock||false, p.es_digital||false, p.marca||'', p.es_preventa||false, p.preventa_precio||0, p.preventa_fecha||null, p.preventa_mostrar_fecha||false, p.preventa_descuento_pct||0, p.preventa_cupo||0]);
     res.json(rows[0]);
   }catch(e){ res.status(500).json({error:e.message}); }
 });
@@ -697,7 +713,7 @@ app.post('/api/productos/:id/duplicar', authPerm('productos'), async (req,res)=>
 app.put('/api/productos/:id', authPerm('productos'), async (req,res)=>{
   try{
     const p=req.body;
-    const fields=['seccion_id','categoria','modelo','nombre','precio_base','precio_original','stock','stock_minimo','imagen','notas','compatibilidad','descripcion','sku','tipo','moneda','precio_oferta','envio_gratis','visible','peso','alto','ancho','largo','permitir_sin_stock','es_digital','marca','es_preventa','preventa_precio','preventa_fecha','preventa_mostrar_fecha','preventa_descuento_pct'];
+    const fields=['seccion_id','categoria','modelo','nombre','precio_base','precio_original','stock','stock_minimo','imagen','notas','compatibilidad','descripcion','sku','tipo','moneda','precio_oferta','envio_gratis','visible','peso','alto','ancho','largo','permitir_sin_stock','es_digital','marca','es_preventa','preventa_precio','preventa_fecha','preventa_mostrar_fecha','preventa_descuento_pct','preventa_cupo','preventa_reservado'];
     const sets=[]; const params=[]; let pi=1;
     for(const f of fields){ if(p[f]!==undefined){ sets.push(`${f}=$${pi++}`); params.push(p[f]); } }
     if(!sets.length) return res.json({ok:true});
@@ -919,10 +935,18 @@ app.post('/api/pedidos', auth(), async (req,res)=>{
     // Validar stock solo si NO es presupuesto
     if (!esPresupuesto) {
     for(const item of (items||[])){
-      if(item._preventa) continue; // preventa/reserva no valida stock real
-      const {rows:prod}=await client.query('SELECT stock, permitir_sin_stock, es_digital, seccion_id, es_preventa FROM productos WHERE id=$1', [item.producto_id]);
+      const {rows:prod}=await client.query('SELECT stock, permitir_sin_stock, es_digital, seccion_id, es_preventa, preventa_cupo, preventa_reservado FROM productos WHERE id=$1', [item.producto_id]);
       if(!prod[0]) continue;
-      if(prod[0].es_preventa) continue; // producto marcado preventa: no valida stock
+      // Preventa: validar contra cupo (si cupo>0). Cupo 0 = ilimitado
+      if(item._preventa || prod[0].es_preventa){
+        const cupo=Number(prod[0].preventa_cupo)||0;
+        const reservado=Number(prod[0].preventa_reservado)||0;
+        if(cupo>0 && (reservado + (item.cantidad||1)) > cupo){
+          await client.query('ROLLBACK');
+          return res.status(400).json({error:`Preventa agotada: ${item.nombre_producto||''} (quedan ${Math.max(0,cupo-reservado)} de ${cupo})`});
+        }
+        continue;
+      }
       const sec=await client.query('SELECT ignorar_stock, permitir_sin_stock FROM secciones WHERE id=$1', [prod[0].seccion_id]).then(r=>r.rows[0]).catch(()=>null);
       const puedeSinStock = prod[0].permitir_sin_stock || prod[0].es_digital || sec?.permitir_sin_stock || sec?.ignorar_stock;
       if(!puedeSinStock && prod[0].stock < (item.cantidad||1)){
@@ -940,12 +964,25 @@ app.post('/api/pedidos', auth(), async (req,res)=>{
       // Descontar stock solo si NO es presupuesto
       if (!esPresupuesto) {
       const {rows:prod}=await client.query('SELECT permitir_sin_stock, es_digital, es_preventa FROM productos WHERE id=$1', [item.producto_id]);
-      if(prod[0] && !prod[0].permitir_sin_stock && !prod[0].es_digital && !prod[0].es_preventa && !item._preventa){
+      if(prod[0] && (prod[0].es_preventa || item._preventa)){
+        // Preventa: aumentar reservado, NO tocar stock físico
+        await client.query('UPDATE productos SET preventa_reservado = COALESCE(preventa_reservado,0) + $1 WHERE id=$2', [item.cantidad||1, item.producto_id]);
+      } else if(prod[0] && !prod[0].permitir_sin_stock && !prod[0].es_digital){
         await client.query('UPDATE productos SET stock = GREATEST(0, stock - $1) WHERE id=$2 AND permitir_sin_stock=false AND es_digital=false', [item.cantidad||1, item.producto_id]);
       }
       }
     }
     if(cupon_codigo) await client.query("UPDATE cupones SET usos_actuales = usos_actuales + 1 WHERE codigo=$1", [cupon_codigo]).catch(()=>{});
+    // Cuenta corriente automática: si el pedido queda con deuda, registrar cargo
+    const ep=String(req.body.estado_pago||'impago');
+    const senaMonto=Number(req.body.sena)||0;
+    if(pedidoUserId && (ep==='debe' || ep==='impago' || ep==='senado')){
+      const deuda = (ep==='senado' || ep==='debe') ? (Number(total||0) - senaMonto) : Number(total||0);
+      if(deuda>0){
+        await client.query('INSERT INTO cuenta_corriente (usuario_id,tipo,monto,concepto,pedido_id) VALUES ($1,$2,$3,$4,$5)',
+          [pedidoUserId, 'cargo', deuda, `Pedido #${String(rows[0].id).padStart(4,'0')}`, rows[0].id]).catch(()=>{});
+      }
+    }
     await client.query('COMMIT');
     res.json(rows[0]);
   }catch(e){ await client.query('ROLLBACK').catch(()=>{}); res.status(500).json({error:e.message}); }
@@ -981,7 +1018,9 @@ app.post('/api/pedidos/multi', auth(), async (req,res)=>{
         await client.query('INSERT INTO pedido_items (pedido_id,producto_id,categoria,modelo,nombre_producto,cantidad,precio_unitario,precio_base) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)',
           [rows[0].id, item.producto_id, item.categoria||'', item.modelo||'', item.nombre_producto||'', item.cantidad||1, item.precio_unitario||0, item.precio_base||0]);
         const {rows:pr}=await client.query('SELECT permitir_sin_stock, es_digital, es_preventa FROM productos WHERE id=$1', [item.producto_id]);
-        if(pr[0] && !pr[0].permitir_sin_stock && !pr[0].es_digital && !pr[0].es_preventa && !item._preventa){
+        if(pr[0] && (pr[0].es_preventa || item._preventa)){
+          await client.query('UPDATE productos SET preventa_reservado = COALESCE(preventa_reservado,0) + $1 WHERE id=$2', [item.cantidad||1, item.producto_id]);
+        } else if(pr[0] && !pr[0].permitir_sin_stock && !pr[0].es_digital){
           await client.query('UPDATE productos SET stock = GREATEST(0, stock - $1) WHERE id=$2 AND permitir_sin_stock=false AND es_digital=false', [item.cantidad||1, item.producto_id]);
         }
       }
