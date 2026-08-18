@@ -152,6 +152,7 @@ async function migrate(){
     `CREATE TABLE IF NOT EXISTS categorias_meta (categoria VARCHAR(200) PRIMARY KEY, orden INT DEFAULT 0, visible BOOLEAN DEFAULT true)`,
     `ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS estado_pago VARCHAR(20) DEFAULT 'impago'`,
     `ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS sena NUMERIC(12,2) DEFAULT 0`,
+    `ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS es_reserva BOOLEAN DEFAULT false`,
     `UPDATE pedidos SET estado_pago='impago' WHERE estado_pago='pendiente' OR estado_pago IS NULL OR estado_pago=''`,
     `CREATE TABLE IF NOT EXISTS ordenes_compra (id SERIAL PRIMARY KEY, proveedor VARCHAR(200), seccion_id INT, estado VARCHAR(20) DEFAULT 'pendiente', total NUMERIC(12,2) DEFAULT 0, notas TEXT, recibida BOOLEAN DEFAULT false, created_at TIMESTAMP DEFAULT NOW())`,
     `CREATE TABLE IF NOT EXISTS orden_compra_items (id SERIAL PRIMARY KEY, orden_id INT REFERENCES ordenes_compra(id) ON DELETE CASCADE, producto_id INT, nombre_producto VARCHAR(300), cantidad INT DEFAULT 1, costo_unitario NUMERIC(12,2) DEFAULT 0)`,
@@ -889,8 +890,9 @@ app.post('/api/pedidos', auth(), async (req,res)=>{
       }
     }
     }
-    const {rows}=await client.query('INSERT INTO pedidos (usuario_id,seccion_id,tipo,metodo_pago,notas,cupon_codigo,subtotal,descuento,total,datos_envio,notificar_wa,costo_envio,metodo_envio,cp_destino,is_test,estado,estado_pago,sena) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18) RETURNING *',
-      [pedidoUserId, seccion_id, tipo||'pedido', metodo_pago||'', notas||'', cupon_codigo||'', subtotal||0, descuento||0, total||0, datos_envio||'', notificar_wa!==false, costo_envio||0, metodo_envio||'', cp_destino||'', is_test||false, req.body.estado||'pendiente', req.body.estado_pago||'impago', req.body.sena||0]);
+    const esReserva = (items||[]).some(it => it._preventa === true);
+    const {rows}=await client.query('INSERT INTO pedidos (usuario_id,seccion_id,tipo,metodo_pago,notas,cupon_codigo,subtotal,descuento,total,datos_envio,notificar_wa,costo_envio,metodo_envio,cp_destino,is_test,estado,estado_pago,sena,es_reserva) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19) RETURNING *',
+      [pedidoUserId, seccion_id, tipo||'pedido', metodo_pago||'', notas||'', cupon_codigo||'', subtotal||0, descuento||0, total||0, datos_envio||'', notificar_wa!==false, costo_envio||0, metodo_envio||'', cp_destino||'', is_test||false, req.body.estado||'pendiente', req.body.estado_pago||'impago', req.body.sena||0, esReserva]);
     for(const item of (items||[])){
       await client.query('INSERT INTO pedido_items (pedido_id,producto_id,categoria,modelo,nombre_producto,cantidad,precio_unitario,precio_base) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)',
         [rows[0].id, item.producto_id, item.categoria||'', item.modelo||'', item.nombre_producto||'', item.cantidad||1, item.precio_unitario||0, item.precio_base||0]);
