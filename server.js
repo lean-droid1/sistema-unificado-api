@@ -153,6 +153,7 @@ async function migrate(){
     `ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS estado_pago VARCHAR(20) DEFAULT 'impago'`,
     `ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS sena NUMERIC(12,2) DEFAULT 0`,
     `ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS es_reserva BOOLEAN DEFAULT false`,
+    `CREATE TABLE IF NOT EXISTS cuenta_corriente (id SERIAL PRIMARY KEY, usuario_id INT, tipo VARCHAR(20), monto NUMERIC(12,2) DEFAULT 0, concepto TEXT DEFAULT '', pedido_id INT, created_at TIMESTAMP DEFAULT NOW())`,
     `UPDATE pedidos SET estado_pago='impago' WHERE estado_pago='pendiente' OR estado_pago IS NULL OR estado_pago=''`,
     `CREATE TABLE IF NOT EXISTS ordenes_compra (id SERIAL PRIMARY KEY, proveedor VARCHAR(200), seccion_id INT, estado VARCHAR(20) DEFAULT 'pendiente', total NUMERIC(12,2) DEFAULT 0, notas TEXT, recibida BOOLEAN DEFAULT false, created_at TIMESTAMP DEFAULT NOW())`,
     `CREATE TABLE IF NOT EXISTS orden_compra_items (id SERIAL PRIMARY KEY, orden_id INT REFERENCES ordenes_compra(id) ON DELETE CASCADE, producto_id INT, nombre_producto VARCHAR(300), cantidad INT DEFAULT 1, costo_unitario NUMERIC(12,2) DEFAULT 0)`,
@@ -545,6 +546,17 @@ app.post('/api/upload-base64', authPerm('config'), async (req,res)=>{
 });
 
 // PRODUCTOS V4 con permitir_sin_stock y es_digital
+app.get('/api/productos/relacionados/:id', async (req,res)=>{
+  try{
+    const {rows:base}=await pool.query('SELECT categoria, seccion_id, marca FROM productos WHERE id=$1', [req.params.id]);
+    if(!base[0]) return res.json([]);
+    const b=base[0];
+    const {rows}=await pool.query(`SELECT p.*, s.nombre as seccion_nombre, s.color as seccion_color FROM productos p LEFT JOIN secciones s ON p.seccion_id=s.id
+      WHERE p.visible=true AND p.id!=$1 AND p.seccion_id=$2 AND (p.categoria=$3 OR ($4<>'' AND p.marca=$4))
+      ORDER BY (p.categoria=$3) DESC, RANDOM() LIMIT 8`, [req.params.id, b.seccion_id, b.categoria||'', b.marca||'']);
+    res.json(rows);
+  }catch(e){ res.status(500).json({error:e.message}); }
+});
 app.get('/api/productos/preventa', async (req,res)=>{
   try{
     const {seccion_id}=req.query;
@@ -805,6 +817,25 @@ app.get('/api/precios-fijos', authPerm('productos'), async (req,res)=>{ try{ con
 app.post('/api/precios-fijos', authPerm('productos'), async (req,res)=>{ try{ const {producto_id,lista_precio_id,precio_fijo}=req.body; await pool.query('INSERT INTO precios_fijos (producto_id,lista_precio_id,precio_fijo) VALUES ($1,$2,$3) ON CONFLICT (producto_id,lista_precio_id) DO UPDATE SET precio_fijo=$3', [producto_id,lista_precio_id,precio_fijo]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 
 // USUARIOS
+app.get('/api/usuarios/:id/cuenta', authPerm('usuarios'), async (req,res)=>{
+  try{
+    const {rows:movs}=await pool.query('SELECT * FROM cuenta_corriente WHERE usuario_id=$1 ORDER BY created_at DESC LIMIT 200', [req.params.id]);
+    const saldo=movs.reduce((s,m)=> s + (m.tipo==='cargo' ? Number(m.monto) : -Number(m.monto)), 0);
+    res.json({ movimientos: movs, saldo });
+  }catch(e){ res.status(500).json({error:e.message}); }
+});
+app.post('/api/usuarios/:id/cuenta', authPerm('usuarios'), async (req,res)=>{
+  try{
+    const {tipo, monto, concepto}=req.body;
+    if(!['cargo','pago'].includes(tipo) || !monto) return res.status(400).json({error:'Datos inválidos'});
+    const {rows}=await pool.query('INSERT INTO cuenta_corriente (usuario_id,tipo,monto,concepto) VALUES ($1,$2,$3,$4) RETURNING *', [req.params.id, tipo, monto, concepto||'']);
+    res.json(rows[0]);
+  }catch(e){ res.status(500).json({error:e.message}); }
+});
+app.delete('/api/cuenta-corriente/:id', authPerm('usuarios'), async (req,res)=>{
+  try{ await pool.query('DELETE FROM cuenta_corriente WHERE id=$1', [req.params.id]); res.json({ok:true}); }
+  catch(e){ res.status(500).json({error:e.message}); }
+});
 app.get('/api/usuarios/:id/historial', authPerm('usuarios'), async (req,res)=>{
   try{
     const {rows:pedidos}=await pool.query(`SELECT p.*, s.nombre as seccion_nombre, s.color as seccion_color FROM pedidos p LEFT JOIN secciones s ON p.seccion_id=s.id WHERE p.usuario_id=$1 ORDER BY p.created_at DESC LIMIT 100`, [req.params.id]);
@@ -1001,6 +1032,42 @@ app.post('/api/pedidos/:id/desarchivar', authPerm('pedidos'), async (req,res)=>{
 app.delete('/api/pedidos/:id', authPerm('pedidos'), async (req,res)=>{ try{ const {rows:oep}=await pool.query('SELECT estado, tipo FROM pedidos WHERE id=$1',[req.params.id]); const oe=String((oep[0]||{}).estado||'').toLowerCase(); const ot=String((oep[0]||{}).tipo||''); const afectabaStock = ot==='pedido' && !['cancelado','anulado','rechazado'].includes(oe); if(afectabaStock){ const {rows:its}=await pool.query('SELECT producto_id, cantidad FROM pedido_items WHERE pedido_id=$1',[req.params.id]); for(const it of its){ if(it.producto_id) await pool.query('UPDATE productos SET stock=GREATEST(0, stock + $1) WHERE id=$2 AND permitir_sin_stock=false AND es_digital=false',[it.cantidad||0, it.producto_id]); } } await pool.query('DELETE FROM pedido_items WHERE pedido_id=$1', [req.params.id]); await pool.query('DELETE FROM pedidos WHERE id=$1', [req.params.id]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 
 // STATS
+// REPORTES: más vendidos, ventas por sección, por mes, ganancias
+app.get('/api/reportes', authPerm('stats'), async (req,res)=>{
+  try{
+    const {desde, hasta, seccion_id}=req.query;
+    const cond=["p.tipo='pedido'", "LOWER(p.estado) NOT IN ('cancelado','anulado','rechazado')"]; const params=[]; let pi=1;
+    if(desde){ cond.push(`p.created_at >= $${pi}`); params.push(desde); pi++; }
+    if(hasta){ cond.push(`p.created_at <= $${pi}`); params.push(hasta+' 23:59:59'); pi++; }
+    if(seccion_id && seccion_id!=='all'){ cond.push(`p.seccion_id = $${pi}`); params.push(seccion_id); pi++; }
+    const where='WHERE '+cond.join(' AND ');
+
+    // Más vendidos (por cantidad)
+    const masVendidos=await pool.query(`SELECT pi.producto_id, pi.nombre_producto, SUM(pi.cantidad)::int as unidades, SUM(pi.cantidad*pi.precio_unitario)::numeric as facturado
+      FROM pedido_items pi JOIN pedidos p ON pi.pedido_id=p.id ${where} GROUP BY pi.producto_id, pi.nombre_producto ORDER BY unidades DESC LIMIT 20`, params);
+
+    // Ventas por sección
+    const porSeccion=await pool.query(`SELECT s.nombre as seccion, COUNT(DISTINCT p.id)::int as pedidos, COALESCE(SUM(p.total),0)::numeric as total
+      FROM pedidos p LEFT JOIN secciones s ON p.seccion_id=s.id ${where} GROUP BY s.nombre ORDER BY total DESC`, params);
+
+    // Ventas por mes
+    const porMes=await pool.query(`SELECT TO_CHAR(DATE_TRUNC('month', p.created_at),'YYYY-MM') as mes, COUNT(*)::int as pedidos, COALESCE(SUM(p.total),0)::numeric as total
+      FROM pedidos p ${where} GROUP BY mes ORDER BY mes DESC LIMIT 12`, params);
+
+    // Ganancias (facturado - costo, usando precio_original del producto)
+    const ganancias=await pool.query(`SELECT COALESCE(SUM(pi.cantidad*pi.precio_unitario),0)::numeric as facturado,
+      COALESCE(SUM(pi.cantidad*COALESCE(NULLIF(pr.precio_original,0), 0)),0)::numeric as costo
+      FROM pedido_items pi JOIN pedidos p ON pi.pedido_id=p.id LEFT JOIN productos pr ON pi.producto_id=pr.id ${where}`, params);
+
+    const g=ganancias.rows[0]||{facturado:0,costo:0};
+    res.json({
+      masVendidos: masVendidos.rows,
+      porSeccion: porSeccion.rows,
+      porMes: porMes.rows,
+      ganancias: { facturado: Number(g.facturado), costo: Number(g.costo), ganancia: Number(g.facturado)-Number(g.costo) }
+    });
+  }catch(e){ res.status(500).json({error:e.message}); }
+});
 app.get('/api/stats', authPerm('stats'), async (req,res)=>{
   try{
     const {seccion_id,desde,hasta,is_test}=req.query;
