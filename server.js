@@ -551,9 +551,17 @@ app.get('/api/productos/relacionados/:id', async (req,res)=>{
     const {rows:base}=await pool.query('SELECT categoria, seccion_id, marca FROM productos WHERE id=$1', [req.params.id]);
     if(!base[0]) return res.json([]);
     const b=base[0];
-    const {rows}=await pool.query(`SELECT p.*, s.nombre as seccion_nombre, s.color as seccion_color FROM productos p LEFT JOIN secciones s ON p.seccion_id=s.id
+    // Primero misma categoría/marca en la sección
+    let {rows}=await pool.query(`SELECT p.*, s.nombre as seccion_nombre, s.color as seccion_color FROM productos p LEFT JOIN secciones s ON p.seccion_id=s.id
       WHERE p.visible=true AND p.id!=$1 AND p.seccion_id=$2 AND (p.categoria=$3 OR ($4<>'' AND p.marca=$4))
       ORDER BY (p.categoria=$3) DESC, RANDOM() LIMIT 8`, [req.params.id, b.seccion_id, b.categoria||'', b.marca||'']);
+    // Si no hay suficientes, completar con otros de la misma sección
+    if(rows.length < 4){
+      const ids=[req.params.id, ...rows.map(r=>r.id)];
+      const {rows:extra}=await pool.query(`SELECT p.*, s.nombre as seccion_nombre, s.color as seccion_color FROM productos p LEFT JOIN secciones s ON p.seccion_id=s.id
+        WHERE p.visible=true AND p.seccion_id=$1 AND p.id != ALL($2::int[]) ORDER BY RANDOM() LIMIT $3`, [b.seccion_id, ids, 8-rows.length]);
+      rows=[...rows, ...extra];
+    }
     res.json(rows);
   }catch(e){ res.status(500).json({error:e.message}); }
 });
@@ -819,7 +827,7 @@ app.post('/api/precios-fijos', authPerm('productos'), async (req,res)=>{ try{ co
 // USUARIOS
 app.get('/api/usuarios/:id/cuenta', authPerm('usuarios'), async (req,res)=>{
   try{
-    const {rows:movs}=await pool.query('SELECT * FROM cuenta_corriente WHERE usuario_id=$1 ORDER BY created_at DESC LIMIT 200', [req.params.id]);
+    const {rows:movs}=await pool.query('SELECT cc.*, p.tipo as pedido_tipo FROM cuenta_corriente cc LEFT JOIN pedidos p ON cc.pedido_id=p.id WHERE cc.usuario_id=$1 ORDER BY cc.created_at DESC LIMIT 200', [req.params.id]);
     const saldo=movs.reduce((s,m)=> s + (m.tipo==='cargo' ? Number(m.monto) : -Number(m.monto)), 0);
     res.json({ movimientos: movs, saldo });
   }catch(e){ res.status(500).json({error:e.message}); }
@@ -911,8 +919,10 @@ app.post('/api/pedidos', auth(), async (req,res)=>{
     // Validar stock solo si NO es presupuesto
     if (!esPresupuesto) {
     for(const item of (items||[])){
-      const {rows:prod}=await client.query('SELECT stock, permitir_sin_stock, es_digital, seccion_id FROM productos WHERE id=$1', [item.producto_id]);
+      if(item._preventa) continue; // preventa/reserva no valida stock real
+      const {rows:prod}=await client.query('SELECT stock, permitir_sin_stock, es_digital, seccion_id, es_preventa FROM productos WHERE id=$1', [item.producto_id]);
       if(!prod[0]) continue;
+      if(prod[0].es_preventa) continue; // producto marcado preventa: no valida stock
       const sec=await client.query('SELECT ignorar_stock, permitir_sin_stock FROM secciones WHERE id=$1', [prod[0].seccion_id]).then(r=>r.rows[0]).catch(()=>null);
       const puedeSinStock = prod[0].permitir_sin_stock || prod[0].es_digital || sec?.permitir_sin_stock || sec?.ignorar_stock;
       if(!puedeSinStock && prod[0].stock < (item.cantidad||1)){
@@ -929,8 +939,8 @@ app.post('/api/pedidos', auth(), async (req,res)=>{
         [rows[0].id, item.producto_id, item.categoria||'', item.modelo||'', item.nombre_producto||'', item.cantidad||1, item.precio_unitario||0, item.precio_base||0]);
       // Descontar stock solo si NO es presupuesto
       if (!esPresupuesto) {
-      const {rows:prod}=await client.query('SELECT permitir_sin_stock, es_digital FROM productos WHERE id=$1', [item.producto_id]);
-      if(prod[0] && !prod[0].permitir_sin_stock && !prod[0].es_digital){
+      const {rows:prod}=await client.query('SELECT permitir_sin_stock, es_digital, es_preventa FROM productos WHERE id=$1', [item.producto_id]);
+      if(prod[0] && !prod[0].permitir_sin_stock && !prod[0].es_digital && !prod[0].es_preventa && !item._preventa){
         await client.query('UPDATE productos SET stock = GREATEST(0, stock - $1) WHERE id=$2 AND permitir_sin_stock=false AND es_digital=false', [item.cantidad||1, item.producto_id]);
       }
       }
@@ -954,8 +964,10 @@ app.post('/api/pedidos/multi', auth(), async (req,res)=>{
       const {seccion_id, items, subtotal, descuento, total, metodo_pago, notas, cupon_codigo, datos_envio, costo_envio, metodo_envio, cp_destino}=ped;
       // Validar stock por seccion antes de crear (transaccional)
       for(const item of (items||[])){
-        const {rows:prod}=await client.query('SELECT stock, permitir_sin_stock, es_digital, seccion_id FROM productos WHERE id=$1', [item.producto_id]);
+        if(item._preventa) continue; // preventa/reserva no valida stock
+        const {rows:prod}=await client.query('SELECT stock, permitir_sin_stock, es_digital, seccion_id, es_preventa FROM productos WHERE id=$1', [item.producto_id]);
         if(!prod[0]) continue;
+        if(prod[0].es_preventa) continue;
         const sec=await client.query('SELECT ignorar_stock, permitir_sin_stock FROM secciones WHERE id=$1', [prod[0].seccion_id]).then(r=>r.rows[0]).catch(()=>null);
         const puedeSinStock = prod[0].permitir_sin_stock || prod[0].es_digital || sec?.permitir_sin_stock || sec?.ignorar_stock;
         if(!puedeSinStock && prod[0].stock < (item.cantidad||1)){
@@ -968,8 +980,8 @@ app.post('/api/pedidos/multi', auth(), async (req,res)=>{
       for(const item of (items||[])){
         await client.query('INSERT INTO pedido_items (pedido_id,producto_id,categoria,modelo,nombre_producto,cantidad,precio_unitario,precio_base) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)',
           [rows[0].id, item.producto_id, item.categoria||'', item.modelo||'', item.nombre_producto||'', item.cantidad||1, item.precio_unitario||0, item.precio_base||0]);
-        const {rows:pr}=await client.query('SELECT permitir_sin_stock, es_digital FROM productos WHERE id=$1', [item.producto_id]);
-        if(pr[0] && !pr[0].permitir_sin_stock && !pr[0].es_digital){
+        const {rows:pr}=await client.query('SELECT permitir_sin_stock, es_digital, es_preventa FROM productos WHERE id=$1', [item.producto_id]);
+        if(pr[0] && !pr[0].permitir_sin_stock && !pr[0].es_digital && !pr[0].es_preventa && !item._preventa){
           await client.query('UPDATE productos SET stock = GREATEST(0, stock - $1) WHERE id=$2 AND permitir_sin_stock=false AND es_digital=false', [item.cantidad||1, item.producto_id]);
         }
       }
@@ -1046,9 +1058,17 @@ app.get('/api/reportes', authPerm('stats'), async (req,res)=>{
     const masVendidos=await pool.query(`SELECT pi.producto_id, pi.nombre_producto, SUM(pi.cantidad)::int as unidades, SUM(pi.cantidad*pi.precio_unitario)::numeric as facturado
       FROM pedido_items pi JOIN pedidos p ON pi.pedido_id=p.id ${where} GROUP BY pi.producto_id, pi.nombre_producto ORDER BY unidades DESC LIMIT 20`, params);
 
-    // Ventas por sección
-    const porSeccion=await pool.query(`SELECT s.nombre as seccion, COUNT(DISTINCT p.id)::int as pedidos, COALESCE(SUM(p.total),0)::numeric as total
-      FROM pedidos p LEFT JOIN secciones s ON p.seccion_id=s.id ${where} GROUP BY s.nombre ORDER BY total DESC`, params);
+    // Ventas por sección (con ganancias por tienda)
+    const porSeccion=await pool.query(`SELECT s.id as seccion_id, s.nombre as seccion, COUNT(DISTINCT p.id)::int as pedidos, COALESCE(SUM(p.total),0)::numeric as total
+      FROM pedidos p LEFT JOIN secciones s ON p.seccion_id=s.id ${where} GROUP BY s.id, s.nombre ORDER BY total DESC`, params);
+
+    // Ganancia por sección (facturado - costo por tienda)
+    const gananciaPorSeccion=await pool.query(`SELECT p.seccion_id,
+      COALESCE(SUM(pi.cantidad*pi.precio_unitario),0)::numeric as facturado,
+      COALESCE(SUM(pi.cantidad*COALESCE(NULLIF(pr.precio_original,0),0)),0)::numeric as costo
+      FROM pedido_items pi JOIN pedidos p ON pi.pedido_id=p.id LEFT JOIN productos pr ON pi.producto_id=pr.id ${where} GROUP BY p.seccion_id`, params);
+    const gxs={}; gananciaPorSeccion.rows.forEach(r=>{ gxs[r.seccion_id]={ facturado:Number(r.facturado), costo:Number(r.costo), ganancia:Number(r.facturado)-Number(r.costo) }; });
+    const porSeccionConGanancia = porSeccion.rows.map(s=>({ ...s, facturado: gxs[s.seccion_id]?.facturado||0, costo: gxs[s.seccion_id]?.costo||0, ganancia: gxs[s.seccion_id]?.ganancia||0 }));
 
     // Ventas por mes
     const porMes=await pool.query(`SELECT TO_CHAR(DATE_TRUNC('month', p.created_at),'YYYY-MM') as mes, COUNT(*)::int as pedidos, COALESCE(SUM(p.total),0)::numeric as total
@@ -1062,7 +1082,7 @@ app.get('/api/reportes', authPerm('stats'), async (req,res)=>{
     const g=ganancias.rows[0]||{facturado:0,costo:0};
     res.json({
       masVendidos: masVendidos.rows,
-      porSeccion: porSeccion.rows,
+      porSeccion: porSeccionConGanancia,
       porMes: porMes.rows,
       ganancias: { facturado: Number(g.facturado), costo: Number(g.costo), ganancia: Number(g.facturado)-Number(g.costo) }
     });
