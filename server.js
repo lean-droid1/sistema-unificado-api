@@ -973,11 +973,11 @@ app.post('/api/pedidos', auth(), async (req,res)=>{
       }
     }
     if(cupon_codigo) await client.query("UPDATE cupones SET usos_actuales = usos_actuales + 1 WHERE codigo=$1", [cupon_codigo]).catch(()=>{});
-    // Cuenta corriente automática: si el pedido queda con deuda, registrar cargo
+    // Cuenta corriente automática: SOLO si el pedido se marca como "debe" (fiado). Impago normal no genera deuda de cuenta corriente.
     const ep=String(req.body.estado_pago||'impago');
     const senaMonto=Number(req.body.sena)||0;
-    if(pedidoUserId && (ep==='debe' || ep==='impago' || ep==='senado')){
-      const deuda = (ep==='senado' || ep==='debe') ? (Number(total||0) - senaMonto) : Number(total||0);
+    if(pedidoUserId && ep==='debe'){
+      const deuda = Number(total||0) - senaMonto;
       if(deuda>0){
         await client.query('INSERT INTO cuenta_corriente (usuario_id,tipo,monto,concepto,pedido_id) VALUES ($1,$2,$3,$4,$5)',
           [pedidoUserId, 'cargo', deuda, `Pedido #${String(rows[0].id).padStart(4,'0')}`, rows[0].id]).catch(()=>{});
@@ -1039,15 +1039,35 @@ app.put('/api/pedidos/:id', authPerm('pedidos'), async (req,res)=>{
     // Capturar estado + tipo + items ANTES de cambios
     const {rows:oldItemsRows}=await pool.query('SELECT producto_id, cantidad FROM pedido_items WHERE pedido_id=$1', [req.params.id]);
     const oldMap={}; for(const it of oldItemsRows){ if(it.producto_id) oldMap[it.producto_id]=(oldMap[it.producto_id]||0)+(it.cantidad||0); }
-    const {rows:oldPedRows}=await pool.query('SELECT estado, tipo FROM pedidos WHERE id=$1', [req.params.id]);
+    const {rows:oldPedRows}=await pool.query('SELECT estado, tipo, estado_pago, usuario_id, total, sena FROM pedidos WHERE id=$1', [req.params.id]);
     const oldEstado=String((oldPedRows[0]||{}).estado||'').toLowerCase();
     const oldTipo=String((oldPedRows[0]||{}).tipo||'');
+    const oldEstadoPago=String((oldPedRows[0]||{}).estado_pago||'');
+    const pedUsuarioId=(oldPedRows[0]||{}).usuario_id;
     const fields=['estado','tipo','metodo_pago','notas','total','subtotal','descuento','datos_envio','usuario_id','notificar_wa','is_test','costo_envio','metodo_envio','cp_destino','estado_pago','sena'];
     for(const f of fields){ if(p[f]!==undefined){ sets.push(`${f}=$${pi++}`); params.push(p[f]); } }
     sets.push(`updated_at=NOW()`);
     if(sets.length<=1) return res.json({ok:true});
     params.push(req.params.id);
     await pool.query(`UPDATE pedidos SET ${sets.join(',')} WHERE id=$${pi}`, params);
+
+    // ── CUENTA CORRIENTE automática al cambiar estado de pago ──
+    const nuevoEstadoPago = (p.estado_pago!==undefined) ? String(p.estado_pago) : oldEstadoPago;
+    if(pedUsuarioId && nuevoEstadoPago !== oldEstadoPago){
+      if(nuevoEstadoPago==='debe' && oldEstadoPago!=='debe'){
+        // Pasó a "debe" (fiado): registrar cargo si no existe ya para este pedido
+        const {rows:ya}=await pool.query("SELECT id FROM cuenta_corriente WHERE pedido_id=$1 AND tipo='cargo'", [req.params.id]);
+        if(!ya.length){
+          const totalPed=(p.total!==undefined)?Number(p.total):Number((oldPedRows[0]||{}).total||0);
+          const senaPed=(p.sena!==undefined)?Number(p.sena):Number((oldPedRows[0]||{}).sena||0);
+          const deuda=totalPed-senaPed;
+          if(deuda>0) await pool.query('INSERT INTO cuenta_corriente (usuario_id,tipo,monto,concepto,pedido_id) VALUES ($1,$2,$3,$4,$5)', [pedUsuarioId,'cargo',deuda,`Pedido #${String(req.params.id).padStart(4,'0')}`,req.params.id]).catch(()=>{});
+        }
+      } else if(oldEstadoPago==='debe' && nuevoEstadoPago!=='debe'){
+        // Salió de "debe" (se pagó): quitar el cargo automático de este pedido
+        await pool.query("DELETE FROM cuenta_corriente WHERE pedido_id=$1 AND tipo='cargo'", [req.params.id]).catch(()=>{});
+      }
+    }
     if(p.items){ await pool.query('DELETE FROM pedido_items WHERE pedido_id=$1', [req.params.id]); for(const item of p.items){ await pool.query('INSERT INTO pedido_items (pedido_id,producto_id,categoria,modelo,nombre_producto,cantidad,precio_unitario,precio_base) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)', [req.params.id, item.producto_id||item.id, item.categoria||'', item.modelo||'', item.nombre_producto||`${item.categoria} - ${item.modelo}`, item.cantidad||item.qty||1, item.precio_unitario||0, item.precio_base||0]); } }
 
     // ── RECONCILIACIÓN DE STOCK ──
