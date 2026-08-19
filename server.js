@@ -47,6 +47,16 @@ app.use('/api/', rateLimit({ windowMs: 1 * 60 * 1000, max: 300 }));
 app.set('trust proxy', 1);
 
 const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
+// Recalcula preventa_reservado de un producto desde los pedidos reales (activos)
+async function recalcReservado(productoId){
+  try{
+    if(!productoId) return;
+    await pool.query(`UPDATE productos SET preventa_reservado = (
+      SELECT COALESCE(SUM(pi.cantidad),0) FROM pedido_items pi JOIN pedidos p ON pi.pedido_id=p.id
+      WHERE pi.producto_id=$1 AND p.tipo='pedido' AND LOWER(COALESCE(p.estado,'')) NOT IN ('cancelado','anulado','rechazado')
+    ) WHERE id=$1 AND es_preventa=true`, [productoId]);
+  }catch(e){ /* noop */ }
+}
 const SECRET = process.env.JWT_SECRET;
 if (!SECRET) {
   console.error('❌ JWT_SECRET no configurado - usando fallback solo para dev');
@@ -573,12 +583,25 @@ app.post('/api/productos/:id/recibir-preventa', authPerm('productos'), async (re
     const {rows}=await pool.query('SELECT stock, preventa_cupo, preventa_reservado FROM productos WHERE id=$1', [req.params.id]);
     if(!rows[0]) return res.status(404).json({error:'Producto no encontrado'});
     const cupo=Number(rows[0].preventa_cupo)||0;
-    const reservado=Number(rows[0].preventa_reservado)||0;
+    // RESERVADO REAL: cuenta las unidades pedidas de este producto en pedidos activos (no cancelados)
+    const {rows:resv}=await pool.query(`SELECT COALESCE(SUM(pi.cantidad),0)::int as reservado
+      FROM pedido_items pi JOIN pedidos p ON pi.pedido_id=p.id
+      WHERE pi.producto_id=$1 AND p.tipo='pedido' AND LOWER(COALESCE(p.estado,'')) NOT IN ('cancelado','anulado','rechazado')`, [req.params.id]);
+    const reservado=Number(resv[0].reservado)||0;
     const cantidadRecibida = req.body.cantidad!==undefined ? Number(req.body.cantidad) : cupo;
     // stock nuevo = stock actual + (recibido - reservado). Lo reservado ya se vendió.
     const aStock = Math.max(0, cantidadRecibida - reservado);
     await pool.query('UPDATE productos SET stock = stock + $1, es_preventa=false, preventa_cupo=0, preventa_reservado=0, preventa_descuento_pct=0 WHERE id=$2', [aStock, req.params.id]);
-    res.json({ ok:true, sumado_a_stock: aStock, reservas_tomadas: reservado });
+    res.json({ ok:true, sumado_a_stock: aStock, reservas_tomadas: reservado, recibido: cantidadRecibida });
+  }catch(e){ res.status(500).json({error:e.message}); }
+});
+// Consultar reservado real (para mostrar en el form antes de recibir)
+app.get('/api/productos/:id/reservado-real', authPerm('productos'), async (req,res)=>{
+  try{
+    const {rows}=await pool.query(`SELECT COALESCE(SUM(pi.cantidad),0)::int as reservado
+      FROM pedido_items pi JOIN pedidos p ON pi.pedido_id=p.id
+      WHERE pi.producto_id=$1 AND p.tipo='pedido' AND LOWER(COALESCE(p.estado,'')) NOT IN ('cancelado','anulado','rechazado')`, [req.params.id]);
+    res.json({ reservado: Number(rows[0].reservado)||0 });
   }catch(e){ res.status(500).json({error:e.message}); }
 });
 app.get('/api/productos/preventa', async (req,res)=>{
@@ -1049,10 +1072,18 @@ app.post('/api/pedidos/multi', auth(), async (req,res)=>{
       const {seccion_id, items, subtotal, descuento, total, metodo_pago, notas, cupon_codigo, datos_envio, costo_envio, metodo_envio, cp_destino}=ped;
       // Validar stock por seccion antes de crear (transaccional)
       for(const item of (items||[])){
-        if(item._preventa) continue; // preventa/reserva no valida stock
-        const {rows:prod}=await client.query('SELECT stock, permitir_sin_stock, es_digital, seccion_id, es_preventa FROM productos WHERE id=$1', [item.producto_id]);
+        const {rows:prod}=await client.query('SELECT stock, permitir_sin_stock, es_digital, seccion_id, es_preventa, preventa_cupo, preventa_reservado FROM productos WHERE id=$1', [item.producto_id]);
         if(!prod[0]) continue;
-        if(prod[0].es_preventa) continue;
+        // Preventa: validar contra cupo (si cupo>0). Cupo 0 = ilimitado
+        if(item._preventa || prod[0].es_preventa){
+          const cupo=Number(prod[0].preventa_cupo)||0;
+          const reservado=Number(prod[0].preventa_reservado)||0;
+          if(cupo>0 && (reservado + (item.cantidad||1)) > cupo){
+            await client.query('ROLLBACK');
+            return res.status(400).json({error:`Preventa agotada: ${item.nombre_producto||''} (quedan ${Math.max(0,cupo-reservado)} de ${cupo})`});
+          }
+          continue;
+        }
         const sec=await client.query('SELECT ignorar_stock, permitir_sin_stock FROM secciones WHERE id=$1', [prod[0].seccion_id]).then(r=>r.rows[0]).catch(()=>null);
         const puedeSinStock = prod[0].permitir_sin_stock || prod[0].es_digital || sec?.permitir_sin_stock || sec?.ignorar_stock;
         if(!puedeSinStock && prod[0].stock < (item.cantidad||1)){
@@ -1116,7 +1147,15 @@ app.put('/api/pedidos/:id', authPerm('pedidos'), async (req,res)=>{
         await pool.query("DELETE FROM cuenta_corriente WHERE pedido_id=$1 AND tipo='cargo'", [req.params.id]).catch(()=>{});
       }
     }
-    if(p.items){ await pool.query('DELETE FROM pedido_items WHERE pedido_id=$1', [req.params.id]); for(const item of p.items){ await pool.query('INSERT INTO pedido_items (pedido_id,producto_id,categoria,modelo,nombre_producto,cantidad,precio_unitario,precio_base) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)', [req.params.id, item.producto_id||item.id, item.categoria||'', item.modelo||'', item.nombre_producto||`${item.categoria} - ${item.modelo}`, item.cantidad||item.qty||1, item.precio_unitario||0, item.precio_base||0]); } }
+    if(p.items){
+      // Capturar productos afectados (viejos + nuevos) para recalcular preventa
+      const {rows:viejos}=await pool.query('SELECT DISTINCT producto_id FROM pedido_items WHERE pedido_id=$1', [req.params.id]);
+      await pool.query('DELETE FROM pedido_items WHERE pedido_id=$1', [req.params.id]);
+      for(const item of p.items){ await pool.query('INSERT INTO pedido_items (pedido_id,producto_id,categoria,modelo,nombre_producto,cantidad,precio_unitario,precio_base) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)', [req.params.id, item.producto_id||item.id, item.categoria||'', item.modelo||'', item.nombre_producto||`${item.categoria} - ${item.modelo}`, item.cantidad||item.qty||1, item.precio_unitario||0, item.precio_base||0]); }
+      // Recalcular reservado de preventa para todos los productos tocados
+      const afectados=new Set([...viejos.map(v=>v.producto_id), ...p.items.map(it=>it.producto_id||it.id)].filter(Boolean));
+      for(const pid of afectados) await recalcReservado(pid);
+    }
 
     // ── RECONCILIACIÓN DE STOCK ──
     // Regla: el stock SOLO lo afectan PEDIDOS reales activos (no presupuestos, no cancelados).
@@ -1142,13 +1181,23 @@ app.put('/api/pedidos/:id', authPerm('pedidos'), async (req,res)=>{
       for(const pid of pids){ const d=(oldMap[pid]||0)-(newMap[pid]||0); if(d!==0) stockAdd[pid]=(stockAdd[pid]||0)+d; }
     }
     // Si no afectaba ni afecta (presupuesto→presupuesto), no se toca nada.
-    for(const pid in stockAdd){ const q=stockAdd[pid]; if(q) await pool.query('UPDATE productos SET stock=GREATEST(0, stock + $1) WHERE id=$2 AND permitir_sin_stock=false AND es_digital=false', [q, pid]); }
+    for(const pid in stockAdd){
+      const q=stockAdd[pid]; if(!q) continue;
+      // No tocar stock de productos en preventa (su cupo se maneja aparte con preventa_reservado)
+      const {rows:esPre}=await pool.query('SELECT es_preventa FROM productos WHERE id=$1', [pid]);
+      if(esPre[0] && esPre[0].es_preventa){ await recalcReservado(pid); continue; }
+      await pool.query('UPDATE productos SET stock=GREATEST(0, stock + $1) WHERE id=$2 AND permitir_sin_stock=false AND es_digital=false', [q, pid]);
+    }
+    // Recalcular reservado si cambió el estado (cancelación/reactivación) para productos del pedido
+    if(p.estado!==undefined && !p.items){
+      for(const it of oldItemsRows){ if(it.producto_id) await recalcReservado(it.producto_id); }
+    }
     res.json({ok:true});
   }catch(e){ res.status(500).json({error:e.message}); }
 });
 app.post('/api/pedidos/:id/archivar', authPerm('pedidos'), async (req,res)=>{ try{ await pool.query('UPDATE pedidos SET archivado=true WHERE id=$1', [req.params.id]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 app.post('/api/pedidos/:id/desarchivar', authPerm('pedidos'), async (req,res)=>{ try{ await pool.query('UPDATE pedidos SET archivado=false WHERE id=$1', [req.params.id]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
-app.delete('/api/pedidos/:id', authPerm('pedidos'), async (req,res)=>{ try{ const {rows:oep}=await pool.query('SELECT estado, tipo FROM pedidos WHERE id=$1',[req.params.id]); const oe=String((oep[0]||{}).estado||'').toLowerCase(); const ot=String((oep[0]||{}).tipo||''); const afectabaStock = ot==='pedido' && !['cancelado','anulado','rechazado'].includes(oe); if(afectabaStock){ const {rows:its}=await pool.query('SELECT producto_id, cantidad FROM pedido_items WHERE pedido_id=$1',[req.params.id]); for(const it of its){ if(it.producto_id) await pool.query('UPDATE productos SET stock=GREATEST(0, stock + $1) WHERE id=$2 AND permitir_sin_stock=false AND es_digital=false',[it.cantidad||0, it.producto_id]); } } await pool.query('DELETE FROM pedido_items WHERE pedido_id=$1', [req.params.id]); await pool.query('DELETE FROM pedidos WHERE id=$1', [req.params.id]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.delete('/api/pedidos/:id', authPerm('pedidos'), async (req,res)=>{ try{ const {rows:oep}=await pool.query('SELECT estado, tipo FROM pedidos WHERE id=$1',[req.params.id]); const oe=String((oep[0]||{}).estado||'').toLowerCase(); const ot=String((oep[0]||{}).tipo||''); const afectabaStock = ot==='pedido' && !['cancelado','anulado','rechazado'].includes(oe); const {rows:its}=await pool.query('SELECT producto_id, cantidad FROM pedido_items WHERE pedido_id=$1',[req.params.id]); const preIds=[]; if(afectabaStock){ for(const it of its){ if(!it.producto_id) continue; const {rows:pp}=await pool.query('SELECT es_preventa FROM productos WHERE id=$1',[it.producto_id]); if(pp[0] && pp[0].es_preventa){ preIds.push(it.producto_id); } else { await pool.query('UPDATE productos SET stock=GREATEST(0, stock + $1) WHERE id=$2 AND permitir_sin_stock=false AND es_digital=false',[it.cantidad||0, it.producto_id]); } } } await pool.query('DELETE FROM pedido_items WHERE pedido_id=$1', [req.params.id]); await pool.query('DELETE FROM pedidos WHERE id=$1', [req.params.id]); for(const pid of preIds) await recalcReservado(pid); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 
 // STATS
 // REPORTES: más vendidos, ventas por sección, por mes, ganancias
