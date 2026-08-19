@@ -732,10 +732,58 @@ app.put('/api/productos/:id', authPerm('productos'), async (req,res)=>{
 app.delete('/api/productos/:id', authPerm('productos'), async (req,res)=>{ try{ await pool.query('DELETE FROM productos WHERE id=$1', [req.params.id]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 app.post('/api/productos/bulk', authPerm('productos'), async (req,res)=>{
   try{
-    const {productos, reemplazar} = req.body;
-    if(reemplazar){ await pool.query('DELETE FROM producto_imagenes'); await pool.query('DELETE FROM pedido_items'); await pool.query('DELETE FROM productos'); }
+    const {productos, reemplazar, modo, faltantes, seccion_id} = req.body;
+    // MODO "solo_categorias": actualiza SOLO la categoría matcheando por SKU (si tiene) o por nombre. No duplica, no toca precio/stock.
+    if(modo==='solo_categorias'){
+      let actualizados=0, noEncontrados=0;
+      for(const p of (productos||[])){
+        if(!p.categoria || p.categoria==='Sin categoría') continue;
+        let r;
+        if(p.sku && p.sku.trim()){
+          r=await pool.query('UPDATE productos SET categoria=$1 WHERE sku=$2', [p.categoria, p.sku.trim()]);
+        }
+        if((!r || r.rowCount===0) && (p.nombre||p.modelo)){
+          r=await pool.query('UPDATE productos SET categoria=$1 WHERE LOWER(TRIM(nombre))=LOWER(TRIM($2)) OR LOWER(TRIM(modelo))=LOWER(TRIM($2))', [p.categoria, (p.nombre||p.modelo).trim()]);
+        }
+        if(r && r.rowCount>0){ actualizados+=r.rowCount; await pool.query('INSERT INTO categorias_meta (categoria, orden, visible) VALUES ($1,0,true) ON CONFLICT DO NOTHING', [p.categoria]).catch(()=>{}); }
+        else noEncontrados++;
+      }
+      return res.json({ok:true, modo:'solo_categorias', actualizados, noEncontrados, saltados:noEncontrados});
+    }
+    // MODO "crear_actualizar": si existe (por SKU o nombre) actualiza, si no inserta
+    if(modo==='crear_actualizar' || modo==='actualizar'){
+      let insertados=0, actualizados=0;
+      for(const p of (productos||[])){
+        let existe=null;
+        if(p.sku && p.sku.trim()){ const {rows}=await pool.query('SELECT id FROM productos WHERE sku=$1 LIMIT 1', [p.sku.trim()]); existe=rows[0]; }
+        if(!existe && (p.nombre||p.modelo)){ const {rows}=await pool.query('SELECT id FROM productos WHERE LOWER(TRIM(nombre))=LOWER(TRIM($1)) LIMIT 1', [(p.nombre||p.modelo).trim()]); existe=rows[0]; }
+        if(existe){
+          await pool.query('UPDATE productos SET categoria=$1, precio_base=$2, stock=$3, precio_oferta=$4 WHERE id=$5', [p.categoria||'', p.precio_base||0, p.stock||0, p.precio_oferta||0, existe.id]);
+          actualizados++;
+        } else {
+          await pool.query(`INSERT INTO productos (seccion_id,categoria,modelo,nombre,precio_base,stock,imagen,sku,descripcion,peso,alto,ancho,largo,visible) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,true)`, [p.seccion_id||seccion_id||1, p.categoria||'', p.modelo||'', p.nombre||p.modelo||'', p.precio_base||0, p.stock||0, p.imagen||'', p.sku||'', p.descripcion||'', p.peso||0, p.alto||0, p.ancho||0, p.largo||0]);
+          insertados++;
+        }
+      }
+      return res.json({ok:true, modo:'crear_actualizar', insertados, actualizados});
+    }
+    // MODO "solo_nuevos": inserta solo los que no existen (por SKU o nombre)
+    if(modo==='solo_nuevos'){
+      let insertados=0, saltados=0;
+      for(const p of (productos||[])){
+        let existe=null;
+        if(p.sku && p.sku.trim()){ const {rows}=await pool.query('SELECT id FROM productos WHERE sku=$1 LIMIT 1', [p.sku.trim()]); existe=rows[0]; }
+        if(!existe && (p.nombre||p.modelo)){ const {rows}=await pool.query('SELECT id FROM productos WHERE LOWER(TRIM(nombre))=LOWER(TRIM($1)) LIMIT 1', [(p.nombre||p.modelo).trim()]); existe=rows[0]; }
+        if(existe){ saltados++; continue; }
+        await pool.query(`INSERT INTO productos (seccion_id,categoria,modelo,nombre,precio_base,stock,imagen,sku,descripcion,peso,alto,ancho,largo,visible) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,true)`, [p.seccion_id||seccion_id||1, p.categoria||'', p.modelo||'', p.nombre||p.modelo||'', p.precio_base||0, p.stock||0, p.imagen||'', p.sku||'', p.descripcion||'', p.peso||0, p.alto||0, p.ancho||0, p.largo||0]);
+        insertados++;
+      }
+      return res.json({ok:true, modo:'solo_nuevos', insertados, saltados});
+    }
+    // MODO por defecto / "reemplazar": insertar (con reemplazar opcional)
+    if(reemplazar || modo==='reemplazar'){ await pool.query('DELETE FROM producto_imagenes'); await pool.query('DELETE FROM pedido_items'); await pool.query('DELETE FROM productos WHERE seccion_id=$1', [seccion_id||1]); }
     for(const p of (productos||[])){
-      await pool.query(`INSERT INTO productos (seccion_id,categoria,modelo,nombre,precio_base,stock,imagen,sku,descripcion,compatibilidad,peso,alto,ancho,largo,visible,permitir_sin_stock,es_digital) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) ON CONFLICT DO NOTHING`, [p.seccion_id||1, p.categoria||'', p.modelo||'', p.nombre||p.modelo||'', p.precio_base||0, p.stock||0, p.imagen||'', p.sku||'', p.descripcion||'', p.compatibilidad||'', p.peso||0, p.alto||0, p.ancho||0, p.largo||0, true, p.permitir_sin_stock||false, p.es_digital||false]);
+      await pool.query(`INSERT INTO productos (seccion_id,categoria,modelo,nombre,precio_base,stock,imagen,sku,descripcion,compatibilidad,peso,alto,ancho,largo,visible,permitir_sin_stock,es_digital) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) ON CONFLICT DO NOTHING`, [p.seccion_id||seccion_id||1, p.categoria||'', p.modelo||'', p.nombre||p.modelo||'', p.precio_base||0, p.stock||0, p.imagen||'', p.sku||'', p.descripcion||'', p.compatibilidad||'', p.peso||0, p.alto||0, p.ancho||0, p.largo||0, true, p.permitir_sin_stock||false, p.es_digital||false]);
     }
     res.json({ok:true, count: productos.length, insertados: productos.length});
   }catch(e){ res.status(500).json({error:e.message}); }
