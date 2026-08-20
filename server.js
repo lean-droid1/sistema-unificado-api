@@ -236,6 +236,7 @@ async function migrate(){
     `ALTER TABLE pedido_items ADD COLUMN IF NOT EXISTS precio_base NUMERIC(12,2) DEFAULT 0`,
     // pedidos - EVERY column
     `ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS datos_envio TEXT DEFAULT ''`,
+    `ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS datos_facturacion TEXT DEFAULT ''`,
     `ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS archivado BOOLEAN DEFAULT false`,
     `ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS is_test BOOLEAN DEFAULT false`,
     `ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS costo_envio NUMERIC(12,2) DEFAULT 0`,
@@ -443,6 +444,19 @@ app.post('/api/register', async (req,res)=>{
   }catch(e){ res.status(400).json({error:e.message.includes('duplicate')?'Usuario ya existe':e.message}); }
 });
 app.get('/api/me', auth(), async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM usuarios WHERE id=$1', [req.user.id]); res.json({...rows[0], password:undefined}); }catch(e){ res.status(500).json({error:e.message}); } });
+// Crear cliente rápido desde el panel (venta de mostrador). Genera usuario auto si no se pasa.
+app.post('/api/usuarios/rapido', authPerm('usuarios'), async (req,res)=>{
+  try{
+    const {nombre,telefono,email,direccion}=req.body;
+    if(!nombre) return res.status(400).json({error:'Falta el nombre'});
+    // usuario auto: nombre sin espacios + timestamp corto, único
+    let base=(nombre||'cliente').toLowerCase().replace(/[^a-z0-9]/g,'').slice(0,12)||'cliente';
+    let usuario=base+Math.floor(Math.random()*9000+1000);
+    const hash=await bcrypt.hash('cliente'+Date.now(),10); // password random (el cliente puede resetear después)
+    const {rows}=await pool.query('INSERT INTO usuarios (nombre,usuario,password,telefono,email,direccion,aprobado,activo) VALUES ($1,$2,$3,$4,$5,$6,true,true) RETURNING id,nombre,usuario,telefono,email', [nombre,usuario,hash,telefono||'',email||'',direccion||'']);
+    res.json(rows[0]);
+  }catch(e){ res.status(400).json({error:e.message.includes('duplicate')?'Ese usuario ya existe, probá otro nombre':e.message}); }
+});
 app.put('/api/me', auth(), async (req,res)=>{
   try{
     const {nombre,telefono,email,direccion,nombre_fantasia,password}=req.body;
@@ -1120,8 +1134,8 @@ app.post('/api/pedidos/multi', auth(), async (req,res)=>{
           return res.status(400).json({error:`Sin stock: ${item.nombre_producto||''} (disponible: ${prod[0].stock})`});
         }
       }
-      const {rows}=await client.query('INSERT INTO pedidos (usuario_id,seccion_id,tipo,metodo_pago,notas,cupon_codigo,subtotal,descuento,total,datos_envio,costo_envio,metodo_envio,cp_destino,is_test) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING *',
-        [req.user.id, seccion_id, 'pedido', metodo_pago||'', notas||'', cupon_codigo||'', subtotal||0, descuento||0, total||0, datos_envio||'', costo_envio||0, metodo_envio||'', cp_destino||'', is_test||false]);
+      const {rows}=await client.query('INSERT INTO pedidos (usuario_id,seccion_id,tipo,metodo_pago,notas,cupon_codigo,subtotal,descuento,total,datos_envio,costo_envio,metodo_envio,cp_destino,is_test,datos_facturacion,estado_pago) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) RETURNING *',
+        [req.user.id, seccion_id, 'pedido', metodo_pago||'', notas||'', cupon_codigo||'', subtotal||0, descuento||0, total||0, datos_envio||'', costo_envio||0, metodo_envio||'', cp_destino||'', is_test||false, ped.datos_facturacion||'', ped.estado_pago||'impago']);
       for(const item of (items||[])){
         await client.query('INSERT INTO pedido_items (pedido_id,producto_id,categoria,modelo,nombre_producto,cantidad,precio_unitario,precio_base) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)',
           [rows[0].id, item.producto_id, item.categoria||'', item.modelo||'', item.nombre_producto||'', item.cantidad||1, item.precio_unitario||0, item.precio_base||0]);
