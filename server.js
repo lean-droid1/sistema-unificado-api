@@ -1,3 +1,4 @@
+
 const express = require('express');
 const cors = require('cors');
 const { Pool } = require('pg');
@@ -42,6 +43,10 @@ app.use(express.json({ limit: '10mb' }));
 
 const rateLimit = require('express-rate-limit');
 app.use('/api/auth', rateLimit({ windowMs: 15 * 60 * 1000, max: 30 }));
+// Límite estricto para login/registro (anti fuerza bruta): 10 intentos cada 15 min por IP
+const authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 10, message: { error: 'Demasiados intentos. Esperá unos minutos e intentá de nuevo.' }, standardHeaders: true, legacyHeaders: false });
+app.use('/api/login', authLimiter);
+app.use('/api/register', authLimiter);
 app.use('/api/', rateLimit({ windowMs: 1 * 60 * 1000, max: 300 }));
 app.set('trust proxy', 1);
 
@@ -438,7 +443,7 @@ app.post('/api/register', async (req,res)=>{
     if(!usuario||usuario.length<3) return res.status(400).json({error:'Min 3 caracteres'});
     const pwError=validatePassword(password); if(pwError) return res.status(400).json({error:pwError});
     const hash=await bcrypt.hash(password,12);
-    const {rows}=await pool.query('INSERT INTO usuarios (nombre,usuario,password,telefono,email,direccion,nombre_fantasia,aprobado,activo) VALUES ($1,$2,$3,$4,$5,$6,$7,false,false) RETURNING *', [nombre,usuario,hash,telefono||'',email||'',direccion||'',nombre_fantasia||'']);
+    const {rows}=await pool.query('INSERT INTO usuarios (nombre,usuario,password,telefono,email,direccion,nombre_fantasia,aprobado,activo) VALUES ($1,$2,$3,$4,$5,$6,$7,false,false) RETURNING id,nombre,usuario,telefono,email,aprobado,activo', [nombre,usuario,hash,telefono||'',email||'',direccion||'',nombre_fantasia||'']);
     res.json(rows[0]);
   }catch(e){ res.status(400).json({error:e.message.includes('duplicate')?'Usuario ya existe':e.message}); }
 });
@@ -448,12 +453,15 @@ app.post('/api/usuarios/rapido', authPerm('usuarios'), async (req,res)=>{
   try{
     const {nombre,telefono,email,direccion}=req.body;
     if(!nombre) return res.status(400).json({error:'Falta el nombre'});
-    // usuario auto: nombre sin espacios + timestamp corto, único
+    // usuario auto: nombre sin espacios + numero corto, único
     let base=(nombre||'cliente').toLowerCase().replace(/[^a-z0-9]/g,'').slice(0,12)||'cliente';
     let usuario=base+Math.floor(Math.random()*9000+1000);
-    const hash=await bcrypt.hash('cliente'+Date.now(),10); // password random (el cliente puede resetear después)
+    // password simple legible para darle al cliente (ej: "tienda4821"). Puede cambiarla después.
+    const passPlano='cliente'+Math.floor(Math.random()*9000+1000);
+    const hash=await bcrypt.hash(passPlano,10);
     const {rows}=await pool.query('INSERT INTO usuarios (nombre,usuario,password,telefono,email,direccion,aprobado,activo) VALUES ($1,$2,$3,$4,$5,$6,true,true) RETURNING id,nombre,usuario,telefono,email', [nombre,usuario,hash,telefono||'',email||'',direccion||'']);
-    res.json(rows[0]);
+    // Devolvemos la password en texto SOLO acá (para que el admin la imprima/pase al cliente). No se guarda en texto.
+    res.json({...rows[0], password_temporal:passPlano});
   }catch(e){ res.status(400).json({error:e.message.includes('duplicate')?'Ese usuario ya existe, probá otro nombre':e.message}); }
 });
 app.put('/api/me', auth(), async (req,res)=>{
