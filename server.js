@@ -274,6 +274,7 @@ async function migrate(){
     `ALTER TABLE productos ADD COLUMN IF NOT EXISTS largo NUMERIC(8,2) DEFAULT 0`,
     `ALTER TABLE productos ADD COLUMN IF NOT EXISTS descripcion TEXT DEFAULT ''`,
     `ALTER TABLE productos ADD COLUMN IF NOT EXISTS sku VARCHAR(100) DEFAULT ''`,
+    `ALTER TABLE productos ADD COLUMN IF NOT EXISTS codigo_barras VARCHAR(60) DEFAULT ''`,
     `ALTER TABLE productos ADD COLUMN IF NOT EXISTS tipo VARCHAR(20) DEFAULT 'fisico'`,
     `ALTER TABLE productos ADD COLUMN IF NOT EXISTS moneda VARCHAR(10) DEFAULT 'ARS'`,
     `ALTER TABLE productos ADD COLUMN IF NOT EXISTS precio_oferta NUMERIC(12,2) DEFAULT 0`,
@@ -736,7 +737,7 @@ app.post('/api/productos/:id/duplicar', authPerm('productos'), async (req,res)=>
 app.put('/api/productos/:id', authPerm('productos'), async (req,res)=>{
   try{
     const p=req.body;
-    const fields=['seccion_id','categoria','modelo','nombre','precio_base','precio_original','stock','stock_minimo','imagen','notas','compatibilidad','descripcion','sku','tipo','moneda','precio_oferta','envio_gratis','visible','peso','alto','ancho','largo','permitir_sin_stock','es_digital','marca','es_preventa','preventa_precio','preventa_fecha','preventa_mostrar_fecha','preventa_descuento_pct','preventa_cupo','preventa_reservado'];
+    const fields=['seccion_id','categoria','modelo','nombre','precio_base','precio_original','stock','stock_minimo','imagen','notas','compatibilidad','descripcion','sku','codigo_barras','tipo','moneda','precio_oferta','envio_gratis','visible','peso','alto','ancho','largo','permitir_sin_stock','es_digital','marca','es_preventa','preventa_precio','preventa_fecha','preventa_mostrar_fecha','preventa_descuento_pct','preventa_cupo','preventa_reservado'];
     const sets=[]; const params=[]; let pi=1;
     for(const f of fields){ if(p[f]!==undefined){ sets.push(`${f}=$${pi++}`); params.push(p[f]); } }
     if(!sets.length) return res.json({ok:true});
@@ -813,7 +814,35 @@ app.post('/api/productos/bulk', authPerm('productos'), async (req,res)=>{
 });
 app.delete('/api/categorias/:categoria', authPerm('productos'), async (req,res)=>{ try{ const {mover_a}=req.query; const destino = mover_a || 'Sin categoría'; const r=await pool.query('UPDATE productos SET categoria=$1 WHERE categoria=$2', [destino, req.params.categoria]); await pool.query('DELETE FROM categorias_meta WHERE categoria=$1', [req.params.categoria]).catch(()=>{}); res.json({ok:true, movidos:r.rowCount, destino}); }catch(e){ res.status(500).json({error:e.message}); } });
 app.delete('/api/productos/all', authPerm('productos'), async (req,res)=>{ try{ await pool.query('DELETE FROM productos'); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
-app.get('/api/productos/buscar', async (req,res)=>{ try{ const {q}=req.query; if(!q) return res.json([]); const {rows}=await pool.query("SELECT id,nombre,modelo,categoria,precio_base,stock,imagen FROM productos WHERE nombre ILIKE $1 OR modelo ILIKE $1 OR categoria ILIKE $1 OR sku ILIKE $1 ORDER BY nombre LIMIT 20", [`%${q}%`]); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
+app.get('/api/productos/buscar', async (req,res)=>{ try{ const {q}=req.query; if(!q) return res.json([]); const {rows}=await pool.query("SELECT id,nombre,modelo,categoria,precio_base,stock,imagen,sku,codigo_barras FROM productos WHERE nombre ILIKE $1 OR modelo ILIKE $1 OR categoria ILIKE $1 OR sku ILIKE $1 ORDER BY nombre LIMIT 20", [`%${q}%`]); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
+// Buscar producto por código de barras/SKU exacto (para el escáner). Devuelve 1 producto.
+app.get('/api/productos/por-codigo/:codigo', async (req,res)=>{
+  try{
+    const c=(req.params.codigo||'').trim();
+    if(!c) return res.status(404).json({error:'Código vacío'});
+    const {rows}=await pool.query(`SELECT p.*, s.nombre as seccion_nombre FROM productos p LEFT JOIN secciones s ON p.seccion_id=s.id
+      WHERE p.codigo_barras=$1 OR p.sku=$1 OR CAST(p.id AS TEXT)=$1 LIMIT 1`, [c]);
+    if(!rows[0]) return res.status(404).json({error:'No se encontró ningún producto con ese código'});
+    res.json(rows[0]);
+  }catch(e){ res.status(500).json({error:e.message}); }
+});
+// Generar código de barras automático para productos que no tienen (basado en ID). Opcional: seccion_id
+app.post('/api/productos/generar-codigos', authPerm('productos'), async (req,res)=>{
+  try{
+    const {seccion_id}=req.body;
+    const cond = seccion_id && seccion_id!=='all' ? 'AND seccion_id=$1' : '';
+    const params = seccion_id && seccion_id!=='all' ? [seccion_id] : [];
+    // Genera código tipo "P" + id con padding (ej P000123) para los que están vacíos
+    const {rows}=await pool.query(`SELECT id FROM productos WHERE (codigo_barras IS NULL OR codigo_barras='') ${cond}`, params);
+    let generados=0;
+    for(const r of rows){
+      const codigo='P'+String(r.id).padStart(6,'0');
+      await pool.query('UPDATE productos SET codigo_barras=$1 WHERE id=$2', [codigo, r.id]);
+      generados++;
+    }
+    res.json({ok:true, generados});
+  }catch(e){ res.status(500).json({error:e.message}); }
+});
 app.get('/api/productos/id/:id', async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM productos WHERE id=$1', [req.params.id]); if(!rows[0]) return res.status(404).json({error:'No encontrado'}); res.json(rows[0]); }catch(e){ res.status(500).json({error:e.message}); } });
 
 // Validar presupuesto antes de convertir: chequear stock y precios actuales
