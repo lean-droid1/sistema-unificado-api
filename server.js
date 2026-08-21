@@ -1,4 +1,3 @@
-
 const express = require('express');
 const cors = require('cors');
 const { Pool } = require('pg');
@@ -168,6 +167,7 @@ async function migrate(){
     `ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS sena NUMERIC(12,2) DEFAULT 0`,
     `ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS es_reserva BOOLEAN DEFAULT false`,
     `CREATE TABLE IF NOT EXISTS cuenta_corriente (id SERIAL PRIMARY KEY, usuario_id INT, tipo VARCHAR(20), monto NUMERIC(12,2) DEFAULT 0, concepto TEXT DEFAULT '', pedido_id INT, created_at TIMESTAMP DEFAULT NOW())`,
+    `CREATE TABLE IF NOT EXISTS pedido_pagos (id SERIAL PRIMARY KEY, pedido_id INT, metodo VARCHAR(100) DEFAULT '', monto NUMERIC(12,2) DEFAULT 0, ajuste_pct NUMERIC(6,2) DEFAULT 0, ajuste_monto NUMERIC(12,2) DEFAULT 0, nota TEXT DEFAULT '', created_at TIMESTAMP DEFAULT NOW())`,
     `UPDATE pedidos SET estado_pago='impago' WHERE estado_pago='pendiente' OR estado_pago IS NULL OR estado_pago=''`,
     `CREATE TABLE IF NOT EXISTS ordenes_compra (id SERIAL PRIMARY KEY, proveedor VARCHAR(200), seccion_id INT, estado VARCHAR(20) DEFAULT 'pendiente', total NUMERIC(12,2) DEFAULT 0, notas TEXT, recibida BOOLEAN DEFAULT false, created_at TIMESTAMP DEFAULT NOW())`,
     `CREATE TABLE IF NOT EXISTS orden_compra_items (id SERIAL PRIMARY KEY, orden_id INT REFERENCES ordenes_compra(id) ON DELETE CASCADE, producto_id INT, nombre_producto VARCHAR(300), cantidad INT DEFAULT 1, costo_unitario NUMERIC(12,2) DEFAULT 0)`,
@@ -1041,7 +1041,7 @@ app.get('/api/pedidos', auth(), async (req,res)=>{
     res.json(rows);
   }catch(e){ res.status(500).json({error:e.message}); }
 });
-app.get('/api/pedidos/:id', auth(), async (req,res)=>{ try{ const {rows}=await pool.query('SELECT p.*, u.nombre as usuario_nombre, u.telefono as usuario_telefono, u.email as usuario_email, u.nombre_fantasia, u.direccion as usuario_direccion, s.nombre as seccion_nombre, s.color as seccion_color FROM pedidos p LEFT JOIN usuarios u ON p.usuario_id=u.id LEFT JOIN secciones s ON p.seccion_id=s.id WHERE p.id=$1', [req.params.id]); if(!rows[0]) return res.status(404).json({error:'No encontrado'}); const {rows:items}=await pool.query('SELECT * FROM pedido_items WHERE pedido_id=$1', [req.params.id]); res.json({...rows[0], items}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.get('/api/pedidos/:id', auth(), async (req,res)=>{ try{ const {rows}=await pool.query('SELECT p.*, u.nombre as usuario_nombre, u.telefono as usuario_telefono, u.email as usuario_email, u.nombre_fantasia, u.direccion as usuario_direccion, s.nombre as seccion_nombre, s.color as seccion_color FROM pedidos p LEFT JOIN usuarios u ON p.usuario_id=u.id LEFT JOIN secciones s ON p.seccion_id=s.id WHERE p.id=$1', [req.params.id]); if(!rows[0]) return res.status(404).json({error:'No encontrado'}); const {rows:items}=await pool.query('SELECT * FROM pedido_items WHERE pedido_id=$1', [req.params.id]); const {rows:pagos}=await pool.query('SELECT * FROM pedido_pagos WHERE pedido_id=$1 ORDER BY created_at', [req.params.id]); res.json({...rows[0], items, pagos}); }catch(e){ res.status(500).json({error:e.message}); } });
 
 // Pedido simple + pedido multi-tienda con transaccion
 app.post('/api/pedidos', auth(), async (req,res)=>{
@@ -1104,6 +1104,15 @@ app.post('/api/pedidos', auth(), async (req,res)=>{
           [pedidoUserId, 'cargo', deuda, `Pedido #${String(rows[0].id).padStart(4,'0')}`, rows[0].id]).catch(()=>{});
       }
     }
+    // Pagos iniciales (venta de mostrador con pagos mixtos)
+    if(Array.isArray(req.body.pagos) && req.body.pagos.length){
+      for(const pg of req.body.pagos){
+        if(Number(pg.monto)>0){
+          await client.query('INSERT INTO pedido_pagos (pedido_id,metodo,monto,ajuste_pct,ajuste_monto,nota) VALUES ($1,$2,$3,$4,$5,$6)',
+            [rows[0].id, pg.metodo||'', Number(pg.monto)||0, Number(pg.ajuste_pct)||0, Number(pg.ajuste_monto)||0, pg.nota||'']);
+        }
+      }
+    }
     await client.query('COMMIT');
     res.json(rows[0]);
   }catch(e){ await client.query('ROLLBACK').catch(()=>{}); res.status(500).json({error:e.message}); }
@@ -1162,8 +1171,45 @@ app.post('/api/pedidos/multi', auth(), async (req,res)=>{
   finally{ client.release(); }
 });
 
-app.put('/api/pedidos/:id', authPerm('pedidos'), async (req,res)=>{
+// ==== PAGOS MIXTOS DE UN PEDIDO ====
+// Recalcula estado_pago del pedido según la suma de pagos registrados
+async function recalcularEstadoPago(pedidoId){
+  const {rows:ped}=await pool.query('SELECT total FROM pedidos WHERE id=$1',[pedidoId]);
+  if(!ped[0]) return;
+  const total=Number(ped[0].total)||0;
+  const {rows:pg}=await pool.query('SELECT COALESCE(SUM(monto),0) as pagado FROM pedido_pagos WHERE pedido_id=$1',[pedidoId]);
+  const pagado=Number(pg[0].pagado)||0;
+  let estado='impago';
+  if(pagado<=0) estado='impago';
+  else if(pagado>=total-0.01) estado='pagado';
+  else estado='senado';
+  // sena = lo pagado (para compatibilidad con lo que ya existe)
+  await pool.query('UPDATE pedidos SET estado_pago=$1, sena=$2, updated_at=NOW() WHERE id=$3',[estado, pagado>=total?0:pagado, pedidoId]);
+  return {estado, pagado, total};
+}
+app.get('/api/pedidos/:id/pagos', auth(), async (req,res)=>{
+  try{ const {rows}=await pool.query('SELECT * FROM pedido_pagos WHERE pedido_id=$1 ORDER BY created_at',[req.params.id]); res.json(rows); }
+  catch(e){ res.status(500).json({error:e.message}); }
+});
+app.post('/api/pedidos/:id/pagos', authPerm('pedidos'), async (req,res)=>{
   try{
+    const {metodo,monto,ajuste_pct,ajuste_monto,nota}=req.body;
+    if(!(Number(monto)>0)) return res.status(400).json({error:'El monto debe ser mayor a 0'});
+    await pool.query('INSERT INTO pedido_pagos (pedido_id,metodo,monto,ajuste_pct,ajuste_monto,nota) VALUES ($1,$2,$3,$4,$5,$6)',
+      [req.params.id, metodo||'', Number(monto)||0, Number(ajuste_pct)||0, Number(ajuste_monto)||0, nota||'']);
+    const r=await recalcularEstadoPago(req.params.id);
+    res.json({ok:true, ...r});
+  }catch(e){ res.status(500).json({error:e.message}); }
+});
+app.delete('/api/pedidos/:id/pagos/:pagoId', authPerm('pedidos'), async (req,res)=>{
+  try{
+    await pool.query('DELETE FROM pedido_pagos WHERE id=$1 AND pedido_id=$2',[req.params.pagoId, req.params.id]);
+    const r=await recalcularEstadoPago(req.params.id);
+    res.json({ok:true, ...r});
+  }catch(e){ res.status(500).json({error:e.message}); }
+});
+
+app.put('/api/pedidos/:id', authPerm('pedidos'), async (req,res)=>{  try{
     const p=req.body; const sets=[]; const params=[]; let pi=1;
     // Capturar estado + tipo + items ANTES de cambios
     const {rows:oldItemsRows}=await pool.query('SELECT producto_id, cantidad FROM pedido_items WHERE pedido_id=$1', [req.params.id]);
