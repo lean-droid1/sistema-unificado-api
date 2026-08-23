@@ -375,6 +375,48 @@ app.post('/api/maintenance-mode', authPerm('config'), async (req,res)=>{
 // === AUTH ===
 let resend=null;
 if(process.env.RESEND_API_KEY){ const {Resend}=require('resend'); resend=new Resend(process.env.RESEND_API_KEY); console.log('📧 Resend OK'); }
+
+// Notificar al admin por email cuando entra una venta online
+async function notificarVentaAdmin(pedidos, comprador){
+  try{
+    if(!resend || !pedidos || !pedidos.length) return;
+    // Email destino: config 'email_ventas' o RESEND_TO o el del primer admin
+    const {rows:cfg}=await pool.query("SELECT valor FROM config WHERE clave='email_ventas'").catch(()=>({rows:[]}));
+    let destino = (cfg[0] && cfg[0].valor) || process.env.RESEND_TO || '';
+    if(!destino){
+      const {rows:adm}=await pool.query("SELECT email FROM usuarios WHERE rol='admin' AND email<>'' ORDER BY id LIMIT 1").catch(()=>({rows:[]}));
+      destino = adm[0] && adm[0].email;
+    }
+    if(!destino) return;
+    const {rows:dc}=await pool.query("SELECT valor FROM design_config WHERE clave='nombre_tienda'").catch(()=>({rows:[]}));
+    const tienda = (dc[0] && dc[0].valor) || 'Tu tienda';
+    const baseUrl = process.env.PUBLIC_URL || process.env.FRONTEND_URL || '';
+    const total = pedidos.reduce((s,p)=>s+Number(p.total||0),0);
+    const nombreCliente = (comprador && (comprador.nombre||comprador.usuario)) || 'Cliente';
+    const filas = pedidos.map(p=>{
+      const link = baseUrl ? `${baseUrl}/?pedido=${p.id}` : '';
+      const num = String(p.id).padStart(4,'0');
+      return `<tr><td style="padding:8px 12px;border-bottom:1px solid #eee">#${num}</td><td style="padding:8px 12px;border-bottom:1px solid #eee">$${Number(p.total||0).toLocaleString('es-AR')}</td><td style="padding:8px 12px;border-bottom:1px solid #eee">${link?`<a href="${link}">Ver orden →</a>`:''}</td></tr>`;
+    }).join('');
+    const html = `
+      <div style="font-family:system-ui,sans-serif;max-width:520px;margin:0 auto">
+        <h2 style="color:#16a34a">🛒 Nueva venta en ${tienda}</h2>
+        <p>Cliente: <strong>${nombreCliente}</strong></p>
+        <p>Total: <strong style="font-size:20px">$${total.toLocaleString('es-AR')}</strong></p>
+        <table style="width:100%;border-collapse:collapse;margin-top:12px">
+          <thead><tr><th style="text-align:left;padding:8px 12px;border-bottom:2px solid #333">Pedido</th><th style="text-align:left;padding:8px 12px;border-bottom:2px solid #333">Total</th><th style="text-align:left;padding:8px 12px;border-bottom:2px solid #333"></th></tr></thead>
+          <tbody>${filas}</tbody>
+        </table>
+        <p style="color:#888;font-size:12px;margin-top:20px">Entró recién a tu tienda. Ingresá al panel para gestionarla.</p>
+      </div>`;
+    await resend.emails.send({
+      from: process.env.RESEND_FROM || 'noreply@resend.dev',
+      to: destino,
+      subject: `🛒 Nueva venta $${total.toLocaleString('es-AR')} — ${tienda}`,
+      html,
+    }).catch(()=>{});
+  }catch(e){ /* silencioso */ }
+}
 const loginAttempts={};
 app.post('/api/login', async (req,res)=>{
   try{
@@ -1170,6 +1212,8 @@ app.post('/api/pedidos/multi', auth(), async (req,res)=>{
     }
     if(creados[0]?.cupon_codigo) await client.query("UPDATE cupones SET usos_actuales = usos_actuales + 1 WHERE codigo=$1", [creados[0].cupon_codigo]).catch(()=>{});
     await client.query('COMMIT');
+    // Notificar al admin por email (nueva venta online)
+    notificarVentaAdmin(creados, req.user).catch(()=>{});
     res.json({ok:true, pedidos: creados});
   }catch(e){ await client.query('ROLLBACK').catch(()=>{}); res.status(500).json({error:e.message}); }
   finally{ client.release(); }
