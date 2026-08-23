@@ -379,15 +379,15 @@ if(process.env.RESEND_API_KEY){ const {Resend}=require('resend'); resend=new Res
 // Notificar al admin por email cuando entra una venta online
 async function notificarVentaAdmin(pedidos, comprador){
   try{
-    if(!resend || !pedidos || !pedidos.length) return;
+    if(!resend || !pedidos || !pedidos.length){ console.log('[venta-mail] sin resend o sin pedidos'); return; }
     // Email destino: config 'email_ventas' o RESEND_TO o el del primer admin
-    const {rows:cfg}=await pool.query("SELECT valor FROM config WHERE clave='email_ventas'").catch(()=>({rows:[]}));
+    const {rows:cfg}=await pool.query("SELECT valor FROM configuracion WHERE clave='email_ventas'").catch(()=>({rows:[]}));
     let destino = (cfg[0] && cfg[0].valor) || process.env.RESEND_TO || '';
     if(!destino){
       const {rows:adm}=await pool.query("SELECT email FROM usuarios WHERE rol='admin' AND email<>'' ORDER BY id LIMIT 1").catch(()=>({rows:[]}));
       destino = adm[0] && adm[0].email;
     }
-    if(!destino) return;
+    if(!destino){ console.log('[venta-mail] no hay email destino (configurá email_ventas en General)'); return; }
     const {rows:dc}=await pool.query("SELECT valor FROM design_config WHERE clave='nombre_tienda'").catch(()=>({rows:[]}));
     const tienda = (dc[0] && dc[0].valor) || 'Tu tienda';
     const baseUrl = process.env.PUBLIC_URL || process.env.FRONTEND_URL || '';
@@ -409,13 +409,15 @@ async function notificarVentaAdmin(pedidos, comprador){
         </table>
         <p style="color:#888;font-size:12px;margin-top:20px">Entró recién a tu tienda. Ingresá al panel para gestionarla.</p>
       </div>`;
-    await resend.emails.send({
-      from: process.env.RESEND_FROM || 'noreply@resend.dev',
+    const r = await resend.emails.send({
+      from: process.env.RESEND_FROM || 'onboarding@resend.dev',
       to: destino,
       subject: `🛒 Nueva venta $${total.toLocaleString('es-AR')} — ${tienda}`,
       html,
-    }).catch(()=>{});
-  }catch(e){ /* silencioso */ }
+    });
+    if(r && r.error){ console.log('[venta-mail] Resend error:', JSON.stringify(r.error)); }
+    else { console.log('[venta-mail] enviado a', destino); }
+  }catch(e){ console.log('[venta-mail] excepción:', e.message); }
 }
 const loginAttempts={};
 app.post('/api/login', async (req,res)=>{
