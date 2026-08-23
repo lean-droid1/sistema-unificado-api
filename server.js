@@ -168,6 +168,9 @@ async function migrate(){
     `ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS es_reserva BOOLEAN DEFAULT false`,
     `CREATE TABLE IF NOT EXISTS cuenta_corriente (id SERIAL PRIMARY KEY, usuario_id INT, tipo VARCHAR(20), monto NUMERIC(12,2) DEFAULT 0, concepto TEXT DEFAULT '', pedido_id INT, created_at TIMESTAMP DEFAULT NOW())`,
     `CREATE TABLE IF NOT EXISTS pedido_pagos (id SERIAL PRIMARY KEY, pedido_id INT, metodo VARCHAR(100) DEFAULT '', monto NUMERIC(12,2) DEFAULT 0, ajuste_pct NUMERIC(6,2) DEFAULT 0, ajuste_monto NUMERIC(12,2) DEFAULT 0, nota TEXT DEFAULT '', created_at TIMESTAMP DEFAULT NOW())`,
+    `ALTER TABLE pedido_pagos ADD COLUMN IF NOT EXISTS recibido NUMERIC(12,2) DEFAULT 0`,
+    `ALTER TABLE pedido_pagos ADD COLUMN IF NOT EXISTS cuenta_como NUMERIC(12,2) DEFAULT 0`,
+    `UPDATE pedido_pagos SET recibido=monto, cuenta_como=monto WHERE recibido=0 AND cuenta_como=0 AND monto>0`,
     `UPDATE pedidos SET estado_pago='impago' WHERE estado_pago='pendiente' OR estado_pago IS NULL OR estado_pago=''`,
     `CREATE TABLE IF NOT EXISTS ordenes_compra (id SERIAL PRIMARY KEY, proveedor VARCHAR(200), seccion_id INT, estado VARCHAR(20) DEFAULT 'pendiente', total NUMERIC(12,2) DEFAULT 0, notas TEXT, recibida BOOLEAN DEFAULT false, created_at TIMESTAMP DEFAULT NOW())`,
     `CREATE TABLE IF NOT EXISTS orden_compra_items (id SERIAL PRIMARY KEY, orden_id INT REFERENCES ordenes_compra(id) ON DELETE CASCADE, producto_id INT, nombre_producto VARCHAR(300), cantidad INT DEFAULT 1, costo_unitario NUMERIC(12,2) DEFAULT 0)`,
@@ -835,7 +838,7 @@ app.post('/api/productos/bulk', authPerm('productos'), async (req,res)=>{
 });
 app.delete('/api/categorias/:categoria', authPerm('productos'), async (req,res)=>{ try{ const {mover_a}=req.query; const destino = mover_a || 'Sin categoría'; const r=await pool.query('UPDATE productos SET categoria=$1 WHERE categoria=$2', [destino, req.params.categoria]); await pool.query('DELETE FROM categorias_meta WHERE categoria=$1', [req.params.categoria]).catch(()=>{}); res.json({ok:true, movidos:r.rowCount, destino}); }catch(e){ res.status(500).json({error:e.message}); } });
 app.delete('/api/productos/all', authPerm('productos'), async (req,res)=>{ try{ await pool.query('DELETE FROM productos'); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
-app.get('/api/productos/buscar', async (req,res)=>{ try{ const {q}=req.query; if(!q) return res.json([]); const {rows}=await pool.query("SELECT id,nombre,modelo,categoria,precio_base,stock,imagen,sku,codigo_barras FROM productos WHERE nombre ILIKE $1 OR modelo ILIKE $1 OR categoria ILIKE $1 OR sku ILIKE $1 ORDER BY nombre LIMIT 20", [`%${q}%`]); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
+app.get('/api/productos/buscar', async (req,res)=>{ try{ const {q}=req.query; if(!q) return res.json([]); const {rows}=await pool.query("SELECT p.id,p.nombre,p.modelo,p.categoria,p.precio_base,p.stock,p.imagen,p.sku,p.codigo_barras,p.seccion_id,p.permitir_sin_stock,p.es_digital,s.nombre as seccion_nombre,s.color as seccion_color FROM productos p LEFT JOIN secciones s ON p.seccion_id=s.id WHERE p.nombre ILIKE $1 OR p.modelo ILIKE $1 OR p.categoria ILIKE $1 OR p.sku ILIKE $1 ORDER BY p.nombre LIMIT 20", [`%${q}%`]); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
 // Buscar producto por código de barras/SKU exacto (para el escáner). Devuelve 1 producto.
 app.get('/api/productos/por-codigo/:codigo', async (req,res)=>{
   try{
@@ -1107,9 +1110,10 @@ app.post('/api/pedidos', auth(), async (req,res)=>{
     // Pagos iniciales (venta de mostrador con pagos mixtos)
     if(Array.isArray(req.body.pagos) && req.body.pagos.length){
       for(const pg of req.body.pagos){
-        if(Number(pg.monto)>0){
-          await client.query('INSERT INTO pedido_pagos (pedido_id,metodo,monto,ajuste_pct,ajuste_monto,nota) VALUES ($1,$2,$3,$4,$5,$6)',
-            [rows[0].id, pg.metodo||'', Number(pg.monto)||0, Number(pg.ajuste_pct)||0, Number(pg.ajuste_monto)||0, pg.nota||'']);
+        const rec=Number(pg.recibido)||0, cta=Number(pg.cuenta_como)||0;
+        if(rec>0 || cta>0){
+          await client.query('INSERT INTO pedido_pagos (pedido_id,metodo,monto,recibido,cuenta_como,ajuste_pct,ajuste_monto,nota) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)',
+            [rows[0].id, pg.metodo||'', rec, rec, cta, Number(pg.ajuste_pct)||0, cta-rec, pg.nota||'']);
         }
       }
     }
@@ -1172,20 +1176,19 @@ app.post('/api/pedidos/multi', auth(), async (req,res)=>{
 });
 
 // ==== PAGOS MIXTOS DE UN PEDIDO ====
-// Recalcula estado_pago del pedido según la suma de pagos registrados
+// Recalcula estado_pago según la suma de "cuenta_como" (lo que tacha de la deuda)
 async function recalcularEstadoPago(pedidoId){
   const {rows:ped}=await pool.query('SELECT total FROM pedidos WHERE id=$1',[pedidoId]);
   if(!ped[0]) return;
   const total=Number(ped[0].total)||0;
-  const {rows:pg}=await pool.query('SELECT COALESCE(SUM(monto),0) as pagado FROM pedido_pagos WHERE pedido_id=$1',[pedidoId]);
-  const pagado=Number(pg[0].pagado)||0;
+  const {rows:pg}=await pool.query('SELECT COALESCE(SUM(cuenta_como),0) as saldado, COALESCE(SUM(recibido),0) as recibido FROM pedido_pagos WHERE pedido_id=$1',[pedidoId]);
+  const saldado=Number(pg[0].saldado)||0;
   let estado='impago';
-  if(pagado<=0) estado='impago';
-  else if(pagado>=total-0.01) estado='pagado';
+  if(saldado<=0) estado='impago';
+  else if(saldado>=total-0.01) estado='pagado';
   else estado='senado';
-  // sena = lo pagado (para compatibilidad con lo que ya existe)
-  await pool.query('UPDATE pedidos SET estado_pago=$1, sena=$2, updated_at=NOW() WHERE id=$3',[estado, pagado>=total?0:pagado, pedidoId]);
-  return {estado, pagado, total};
+  await pool.query('UPDATE pedidos SET estado_pago=$1, sena=$2, updated_at=NOW() WHERE id=$3',[estado, saldado>=total?0:saldado, pedidoId]);
+  return {estado, saldado, total, recibido:Number(pg[0].recibido)||0};
 }
 app.get('/api/pedidos/:id/pagos', auth(), async (req,res)=>{
   try{ const {rows}=await pool.query('SELECT * FROM pedido_pagos WHERE pedido_id=$1 ORDER BY created_at',[req.params.id]); res.json(rows); }
@@ -1193,10 +1196,12 @@ app.get('/api/pedidos/:id/pagos', auth(), async (req,res)=>{
 });
 app.post('/api/pedidos/:id/pagos', authPerm('pedidos'), async (req,res)=>{
   try{
-    const {metodo,monto,ajuste_pct,ajuste_monto,nota}=req.body;
-    if(!(Number(monto)>0)) return res.status(400).json({error:'El monto debe ser mayor a 0'});
-    await pool.query('INSERT INTO pedido_pagos (pedido_id,metodo,monto,ajuste_pct,ajuste_monto,nota) VALUES ($1,$2,$3,$4,$5,$6)',
-      [req.params.id, metodo||'', Number(monto)||0, Number(ajuste_pct)||0, Number(ajuste_monto)||0, nota||'']);
+    const {metodo,recibido,cuenta_como,ajuste_pct,nota}=req.body;
+    const rec=Number(recibido)||0, cta=Number(cuenta_como)||0;
+    if(!(rec>0) && !(cta>0)) return res.status(400).json({error:'El monto debe ser mayor a 0'});
+    const ajusteMonto=cta-rec;
+    await pool.query('INSERT INTO pedido_pagos (pedido_id,metodo,monto,recibido,cuenta_como,ajuste_pct,ajuste_monto,nota) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)',
+      [req.params.id, metodo||'', rec, rec, cta, Number(ajuste_pct)||0, ajusteMonto, nota||'']);
     const r=await recalcularEstadoPago(req.params.id);
     res.json({ok:true, ...r});
   }catch(e){ res.status(500).json({error:e.message}); }
@@ -1297,6 +1302,29 @@ app.delete('/api/pedidos/:id', authPerm('pedidos'), async (req,res)=>{ try{ cons
 
 // STATS
 // REPORTES: más vendidos, ventas por sección, por mes, ganancias
+// ==== CAJA / ARQUEO ==== (plata real cobrada, online + presencial)
+app.get('/api/caja', authPerm('stats'), async (req,res)=>{
+  try{
+    const {desde,hasta}=req.query;
+    const cond=[]; const params=[];
+    if(desde){ params.push(desde); cond.push(`pp.created_at >= $${params.length}`); }
+    if(hasta){ params.push(hasta); cond.push(`pp.created_at <= $${params.length}`); }
+    const where=cond.length?`WHERE ${cond.join(' AND ')}`:'';
+    const {rows:porMetodo}=await pool.query(
+      `SELECT COALESCE(NULLIF(pp.metodo,''),'sin método') as metodo,
+              COALESCE(SUM(pp.recibido),0) as recibido,
+              COALESCE(SUM(pp.cuenta_como),0) as saldado
+       FROM pedido_pagos pp ${where}
+       GROUP BY pp.metodo ORDER BY recibido DESC`, params);
+    const {rows:aj}=await pool.query(
+      `SELECT COALESCE(SUM(CASE WHEN pp.ajuste_monto<0 THEN -pp.ajuste_monto ELSE 0 END),0) as descuentos,
+              COALESCE(SUM(CASE WHEN pp.ajuste_monto>0 THEN pp.ajuste_monto ELSE 0 END),0) as recargos,
+              COALESCE(SUM(pp.recibido),0) as total_recibido,
+              COALESCE(SUM(pp.cuenta_como),0) as total_saldado
+       FROM pedido_pagos pp ${where}`, params);
+    res.json({ porMetodo, ...aj[0] });
+  }catch(e){ res.status(500).json({error:e.message}); }
+});
 app.get('/api/reportes', authPerm('stats'), async (req,res)=>{
   try{
     const {desde, hasta, seccion_id}=req.query;
