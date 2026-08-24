@@ -47,6 +47,7 @@ const authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 10, message: { er
 app.use('/api/login', authLimiter);
 app.use('/api/register', authLimiter);
 app.use('/api/', rateLimit({ windowMs: 1 * 60 * 1000, max: 300 }));
+app.use('/api/', (req,res,next)=>resolveTenant(req,res,next));
 app.set('trust proxy', 1);
 
 const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
@@ -118,6 +119,38 @@ const authPerm = (permiso) => async (req,res,next)=>{
   }catch{ res.status(401).json({error:'Token inválido'}); }
 };
 const optionalAuth = (req,res,next)=>{ try{ const t=req.headers.authorization?.split(' ')[1]; if(t) req.user=jwt.verify(t,JWT_SECRET);}catch{} next(); };
+
+// ═══ MULTI-TENANT: resolución del inquilino (etapa 2) ═══
+// Determina a qué tienda pertenece cada request. Orden: header X-Tenant (slug o id) → tenant del user logueado → 1 (default).
+// Cachea slug→id en memoria para no consultar la DB en cada request.
+const tenantCache = new Map();
+async function slugToTenantId(slug){
+  if(!slug) return null;
+  if(tenantCache.has(slug)) return tenantCache.get(slug);
+  const {rows} = await pool.query('SELECT id, estado FROM tenants WHERE slug=$1 OR dominio_propio=$1 LIMIT 1', [slug]).catch(()=>({rows:[]}));
+  const id = rows[0] ? rows[0].id : null;
+  if(id) tenantCache.set(slug, id);
+  return id;
+}
+const resolveTenant = async (req,res,next)=>{
+  try{
+    let tid = null;
+    // 1) header explícito del frontend (según subdominio de la tienda)
+    const h = req.headers['x-tenant'];
+    if(h){
+      if(/^\d+$/.test(h)) tid = Number(h);
+      else tid = await slugToTenantId(String(h).toLowerCase().trim());
+    }
+    // 2) tenant del usuario logueado (si el token lo trae)
+    if(!tid){
+      try{ const t=req.headers.authorization?.split(' ')[1]; if(t){ const d=jwt.verify(t,JWT_SECRET); if(d && d.tenant_id) tid=d.tenant_id; } }catch{}
+    }
+    // 3) default: tienda principal
+    req.tenantId = tid || 1;
+  }catch{ req.tenantId = 1; }
+  next();
+};
+
 
 // === MIGRATE V4 ===
 async function migrate(){
@@ -487,7 +520,7 @@ app.post('/api/login', async (req,res)=>{
       await pool.query('UPDATE otp_codes SET usado=true WHERE id=$1', [otps[0].id]);
     }
     delete loginAttempts[key];
-    const token=jwt.sign({id:rows[0].id, rol:rows[0].rol, usuario:rows[0].usuario}, JWT_SECRET, {expiresIn:'7d'});
+    const token=jwt.sign({id:rows[0].id, rol:rows[0].rol, usuario:rows[0].usuario, tenant_id:rows[0].tenant_id||1}, JWT_SECRET, {expiresIn:'7d'});
     res.json({token, user:{...rows[0], password:undefined}});
   }catch(e){ res.status(500).json({error:e.message}); }
 });
@@ -495,7 +528,7 @@ app.post('/api/logout', auth(), async (req,res)=>{
   try{ const decoded=jwt.decode(req._token); const expira=new Date(decoded.exp*1000); await pool.query('INSERT INTO tokens_revocados (token_hash,expira) VALUES ($1,$2) ON CONFLICT DO NOTHING', [hashToken(req._token), expira]); await pool.query('DELETE FROM tokens_revocados WHERE expira<NOW()').catch(()=>{}); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); }
 });
 app.post('/api/refresh-token', auth(), async (req,res)=>{
-  try{ const {rows}=await pool.query('SELECT id,rol,usuario,activo FROM usuarios WHERE id=$1', [req.user.id]); if(!rows[0]||!rows[0].activo) return res.status(401).json({error:'Cuenta desactivada'}); const decoded=jwt.decode(req._token); await pool.query('INSERT INTO tokens_revocados (token_hash,expira) VALUES ($1,$2) ON CONFLICT DO NOTHING', [hashToken(req._token), new Date(decoded.exp*1000)]); const newToken=jwt.sign({id:rows[0].id, rol:rows[0].rol, usuario:rows[0].usuario}, JWT_SECRET, {expiresIn:'7d'}); res.json({token:newToken}); }catch(e){ res.status(500).json({error:e.message}); }
+  try{ const {rows}=await pool.query('SELECT id,rol,usuario,activo,tenant_id FROM usuarios WHERE id=$1', [req.user.id]); if(!rows[0]||!rows[0].activo) return res.status(401).json({error:'Cuenta desactivada'}); const decoded=jwt.decode(req._token); await pool.query('INSERT INTO tokens_revocados (token_hash,expira) VALUES ($1,$2) ON CONFLICT DO NOTHING', [hashToken(req._token), new Date(decoded.exp*1000)]); const newToken=jwt.sign({id:rows[0].id, rol:rows[0].rol, usuario:rows[0].usuario, tenant_id:rows[0].tenant_id||1}, JWT_SECRET, {expiresIn:'7d'}); res.json({token:newToken}); }catch(e){ res.status(500).json({error:e.message}); }
 });
 app.put('/api/me/otp', auth(), async (req,res)=>{ try{ const {activo}=req.body; await pool.query('UPDATE usuarios SET otp_activo=$1 WHERE id=$2', [activo, req.user.id]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 
