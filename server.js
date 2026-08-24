@@ -713,18 +713,18 @@ app.post('/api/upload-base64', authPerm('config'), async (req,res)=>{
 // PRODUCTOS V4 con permitir_sin_stock y es_digital
 app.get('/api/productos/relacionados/:id', async (req,res)=>{
   try{
-    const {rows:base}=await pool.query('SELECT categoria, seccion_id, marca FROM productos WHERE id=$1', [req.params.id]);
+    const {rows:base}=await pool.query('SELECT categoria, seccion_id, marca FROM productos WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]);
     if(!base[0]) return res.json([]);
     const b=base[0];
     // Primero misma categoría/marca en la sección
     let {rows}=await pool.query(`SELECT p.*, s.nombre as seccion_nombre, s.color as seccion_color FROM productos p LEFT JOIN secciones s ON p.seccion_id=s.id
-      WHERE p.visible=true AND p.id!=$1 AND p.seccion_id=$2 AND (p.categoria=$3 OR ($4<>'' AND p.marca=$4))
-      ORDER BY (p.categoria=$3) DESC, RANDOM() LIMIT 8`, [req.params.id, b.seccion_id, b.categoria||'', b.marca||'']);
+      WHERE p.visible=true AND p.tenant_id=$5 AND p.id!=$1 AND p.seccion_id=$2 AND (p.categoria=$3 OR ($4<>'' AND p.marca=$4))
+      ORDER BY (p.categoria=$3) DESC, RANDOM() LIMIT 8`, [req.params.id, b.seccion_id, b.categoria||'', b.marca||'', req.tenantId]);
     // Si no hay suficientes, completar con otros de la misma sección
     if(rows.length < 4){
       const ids=[req.params.id, ...rows.map(r=>r.id)];
       const {rows:extra}=await pool.query(`SELECT p.*, s.nombre as seccion_nombre, s.color as seccion_color FROM productos p LEFT JOIN secciones s ON p.seccion_id=s.id
-        WHERE p.visible=true AND p.seccion_id=$1 AND p.id != ALL($2::int[]) ORDER BY RANDOM() LIMIT $3`, [b.seccion_id, ids, 8-rows.length]);
+        WHERE p.visible=true AND p.tenant_id=$4 AND p.seccion_id=$1 AND p.id != ALL($2::int[]) ORDER BY RANDOM() LIMIT $3`, [b.seccion_id, ids, 8-rows.length, req.tenantId]);
       rows=[...rows, ...extra];
     }
     res.json(rows);
@@ -733,7 +733,7 @@ app.get('/api/productos/relacionados/:id', async (req,res)=>{
 // Recibir la preventa: pasa el cupo al stock físico, descuenta lo reservado, desactiva preventa
 app.post('/api/productos/:id/recibir-preventa', authPerm('productos'), async (req,res)=>{
   try{
-    const {rows}=await pool.query('SELECT stock, preventa_cupo, preventa_reservado FROM productos WHERE id=$1', [req.params.id]);
+    const {rows}=await pool.query('SELECT stock, preventa_cupo, preventa_reservado FROM productos WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]);
     if(!rows[0]) return res.status(404).json({error:'Producto no encontrado'});
     const cupo=Number(rows[0].preventa_cupo)||0;
     // RESERVADO REAL: cuenta las unidades pedidas de este producto en pedidos activos (no cancelados)
@@ -760,8 +760,8 @@ app.get('/api/productos/:id/reservado-real', authPerm('productos'), async (req,r
 app.get('/api/productos/preventa', async (req,res)=>{
   try{
     const {seccion_id}=req.query;
-    let q='SELECT p.*, s.nombre as seccion_nombre, s.color as seccion_color FROM productos p LEFT JOIN secciones s ON p.seccion_id=s.id WHERE p.visible=true AND p.es_preventa=true';
-    const params=[];
+    let q='SELECT p.*, s.nombre as seccion_nombre, s.color as seccion_color FROM productos p LEFT JOIN secciones s ON p.seccion_id=s.id WHERE p.visible=true AND p.es_preventa=true AND p.tenant_id=$1';
+    const params=[req.tenantId];
     if(seccion_id && seccion_id!=='all'){ params.push(seccion_id); q+=` AND p.seccion_id=$${params.length}`; }
     q+=' ORDER BY p.preventa_fecha ASC NULLS LAST, p.created_at DESC LIMIT 30';
     const {rows}=await pool.query(q, params);
@@ -771,8 +771,8 @@ app.get('/api/productos/preventa', async (req,res)=>{
 app.get('/api/productos/novedades', async (req,res)=>{
   try{
     const {seccion_id, limit}=req.query;
-    let q='SELECT p.*, s.nombre as seccion_nombre, s.color as seccion_color FROM productos p LEFT JOIN secciones s ON p.seccion_id=s.id WHERE p.visible=true';
-    const params=[];
+    let q='SELECT p.*, s.nombre as seccion_nombre, s.color as seccion_color FROM productos p LEFT JOIN secciones s ON p.seccion_id=s.id WHERE p.visible=true AND p.tenant_id=$1';
+    const params=[req.tenantId];
     if(seccion_id && seccion_id!=='all'){ params.push(seccion_id); q+=` AND p.seccion_id=$${params.length}`; }
     q+=` ORDER BY p.created_at DESC LIMIT ${Math.min(Number(limit)||12, 30)}`;
     const {rows}=await pool.query(q, params);
@@ -809,11 +809,11 @@ app.get('/api/categorias', async (req,res)=>{ try{ const {seccion_id}=req.query;
 app.get('/api/categorias/admin', authPerm('productos'), async (req,res)=>{
   try{
     const {seccion_id}=req.query;
-    let q='SELECT categoria, COUNT(*)::int as cantidad FROM productos'; const params=[];
-    if(seccion_id && seccion_id!=='all'){ q+=' WHERE seccion_id=$1'; params.push(seccion_id); }
+    let q='SELECT categoria, COUNT(*)::int as cantidad FROM productos WHERE tenant_id=$1'; const params=[req.tenantId];
+    if(seccion_id && seccion_id!=='all'){ q+=' AND seccion_id=$2'; params.push(seccion_id); }
     q+=' GROUP BY categoria ORDER BY categoria';
     const {rows:cats}=await pool.query(q, params);
-    const {rows:meta}=await pool.query('SELECT * FROM categorias_meta').catch(()=>({rows:[]}));
+    const {rows:meta}=await pool.query('SELECT * FROM categorias_meta WHERE tenant_id=$1', [req.tenantId]).catch(()=>({rows:[]}));
     const metaMap={}; meta.forEach(m=>metaMap[m.categoria]=m);
     const catSet=new Set(cats.map(c=>c.categoria).filter(Boolean));
     const result=cats.filter(c=>c.categoria).map(c=>({ nombre:c.categoria, cantidad:c.cantidad, orden:(metaMap[c.categoria]?.orden??999), visible:(metaMap[c.categoria]?.visible!==false) }));
@@ -871,18 +871,18 @@ app.post('/api/categorias/meta', authPerm('productos'), async (req,res)=>{
 app.post('/api/productos', authPerm('productos'), async (req,res)=>{
   try{
     const p=req.body;
-    const {rows}=await pool.query(`INSERT INTO productos (seccion_id,categoria,modelo,nombre,precio_base,precio_original,stock,stock_minimo,imagen,notas,compatibilidad,descripcion,sku,tipo,moneda,precio_oferta,envio_gratis,visible,peso,alto,ancho,largo,permitir_sin_stock,es_digital,marca,es_preventa,preventa_precio,preventa_fecha,preventa_mostrar_fecha,preventa_descuento_pct,preventa_cupo) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31) RETURNING *`,
-      [p.seccion_id, p.categoria||'', p.modelo||'', p.nombre||'', p.precio_base||0, p.precio_original||0, p.stock||0, p.stock_minimo||0, p.imagen||'', p.notas||'', p.compatibilidad||'', p.descripcion||'', p.sku||'', p.tipo||'fisico', p.moneda||'ARS', p.precio_oferta||0, p.envio_gratis||false, p.visible!==false, p.peso||0, p.alto||0, p.ancho||0, p.largo||0, p.permitir_sin_stock||false, p.es_digital||false, p.marca||'', p.es_preventa||false, p.preventa_precio||0, p.preventa_fecha||null, p.preventa_mostrar_fecha||false, p.preventa_descuento_pct||0, p.preventa_cupo||0]);
+    const {rows}=await pool.query(`INSERT INTO productos (tenant_id,seccion_id,categoria,modelo,nombre,precio_base,precio_original,stock,stock_minimo,imagen,notas,compatibilidad,descripcion,sku,tipo,moneda,precio_oferta,envio_gratis,visible,peso,alto,ancho,largo,permitir_sin_stock,es_digital,marca,es_preventa,preventa_precio,preventa_fecha,preventa_mostrar_fecha,preventa_descuento_pct,preventa_cupo) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32) RETURNING *`,
+      [req.tenantId, p.seccion_id, p.categoria||'', p.modelo||'', p.nombre||'', p.precio_base||0, p.precio_original||0, p.stock||0, p.stock_minimo||0, p.imagen||'', p.notas||'', p.compatibilidad||'', p.descripcion||'', p.sku||'', p.tipo||'fisico', p.moneda||'ARS', p.precio_oferta||0, p.envio_gratis||false, p.visible!==false, p.peso||0, p.alto||0, p.ancho||0, p.largo||0, p.permitir_sin_stock||false, p.es_digital||false, p.marca||'', p.es_preventa||false, p.preventa_precio||0, p.preventa_fecha||null, p.preventa_mostrar_fecha||false, p.preventa_descuento_pct||0, p.preventa_cupo||0]);
     res.json(rows[0]);
   }catch(e){ res.status(500).json({error:e.message}); }
 });
 app.post('/api/productos/:id/duplicar', authPerm('productos'), async (req,res)=>{
   try{
-    const {rows:orig}=await pool.query('SELECT * FROM productos WHERE id=$1', [req.params.id]);
+    const {rows:orig}=await pool.query('SELECT * FROM productos WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]);
     if(!orig[0]) return res.status(404).json({error:'No encontrado'});
     const p=orig[0];
-    const {rows}=await pool.query(`INSERT INTO productos (seccion_id,categoria,modelo,nombre,precio_base,precio_original,stock,stock_minimo,imagen,notas,compatibilidad,descripcion,sku,tipo,moneda,precio_oferta,envio_gratis,visible,peso,alto,ancho,largo,permitir_sin_stock,es_digital) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24) RETURNING *`,
-      [p.seccion_id, p.categoria, p.modelo, (p.nombre||p.modelo||'')+' (copia)', p.precio_base, p.precio_original, 0, p.stock_minimo, p.imagen, p.notas, p.compatibilidad, p.descripcion, p.sku?p.sku+'-copia':'', p.tipo, p.moneda, p.precio_oferta, p.envio_gratis, false, p.peso, p.alto, p.ancho, p.largo, p.permitir_sin_stock, p.es_digital]);
+    const {rows}=await pool.query(`INSERT INTO productos (tenant_id,seccion_id,categoria,modelo,nombre,precio_base,precio_original,stock,stock_minimo,imagen,notas,compatibilidad,descripcion,sku,tipo,moneda,precio_oferta,envio_gratis,visible,peso,alto,ancho,largo,permitir_sin_stock,es_digital) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25) RETURNING *`,
+      [req.tenantId, p.seccion_id, p.categoria, p.modelo, (p.nombre||p.modelo||'')+' (copia)', p.precio_base, p.precio_original, 0, p.stock_minimo, p.imagen, p.notas, p.compatibilidad, p.descripcion, p.sku?p.sku+'-copia':'', p.tipo, p.moneda, p.precio_oferta, p.envio_gratis, false, p.peso, p.alto, p.ancho, p.largo, p.permitir_sin_stock, p.es_digital]);
     res.json(rows[0]);
   }catch(e){ res.status(500).json({error:e.message}); }
 });
@@ -895,17 +895,17 @@ app.put('/api/productos/:id', authPerm('productos'), async (req,res)=>{
     if(!sets.length) return res.json({ok:true});
     // historial precios si cambia precio_base
     if(p.precio_base!==undefined){
-      const {rows:old}=await pool.query('SELECT precio_base FROM productos WHERE id=$1', [req.params.id]);
+      const {rows:old}=await pool.query('SELECT precio_base FROM productos WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]);
       if(old[0] && old[0].precio_base!=p.precio_base){
-        await pool.query('INSERT INTO historial_precios (producto_id,precio_anterior,precio_nuevo,usuario) VALUES ($1,$2,$3,$4)', [req.params.id, old[0].precio_base, p.precio_base, req.user.usuario||'']).catch(()=>{});
+        await pool.query('INSERT INTO historial_precios (tenant_id,producto_id,precio_anterior,precio_nuevo,usuario) VALUES ($1,$2,$3,$4,$5)', [req.tenantId, req.params.id, old[0].precio_base, p.precio_base, req.user.usuario||'']).catch(()=>{});
       }
     }
-    params.push(req.params.id);
-    await pool.query(`UPDATE productos SET ${sets.join(',')} WHERE id=$${pi}`, params);
+    params.push(req.params.id); params.push(req.tenantId);
+    await pool.query(`UPDATE productos SET ${sets.join(',')} WHERE id=$${pi} AND tenant_id=$${pi+1}`, params);
     res.json({ok:true});
   }catch(e){ res.status(500).json({error:e.message}); }
 });
-app.delete('/api/productos/:id', authPerm('productos'), async (req,res)=>{ try{ await pool.query('DELETE FROM productos WHERE id=$1', [req.params.id]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.delete('/api/productos/:id', authPerm('productos'), async (req,res)=>{ try{ await pool.query('DELETE FROM productos WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 app.post('/api/productos/bulk', authPerm('productos'), async (req,res)=>{
   try{
     const {productos, reemplazar, modo, faltantes, seccion_id} = req.body;
@@ -916,12 +916,12 @@ app.post('/api/productos/bulk', authPerm('productos'), async (req,res)=>{
         if(!p.categoria || p.categoria==='Sin categoría') continue;
         let r;
         if(p.sku && p.sku.trim()){
-          r=await pool.query('UPDATE productos SET categoria=$1 WHERE sku=$2', [p.categoria, p.sku.trim()]);
+          r=await pool.query('UPDATE productos SET categoria=$1 WHERE sku=$2 AND tenant_id=$3', [p.categoria, p.sku.trim(), req.tenantId]);
         }
         if((!r || r.rowCount===0) && (p.nombre||p.modelo)){
-          r=await pool.query('UPDATE productos SET categoria=$1 WHERE LOWER(TRIM(nombre))=LOWER(TRIM($2)) OR LOWER(TRIM(modelo))=LOWER(TRIM($2))', [p.categoria, (p.nombre||p.modelo).trim()]);
+          r=await pool.query('UPDATE productos SET categoria=$1 WHERE tenant_id=$3 AND (LOWER(TRIM(nombre))=LOWER(TRIM($2)) OR LOWER(TRIM(modelo))=LOWER(TRIM($2)))', [p.categoria, (p.nombre||p.modelo).trim(), req.tenantId]);
         }
-        if(r && r.rowCount>0){ actualizados+=r.rowCount; await pool.query('INSERT INTO categorias_meta (categoria, orden, visible) VALUES ($1,0,true) ON CONFLICT DO NOTHING', [p.categoria]).catch(()=>{}); }
+        if(r && r.rowCount>0){ actualizados+=r.rowCount; await pool.query('INSERT INTO categorias_meta (tenant_id, categoria, orden, visible) VALUES ($2,$1,0,true) ON CONFLICT DO NOTHING', [p.categoria, req.tenantId]).catch(()=>{}); }
         else noEncontrados++;
       }
       return res.json({ok:true, modo:'solo_categorias', actualizados, noEncontrados, saltados:noEncontrados});
@@ -931,13 +931,13 @@ app.post('/api/productos/bulk', authPerm('productos'), async (req,res)=>{
       let insertados=0, actualizados=0;
       for(const p of (productos||[])){
         let existe=null;
-        if(p.sku && p.sku.trim()){ const {rows}=await pool.query('SELECT id FROM productos WHERE sku=$1 LIMIT 1', [p.sku.trim()]); existe=rows[0]; }
-        if(!existe && (p.nombre||p.modelo)){ const {rows}=await pool.query('SELECT id FROM productos WHERE LOWER(TRIM(nombre))=LOWER(TRIM($1)) LIMIT 1', [(p.nombre||p.modelo).trim()]); existe=rows[0]; }
+        if(p.sku && p.sku.trim()){ const {rows}=await pool.query('SELECT id FROM productos WHERE sku=$1 AND tenant_id=$2 LIMIT 1', [p.sku.trim(), req.tenantId]); existe=rows[0]; }
+        if(!existe && (p.nombre||p.modelo)){ const {rows}=await pool.query('SELECT id FROM productos WHERE LOWER(TRIM(nombre))=LOWER(TRIM($1)) AND tenant_id=$2 LIMIT 1', [(p.nombre||p.modelo).trim(), req.tenantId]); existe=rows[0]; }
         if(existe){
-          await pool.query('UPDATE productos SET categoria=$1, precio_base=$2, stock=$3, precio_oferta=$4 WHERE id=$5', [p.categoria||'', p.precio_base||0, p.stock||0, p.precio_oferta||0, existe.id]);
+          await pool.query('UPDATE productos SET categoria=$1, precio_base=$2, stock=$3, precio_oferta=$4 WHERE id=$5 AND tenant_id=$6', [p.categoria||'', p.precio_base||0, p.stock||0, p.precio_oferta||0, existe.id, req.tenantId]);
           actualizados++;
         } else {
-          await pool.query(`INSERT INTO productos (seccion_id,categoria,modelo,nombre,precio_base,stock,imagen,sku,descripcion,peso,alto,ancho,largo,visible) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,true)`, [p.seccion_id||seccion_id||1, p.categoria||'', p.modelo||'', p.nombre||p.modelo||'', p.precio_base||0, p.stock||0, p.imagen||'', p.sku||'', p.descripcion||'', p.peso||0, p.alto||0, p.ancho||0, p.largo||0]);
+          await pool.query(`INSERT INTO productos (tenant_id,seccion_id,categoria,modelo,nombre,precio_base,stock,imagen,sku,descripcion,peso,alto,ancho,largo,visible) VALUES ($14,$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,true)`, [p.seccion_id||seccion_id||1, p.categoria||'', p.modelo||'', p.nombre||p.modelo||'', p.precio_base||0, p.stock||0, p.imagen||'', p.sku||'', p.descripcion||'', p.peso||0, p.alto||0, p.ancho||0, p.largo||0, req.tenantId]);
           insertados++;
         }
       }
@@ -948,32 +948,32 @@ app.post('/api/productos/bulk', authPerm('productos'), async (req,res)=>{
       let insertados=0, saltados=0;
       for(const p of (productos||[])){
         let existe=null;
-        if(p.sku && p.sku.trim()){ const {rows}=await pool.query('SELECT id FROM productos WHERE sku=$1 LIMIT 1', [p.sku.trim()]); existe=rows[0]; }
-        if(!existe && (p.nombre||p.modelo)){ const {rows}=await pool.query('SELECT id FROM productos WHERE LOWER(TRIM(nombre))=LOWER(TRIM($1)) LIMIT 1', [(p.nombre||p.modelo).trim()]); existe=rows[0]; }
+        if(p.sku && p.sku.trim()){ const {rows}=await pool.query('SELECT id FROM productos WHERE sku=$1 AND tenant_id=$2 LIMIT 1', [p.sku.trim(), req.tenantId]); existe=rows[0]; }
+        if(!existe && (p.nombre||p.modelo)){ const {rows}=await pool.query('SELECT id FROM productos WHERE LOWER(TRIM(nombre))=LOWER(TRIM($1)) AND tenant_id=$2 LIMIT 1', [(p.nombre||p.modelo).trim(), req.tenantId]); existe=rows[0]; }
         if(existe){ saltados++; continue; }
-        await pool.query(`INSERT INTO productos (seccion_id,categoria,modelo,nombre,precio_base,stock,imagen,sku,descripcion,peso,alto,ancho,largo,visible) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,true)`, [p.seccion_id||seccion_id||1, p.categoria||'', p.modelo||'', p.nombre||p.modelo||'', p.precio_base||0, p.stock||0, p.imagen||'', p.sku||'', p.descripcion||'', p.peso||0, p.alto||0, p.ancho||0, p.largo||0]);
+        await pool.query(`INSERT INTO productos (tenant_id,seccion_id,categoria,modelo,nombre,precio_base,stock,imagen,sku,descripcion,peso,alto,ancho,largo,visible) VALUES ($14,$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,true)`, [p.seccion_id||seccion_id||1, p.categoria||'', p.modelo||'', p.nombre||p.modelo||'', p.precio_base||0, p.stock||0, p.imagen||'', p.sku||'', p.descripcion||'', p.peso||0, p.alto||0, p.ancho||0, p.largo||0, req.tenantId]);
         insertados++;
       }
       return res.json({ok:true, modo:'solo_nuevos', insertados, saltados});
     }
     // MODO por defecto / "reemplazar": insertar (con reemplazar opcional)
-    if(reemplazar || modo==='reemplazar'){ await pool.query('DELETE FROM producto_imagenes'); await pool.query('DELETE FROM pedido_items'); await pool.query('DELETE FROM productos WHERE seccion_id=$1', [seccion_id||1]); }
+    if(reemplazar || modo==='reemplazar'){ await pool.query('DELETE FROM producto_imagenes WHERE tenant_id=$1', [req.tenantId]); await pool.query('DELETE FROM pedido_items WHERE tenant_id=$1', [req.tenantId]); await pool.query('DELETE FROM productos WHERE seccion_id=$1 AND tenant_id=$2', [seccion_id||1, req.tenantId]); }
     for(const p of (productos||[])){
-      await pool.query(`INSERT INTO productos (seccion_id,categoria,modelo,nombre,precio_base,stock,imagen,sku,descripcion,compatibilidad,peso,alto,ancho,largo,visible,permitir_sin_stock,es_digital) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) ON CONFLICT DO NOTHING`, [p.seccion_id||seccion_id||1, p.categoria||'', p.modelo||'', p.nombre||p.modelo||'', p.precio_base||0, p.stock||0, p.imagen||'', p.sku||'', p.descripcion||'', p.compatibilidad||'', p.peso||0, p.alto||0, p.ancho||0, p.largo||0, true, p.permitir_sin_stock||false, p.es_digital||false]);
+      await pool.query(`INSERT INTO productos (tenant_id,seccion_id,categoria,modelo,nombre,precio_base,stock,imagen,sku,descripcion,compatibilidad,peso,alto,ancho,largo,visible,permitir_sin_stock,es_digital) VALUES ($18,$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) ON CONFLICT DO NOTHING`, [p.seccion_id||seccion_id||1, p.categoria||'', p.modelo||'', p.nombre||p.modelo||'', p.precio_base||0, p.stock||0, p.imagen||'', p.sku||'', p.descripcion||'', p.compatibilidad||'', p.peso||0, p.alto||0, p.ancho||0, p.largo||0, true, p.permitir_sin_stock||false, p.es_digital||false, req.tenantId]);
     }
     res.json({ok:true, count: productos.length, insertados: productos.length});
   }catch(e){ res.status(500).json({error:e.message}); }
 });
-app.delete('/api/categorias/:categoria', authPerm('productos'), async (req,res)=>{ try{ const {mover_a}=req.query; const destino = mover_a || 'Sin categoría'; const r=await pool.query('UPDATE productos SET categoria=$1 WHERE categoria=$2', [destino, req.params.categoria]); await pool.query('DELETE FROM categorias_meta WHERE categoria=$1', [req.params.categoria]).catch(()=>{}); res.json({ok:true, movidos:r.rowCount, destino}); }catch(e){ res.status(500).json({error:e.message}); } });
-app.delete('/api/productos/all', authPerm('productos'), async (req,res)=>{ try{ await pool.query('DELETE FROM productos'); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
-app.get('/api/productos/buscar', async (req,res)=>{ try{ const {q}=req.query; if(!q) return res.json([]); const {rows}=await pool.query("SELECT p.id,p.nombre,p.modelo,p.categoria,p.precio_base,p.stock,p.imagen,p.sku,p.codigo_barras,p.seccion_id,p.permitir_sin_stock,p.es_digital,s.nombre as seccion_nombre,s.color as seccion_color FROM productos p LEFT JOIN secciones s ON p.seccion_id=s.id WHERE p.nombre ILIKE $1 OR p.modelo ILIKE $1 OR p.categoria ILIKE $1 OR p.sku ILIKE $1 ORDER BY p.nombre LIMIT 20", [`%${q}%`]); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
+app.delete('/api/categorias/:categoria', authPerm('productos'), async (req,res)=>{ try{ const {mover_a}=req.query; const destino = mover_a || 'Sin categoría'; const r=await pool.query('UPDATE productos SET categoria=$1 WHERE categoria=$2 AND tenant_id=$3', [destino, req.params.categoria, req.tenantId]); await pool.query('DELETE FROM categorias_meta WHERE categoria=$1 AND tenant_id=$2', [req.params.categoria, req.tenantId]).catch(()=>{}); res.json({ok:true, movidos:r.rowCount, destino}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.delete('/api/productos/all', authPerm('productos'), async (req,res)=>{ try{ await pool.query('DELETE FROM productos WHERE tenant_id=$1', [req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.get('/api/productos/buscar', async (req,res)=>{ try{ const {q}=req.query; if(!q) return res.json([]); const {rows}=await pool.query("SELECT p.id,p.nombre,p.modelo,p.categoria,p.precio_base,p.stock,p.imagen,p.sku,p.codigo_barras,p.seccion_id,p.permitir_sin_stock,p.es_digital,s.nombre as seccion_nombre,s.color as seccion_color FROM productos p LEFT JOIN secciones s ON p.seccion_id=s.id WHERE p.tenant_id=$2 AND (p.nombre ILIKE $1 OR p.modelo ILIKE $1 OR p.categoria ILIKE $1 OR p.sku ILIKE $1) ORDER BY p.nombre LIMIT 20", [`%${q}%`, req.tenantId]); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
 // Buscar producto por código de barras/SKU exacto (para el escáner). Devuelve 1 producto.
 app.get('/api/productos/por-codigo/:codigo', async (req,res)=>{
   try{
     const c=(req.params.codigo||'').trim();
     if(!c) return res.status(404).json({error:'Código vacío'});
     const {rows}=await pool.query(`SELECT p.*, s.nombre as seccion_nombre FROM productos p LEFT JOIN secciones s ON p.seccion_id=s.id
-      WHERE p.codigo_barras=$1 OR p.sku=$1 OR CAST(p.id AS TEXT)=$1 LIMIT 1`, [c]);
+      WHERE p.tenant_id=$2 AND (p.codigo_barras=$1 OR p.sku=$1 OR CAST(p.id AS TEXT)=$1) LIMIT 1`, [c, req.tenantId]);
     if(!rows[0]) return res.status(404).json({error:'No se encontró ningún producto con ese código'});
     res.json(rows[0]);
   }catch(e){ res.status(500).json({error:e.message}); }
@@ -982,20 +982,20 @@ app.get('/api/productos/por-codigo/:codigo', async (req,res)=>{
 app.post('/api/productos/generar-codigos', authPerm('productos'), async (req,res)=>{
   try{
     const {seccion_id}=req.body;
-    const cond = seccion_id && seccion_id!=='all' ? 'AND seccion_id=$1' : '';
-    const params = seccion_id && seccion_id!=='all' ? [seccion_id] : [];
+    const cond = seccion_id && seccion_id!=='all' ? 'AND seccion_id=$2' : '';
+    const params = seccion_id && seccion_id!=='all' ? [req.tenantId, seccion_id] : [req.tenantId];
     // Genera código tipo "P" + id con padding (ej P000123) para los que están vacíos
-    const {rows}=await pool.query(`SELECT id FROM productos WHERE (codigo_barras IS NULL OR codigo_barras='') ${cond}`, params);
+    const {rows}=await pool.query(`SELECT id FROM productos WHERE tenant_id=$1 AND (codigo_barras IS NULL OR codigo_barras='') ${cond}`, params);
     let generados=0;
     for(const r of rows){
       const codigo='P'+String(r.id).padStart(6,'0');
-      await pool.query('UPDATE productos SET codigo_barras=$1 WHERE id=$2', [codigo, r.id]);
+      await pool.query('UPDATE productos SET codigo_barras=$1 WHERE id=$2 AND tenant_id=$3', [codigo, r.id, req.tenantId]);
       generados++;
     }
     res.json({ok:true, generados});
   }catch(e){ res.status(500).json({error:e.message}); }
 });
-app.get('/api/productos/id/:id', async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM productos WHERE id=$1', [req.params.id]); if(!rows[0]) return res.status(404).json({error:'No encontrado'}); res.json(rows[0]); }catch(e){ res.status(500).json({error:e.message}); } });
+app.get('/api/productos/id/:id', async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM productos WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); if(!rows[0]) return res.status(404).json({error:'No encontrado'}); res.json(rows[0]); }catch(e){ res.status(500).json({error:e.message}); } });
 
 // Validar presupuesto antes de convertir: chequear stock y precios actuales
 app.post('/api/pedidos/:id/validar-conversion', authPerm('pedidos'), async (req,res)=>{
