@@ -403,9 +403,14 @@ async function migrate(){
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_${t}_tenant ON ${t}(tenant_id)`).catch(()=>{});
   }
   console.log('✅ Multi-tenant base OK (tenant_id en todas las tablas)');
+  // Key-value tables: la clave ya no es única global, sino por tenant. Cambiar constraint a (tenant_id, clave).
+  await pool.query(`ALTER TABLE configuracion DROP CONSTRAINT IF EXISTS configuracion_pkey`).catch(()=>{});
+  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS uq_configuracion_tenant_clave ON configuracion(tenant_id, clave)`).catch(e=>console.log('uq config warn', e.message.slice(0,80)));
+  await pool.query(`ALTER TABLE design_config DROP CONSTRAINT IF EXISTS design_config_clave_key`).catch(()=>{});
+  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS uq_design_config_tenant_clave ON design_config(tenant_id, clave)`).catch(e=>console.log('uq design warn', e.message.slice(0,80)));
   // Design defaults
   const defs = {nombre_tienda:'Mi Tienda',logo_url:'',favicon_url:'',color_primario:'#4A69E2',color_secundario:'#232321',color_acento:'#FFA52F',fuente:'Archivo',footer_texto:'',css_custom:'',hero_titulo:'',hero_subtitulo:'',promo_banner:'',whatsapp_numero:'',whatsapp_mensaje:'Hola, quiero consultar sobre un producto',confianza_1_icono:'truck',confianza_1_titulo:'Envío a todo el país',confianza_1_sub:'Andreani y más',confianza_2_icono:'shield',confianza_2_titulo:'Compra segura',confianza_2_sub:'Garantía incluida',confianza_3_icono:'message-circle',confianza_3_titulo:'Atención directa',confianza_3_sub:'WhatsApp'};
-  for(const [k,v] of Object.entries(defs)){ await pool.query("INSERT INTO design_config (clave,valor) VALUES ($1,$2) ON CONFLICT (clave) DO NOTHING", [k,v]).catch(()=>{}); }
+  for(const [k,v] of Object.entries(defs)){ await pool.query("INSERT INTO design_config (tenant_id,clave,valor) VALUES (1,$1,$2) ON CONFLICT (tenant_id,clave) DO NOTHING", [k,v]).catch(()=>{}); }
   // FIX #5: seed admin si no existe ninguno
   try{
     const {rows:admins}=await pool.query("SELECT id FROM usuarios WHERE rol='admin' LIMIT 1");
@@ -444,10 +449,10 @@ app.get('/api/dolar-blue', async (req,res)=>{
 
 // Maintenance
 app.get('/api/maintenance-status', async (req,res)=>{
-  try{ const {rows}=await pool.query("SELECT clave,valor FROM configuracion WHERE clave IN ('mantenimiento_activo','mantenimiento_mensaje','mantenimiento_countdown')"); const cfg={}; rows.forEach(r=>cfg[r.clave]=r.valor); res.json({activo:cfg.mantenimiento_activo==='true', mensaje:cfg.mantenimiento_mensaje||'', countdown:cfg.mantenimiento_countdown||''}); }catch{ res.json({activo:false}); }
+  try{ const {rows}=await pool.query("SELECT clave,valor FROM configuracion WHERE tenant_id=$1 AND clave IN ('mantenimiento_activo','mantenimiento_mensaje','mantenimiento_countdown')", [req.tenantId]); const cfg={}; rows.forEach(r=>cfg[r.clave]=r.valor); res.json({activo:cfg.mantenimiento_activo==='true', mensaje:cfg.mantenimiento_mensaje||'', countdown:cfg.mantenimiento_countdown||''}); }catch{ res.json({activo:false}); }
 });
 app.post('/api/maintenance-mode', authPerm('config'), async (req,res)=>{
-  try{ const {activo,mensaje,countdown}=req.body; await pool.query("INSERT INTO configuracion (clave,valor) VALUES ('mantenimiento_activo',$1) ON CONFLICT (clave) DO UPDATE SET valor=$1", [activo?'true':'false']); await pool.query("INSERT INTO configuracion (clave,valor) VALUES ('mantenimiento_mensaje',$1) ON CONFLICT (clave) DO UPDATE SET valor=$1", [mensaje||'']); await pool.query("INSERT INTO configuracion (clave,valor) VALUES ('mantenimiento_countdown',$1) ON CONFLICT (clave) DO UPDATE SET valor=$1", [countdown||'']); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); }
+  try{ const {activo,mensaje,countdown}=req.body; await pool.query("INSERT INTO configuracion (tenant_id,clave,valor) VALUES ($2,'mantenimiento_activo',$1) ON CONFLICT (tenant_id,clave) DO UPDATE SET valor=$1", [activo?'true':'false', req.tenantId]); await pool.query("INSERT INTO configuracion (tenant_id,clave,valor) VALUES ($2,'mantenimiento_mensaje',$1) ON CONFLICT (tenant_id,clave) DO UPDATE SET valor=$1", [mensaje||'', req.tenantId]); await pool.query("INSERT INTO configuracion (tenant_id,clave,valor) VALUES ($2,'mantenimiento_countdown',$1) ON CONFLICT (tenant_id,clave) DO UPDATE SET valor=$1", [countdown||'', req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); }
 });
 
 // === AUTH ===
@@ -458,15 +463,16 @@ if(process.env.RESEND_API_KEY){ const {Resend}=require('resend'); resend=new Res
 async function notificarVentaAdmin(pedidos, comprador){
   try{
     if(!resend || !pedidos || !pedidos.length){ console.log('[venta-mail] sin resend o sin pedidos'); return; }
-    // Email destino: config 'email_ventas' o RESEND_TO o el del primer admin
-    const {rows:cfg}=await pool.query("SELECT valor FROM configuracion WHERE clave='email_ventas'").catch(()=>({rows:[]}));
+    const tid = pedidos[0].tenant_id || 1;
+    // Email destino: config 'email_ventas' del tenant → RESEND_TO → primer admin del tenant
+    const {rows:cfg}=await pool.query("SELECT valor FROM configuracion WHERE clave='email_ventas' AND tenant_id=$1", [tid]).catch(()=>({rows:[]}));
     let destino = (cfg[0] && cfg[0].valor) || process.env.RESEND_TO || '';
     if(!destino){
-      const {rows:adm}=await pool.query("SELECT email FROM usuarios WHERE rol='admin' AND email<>'' ORDER BY id LIMIT 1").catch(()=>({rows:[]}));
+      const {rows:adm}=await pool.query("SELECT email FROM usuarios WHERE rol='admin' AND email<>'' AND tenant_id=$1 ORDER BY id LIMIT 1", [tid]).catch(()=>({rows:[]}));
       destino = adm[0] && adm[0].email;
     }
     if(!destino){ console.log('[venta-mail] no hay email destino (configurá email_ventas en General)'); return; }
-    const {rows:dc}=await pool.query("SELECT valor FROM design_config WHERE clave='nombre_tienda'").catch(()=>({rows:[]}));
+    const {rows:dc}=await pool.query("SELECT valor FROM design_config WHERE clave='nombre_tienda' AND tenant_id=$1", [tid]).catch(()=>({rows:[]}));
     const tienda = (dc[0] && dc[0].valor) || 'Tu tienda';
     const baseUrl = process.env.PUBLIC_URL || process.env.FRONTEND_URL || '';
     const total = pedidos.reduce((s,p)=>s+Number(p.total||0),0);
@@ -601,7 +607,7 @@ app.put('/api/me', auth(), async (req,res)=>{
 
 // CONFIG
 app.get('/api/config', async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM configuracion WHERE tenant_id=$1', [req.tenantId]); const cfg={}; rows.forEach(r=>cfg[r.clave]=r.valor); res.json(cfg); }catch(e){ res.status(500).json({error:e.message}); } });
-app.put('/api/config', authPerm('config'), async (req,res)=>{ try{ for(const [k,v] of Object.entries(req.body)){ await pool.query("INSERT INTO configuracion (clave,valor) VALUES ($1,$2) ON CONFLICT (clave) DO UPDATE SET valor=$2", [k,v]); } res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.put('/api/config', authPerm('config'), async (req,res)=>{ try{ for(const [k,v] of Object.entries(req.body)){ await pool.query("INSERT INTO configuracion (tenant_id,clave,valor) VALUES ($1,$2,$3) ON CONFLICT (tenant_id,clave) DO UPDATE SET valor=$3", [req.tenantId,k,v]); } res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 
 // LISTAS
 app.get('/api/listas', async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM listas_precio ORDER BY multiplicador'); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
@@ -1568,7 +1574,7 @@ app.put('/api/menu/:id', authPerm('config'), async (req,res)=>{ try{ const m=req
 app.delete('/api/menu/:id', authPerm('config'), async (req,res)=>{ try{ await pool.query('DELETE FROM menu_items WHERE id=$1', [req.params.id]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 
 app.get('/api/design', async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM design_config WHERE tenant_id=$1', [req.tenantId]); const cfg={}; rows.forEach(r=>cfg[r.clave]=r.valor); res.json(cfg); }catch(e){ res.status(500).json({error:e.message}); } });
-app.put('/api/design', authPerm('config'), async (req,res)=>{ try{ for(const [k,v] of Object.entries(req.body)){ await pool.query("INSERT INTO design_config (clave,valor) VALUES ($1,$2) ON CONFLICT (clave) DO UPDATE SET valor=$2", [k,v]); } res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.put('/api/design', authPerm('config'), async (req,res)=>{ try{ for(const [k,v] of Object.entries(req.body)){ await pool.query("INSERT INTO design_config (tenant_id,clave,valor) VALUES ($1,$2,$3) ON CONFLICT (tenant_id,clave) DO UPDATE SET valor=$3", [req.tenantId,k,v]); } res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 
 app.get('/api/metodos-pago', async (req,res)=>{ try{ const {seccion_id}=req.query; let q='SELECT * FROM metodos_pago WHERE activo=true'; const params=[]; if(seccion_id){ q+=' AND (seccion_id=$1 OR seccion_id IS NULL)'; params.push(seccion_id); } q+=' ORDER BY orden'; const {rows}=await pool.query(q, params); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
 app.get('/api/metodos-pago/all', authPerm('config'), async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM metodos_pago ORDER BY orden'); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
