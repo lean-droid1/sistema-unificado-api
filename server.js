@@ -344,6 +344,32 @@ async function migrate(){
     `CREATE INDEX IF NOT EXISTS idx_precios_fijos_prod ON precios_fijos(producto_id)`,
   ];
   for(const ix of indices) await pool.query(ix).catch(()=>{});
+  // ═══ MULTI-TENANT: base additiva (etapa 1) ═══
+  // Tabla de inquilinos (cada cliente que alquila = 1 tenant). tenant 1 = tienda actual (Leandro)
+  await pool.query(`CREATE TABLE IF NOT EXISTS tenants (
+    id SERIAL PRIMARY KEY,
+    nombre VARCHAR(200) DEFAULT 'Mi Tienda',
+    slug VARCHAR(100) UNIQUE,
+    dominio_propio VARCHAR(200) DEFAULT '',
+    plan VARCHAR(20) DEFAULT 'full',
+    estado VARCHAR(20) DEFAULT 'activo',
+    fecha_fin_trial TIMESTAMP,
+    descuento_hasta TIMESTAMP,
+    notas TEXT DEFAULT '',
+    created_at TIMESTAMP DEFAULT NOW()
+  )`).catch(e=>console.log('tenants warn', e.message.slice(0,80)));
+  // Asegurar tenant 1 (la tienda actual) — dueño, plan full, activo para siempre
+  await pool.query(`INSERT INTO tenants (id, nombre, slug, plan, estado) VALUES (1, 'Tienda principal', 'principal', 'full', 'activo') ON CONFLICT (id) DO NOTHING`).catch(()=>{});
+  // Que el próximo tenant creado sea id 2+ (no pisar el 1)
+  await pool.query(`SELECT setval(pg_get_serial_sequence('tenants','id'), GREATEST((SELECT MAX(id) FROM tenants), 1))`).catch(()=>{});
+  // Agregar tenant_id DEFAULT 1 a todas las tablas con datos por tienda.
+  // DEFAULT 1 = todo lo existente y todo lo nuevo (que no especifique) pertenece a la tienda actual. Nada se rompe.
+  const tenantTables = ['productos','pedidos','pedido_items','pedido_pagos','usuarios','secciones','categorias_meta','configuracion','design_config','cupones','cupon_productos','promociones','listas_precio','precios_fijos','ordenes_compra','orden_compra_items','cuenta_corriente','leads','carritos_abandonados','badges','barras_texto','menu_items','metodos_pago','metodos_envio_custom','config_envio','notificaciones_stock','paginas_info','popups','redes_sociales','slider_banners','contactos','favoritos','historial_precios','producto_imagenes','variantes'];
+  for(const t of tenantTables){
+    await pool.query(`ALTER TABLE ${t} ADD COLUMN IF NOT EXISTS tenant_id INT DEFAULT 1`).catch(()=>{});
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_${t}_tenant ON ${t}(tenant_id)`).catch(()=>{});
+  }
+  console.log('✅ Multi-tenant base OK (tenant_id en todas las tablas)');
   // Design defaults
   const defs = {nombre_tienda:'Mi Tienda',logo_url:'',favicon_url:'',color_primario:'#4A69E2',color_secundario:'#232321',color_acento:'#FFA52F',fuente:'Archivo',footer_texto:'',css_custom:'',hero_titulo:'',hero_subtitulo:'',promo_banner:'',whatsapp_numero:'',whatsapp_mensaje:'Hola, quiero consultar sobre un producto',confianza_1_icono:'truck',confianza_1_titulo:'Envío a todo el país',confianza_1_sub:'Andreani y más',confianza_2_icono:'shield',confianza_2_titulo:'Compra segura',confianza_2_sub:'Garantía incluida',confianza_3_icono:'message-circle',confianza_3_titulo:'Atención directa',confianza_3_sub:'WhatsApp'};
   for(const [k,v] of Object.entries(defs)){ await pool.query("INSERT INTO design_config (clave,valor) VALUES ($1,$2) ON CONFLICT (clave) DO NOTHING", [k,v]).catch(()=>{}); }
