@@ -408,16 +408,19 @@ async function migrate(){
   await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS uq_configuracion_tenant_clave ON configuracion(tenant_id, clave)`).catch(e=>console.log('uq config warn', e.message.slice(0,80)));
   await pool.query(`ALTER TABLE design_config DROP CONSTRAINT IF EXISTS design_config_clave_key`).catch(()=>{});
   await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS uq_design_config_tenant_clave ON design_config(tenant_id, clave)`).catch(e=>console.log('uq design warn', e.message.slice(0,80)));
+  // usuario único por tenant (dos tiendas pueden tener el mismo nombre de usuario)
+  await pool.query(`ALTER TABLE usuarios DROP CONSTRAINT IF EXISTS usuarios_usuario_key`).catch(()=>{});
+  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS uq_usuarios_tenant_usuario ON usuarios(tenant_id, usuario)`).catch(e=>console.log('uq usuarios warn', e.message.slice(0,80)));
   // Design defaults
   const defs = {nombre_tienda:'Mi Tienda',logo_url:'',favicon_url:'',color_primario:'#4A69E2',color_secundario:'#232321',color_acento:'#FFA52F',fuente:'Archivo',footer_texto:'',css_custom:'',hero_titulo:'',hero_subtitulo:'',promo_banner:'',whatsapp_numero:'',whatsapp_mensaje:'Hola, quiero consultar sobre un producto',confianza_1_icono:'truck',confianza_1_titulo:'Envío a todo el país',confianza_1_sub:'Andreani y más',confianza_2_icono:'shield',confianza_2_titulo:'Compra segura',confianza_2_sub:'Garantía incluida',confianza_3_icono:'message-circle',confianza_3_titulo:'Atención directa',confianza_3_sub:'WhatsApp'};
   for(const [k,v] of Object.entries(defs)){ await pool.query("INSERT INTO design_config (tenant_id,clave,valor) VALUES (1,$1,$2) ON CONFLICT (tenant_id,clave) DO NOTHING", [k,v]).catch(()=>{}); }
   // FIX #5: seed admin si no existe ninguno
   try{
-    const {rows:admins}=await pool.query("SELECT id FROM usuarios WHERE rol='admin' LIMIT 1");
+    const {rows:admins}=await pool.query("SELECT id FROM usuarios WHERE rol='admin' AND tenant_id=1 LIMIT 1");
     if(!admins.length){
       const adminPass=process.env.ADMIN_PASSWORD||'Admin1234';
       const hash=await bcrypt.hash(adminPass,12);
-      await pool.query("INSERT INTO usuarios (nombre,usuario,password,rol,aprobado,activo) VALUES ('Administrador','admin',$1,'admin',true,true) ON CONFLICT (usuario) DO NOTHING", [hash]);
+      await pool.query("INSERT INTO usuarios (tenant_id,nombre,usuario,password,rol,aprobado,activo) VALUES (1,'Administrador','admin',$1,'admin',true,true) ON CONFLICT (tenant_id,usuario) DO NOTHING", [hash]);
       console.log('✅ Admin creado -> usuario: admin  password: '+adminPass+'  (cambialo en Mi Cuenta)');
     }
   }catch(e){ console.log('seed admin warn', e.message); }
@@ -510,8 +513,8 @@ app.post('/api/login', async (req,res)=>{
     if(!usuario||!password) return res.status(400).json({error:'Usuario y contraseña requeridos'});
     const ip=req.ip; const key=`${ip}_${usuario.toLowerCase()}`;
     if(loginAttempts[key] && loginAttempts[key].count>=5 && Date.now()-loginAttempts[key].last<15*60*1000) return res.status(429).json({error:'Bloqueado 15min'});
-    const {rows}=await pool.query('SELECT * FROM usuarios WHERE LOWER(usuario)=LOWER($1) AND activo=true', [usuario]);
-    if(!rows[0]){ const {rows:pend}=await pool.query('SELECT * FROM usuarios WHERE LOWER(usuario)=LOWER($1) AND aprobado=false', [usuario]); if(pend[0]) return res.status(403).json({error:'Pendiente aprobación'}); loginAttempts[key]={count:(loginAttempts[key]?.count||0)+1, last:Date.now()}; return res.status(401).json({error:'Usuario o contraseña incorrectos'}); }
+    const {rows}=await pool.query('SELECT * FROM usuarios WHERE LOWER(usuario)=LOWER($1) AND activo=true AND tenant_id=$2', [usuario, req.tenantId]);
+    if(!rows[0]){ const {rows:pend}=await pool.query('SELECT * FROM usuarios WHERE LOWER(usuario)=LOWER($1) AND aprobado=false AND tenant_id=$2', [usuario, req.tenantId]); if(pend[0]) return res.status(403).json({error:'Pendiente aprobación'}); loginAttempts[key]={count:(loginAttempts[key]?.count||0)+1, last:Date.now()}; return res.status(401).json({error:'Usuario o contraseña incorrectos'}); }
     const valid=await bcrypt.compare(password, rows[0].password);
     if(!valid){ loginAttempts[key]={count:(loginAttempts[key]?.count||0)+1, last:Date.now()}; return res.status(401).json({error:'Usuario o contraseña incorrectos'}); }
     if(rows[0].otp_activo && resend){
@@ -536,14 +539,14 @@ app.post('/api/logout', auth(), async (req,res)=>{
 app.post('/api/refresh-token', auth(), async (req,res)=>{
   try{ const {rows}=await pool.query('SELECT id,rol,usuario,activo,tenant_id FROM usuarios WHERE id=$1', [req.user.id]); if(!rows[0]||!rows[0].activo) return res.status(401).json({error:'Cuenta desactivada'}); const decoded=jwt.decode(req._token); await pool.query('INSERT INTO tokens_revocados (token_hash,expira) VALUES ($1,$2) ON CONFLICT DO NOTHING', [hashToken(req._token), new Date(decoded.exp*1000)]); const newToken=jwt.sign({id:rows[0].id, rol:rows[0].rol, usuario:rows[0].usuario, tenant_id:rows[0].tenant_id||1}, JWT_SECRET, {expiresIn:'7d'}); res.json({token:newToken}); }catch(e){ res.status(500).json({error:e.message}); }
 });
-app.put('/api/me/otp', auth(), async (req,res)=>{ try{ const {activo}=req.body; await pool.query('UPDATE usuarios SET otp_activo=$1 WHERE id=$2', [activo, req.user.id]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.put('/api/me/otp', auth(), async (req,res)=>{ try{ const {activo}=req.body; await pool.query('UPDATE usuarios SET otp_activo=$1 WHERE id=$2 AND tenant_id=$3', [activo, req.user.id, req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 
 // Password reset mejorado
 app.post('/api/forgot-password', async (req,res)=>{
   try{
     const {usuario, email} = req.body;
     if(!usuario && !email) return res.status(400).json({error:'Usuario o email requerido'});
-    const {rows} = await pool.query('SELECT * FROM usuarios WHERE LOWER(usuario)=LOWER($1) OR LOWER(email)=LOWER($1) LIMIT 1', [usuario||email]);
+    const {rows} = await pool.query('SELECT * FROM usuarios WHERE (LOWER(usuario)=LOWER($1) OR LOWER(email)=LOWER($1)) AND tenant_id=$2 LIMIT 1', [usuario||email, req.tenantId]);
     if(!rows[0]) return res.status(404).json({error:'Usuario no encontrado'});
     const codigo = 'KICKS-'+crypto.randomBytes(3).toString('hex').toUpperCase(); // ej KICKS-A3F9B2
     await pool.query('UPDATE usuarios SET reset_codigo=$1, reset_expira=NOW()+INTERVAL \'24 hours\' WHERE id=$2', [codigo, rows[0].id]);
@@ -560,7 +563,7 @@ app.post('/api/reset-password', async (req,res)=>{
     if(!codigo||!nueva_password) return res.status(400).json({error:'Código y nueva contraseña requeridos'});
     const pwError=validatePassword(nueva_password);
     if(pwError) return res.status(400).json({error:pwError});
-    const {rows}=await pool.query('SELECT * FROM usuarios WHERE reset_codigo=$1 AND reset_expira>NOW()', [codigo]);
+    const {rows}=await pool.query('SELECT * FROM usuarios WHERE reset_codigo=$1 AND reset_expira>NOW() AND tenant_id=$2', [codigo, req.tenantId]);
     if(!rows[0]) return res.status(400).json({error:'Código inválido o expirado'});
     const hash=await bcrypt.hash(nueva_password,12);
     await pool.query('UPDATE usuarios SET password=$1, reset_codigo=\'\', reset_expira=NULL WHERE id=$2', [hash, rows[0].id]);
@@ -574,11 +577,11 @@ app.post('/api/register', async (req,res)=>{
     if(!usuario||usuario.length<3) return res.status(400).json({error:'Min 3 caracteres'});
     const pwError=validatePassword(password); if(pwError) return res.status(400).json({error:pwError});
     const hash=await bcrypt.hash(password,12);
-    const {rows}=await pool.query('INSERT INTO usuarios (nombre,usuario,password,telefono,email,direccion,nombre_fantasia,aprobado,activo) VALUES ($1,$2,$3,$4,$5,$6,$7,false,false) RETURNING id,nombre,usuario,telefono,email,aprobado,activo', [nombre,usuario,hash,telefono||'',email||'',direccion||'',nombre_fantasia||'']);
+    const {rows}=await pool.query('INSERT INTO usuarios (tenant_id,nombre,usuario,password,telefono,email,direccion,nombre_fantasia,aprobado,activo) VALUES ($8,$1,$2,$3,$4,$5,$6,$7,false,false) RETURNING id,nombre,usuario,telefono,email,aprobado,activo', [nombre,usuario,hash,telefono||'',email||'',direccion||'',nombre_fantasia||'', req.tenantId]);
     res.json(rows[0]);
   }catch(e){ res.status(400).json({error:e.message.includes('duplicate')?'Usuario ya existe':e.message}); }
 });
-app.get('/api/me', auth(), async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM usuarios WHERE id=$1', [req.user.id]); res.json({...rows[0], password:undefined}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.get('/api/me', auth(), async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM usuarios WHERE id=$1 AND tenant_id=$2', [req.user.id, req.tenantId]); res.json({...rows[0], password:undefined}); }catch(e){ res.status(500).json({error:e.message}); } });
 // Crear cliente rápido desde el panel (venta de mostrador). Genera usuario auto si no se pasa.
 app.post('/api/usuarios/rapido', authPerm('usuarios'), async (req,res)=>{
   try{
@@ -590,7 +593,7 @@ app.post('/api/usuarios/rapido', authPerm('usuarios'), async (req,res)=>{
     // password simple legible para darle al cliente (ej: "tienda4821"). Puede cambiarla después.
     const passPlano='cliente'+Math.floor(Math.random()*9000+1000);
     const hash=await bcrypt.hash(passPlano,10);
-    const {rows}=await pool.query('INSERT INTO usuarios (nombre,usuario,password,telefono,email,direccion,aprobado,activo) VALUES ($1,$2,$3,$4,$5,$6,true,true) RETURNING id,nombre,usuario,telefono,email', [nombre,usuario,hash,telefono||'',email||'',direccion||'']);
+    const {rows}=await pool.query('INSERT INTO usuarios (tenant_id,nombre,usuario,password,telefono,email,direccion,aprobado,activo) VALUES ($7,$1,$2,$3,$4,$5,$6,true,true) RETURNING id,nombre,usuario,telefono,email', [nombre,usuario,hash,telefono||'',email||'',direccion||'', req.tenantId]);
     // Devolvemos la password en texto SOLO acá (para que el admin la imprima/pase al cliente). No se guarda en texto.
     res.json({...rows[0], password_temporal:passPlano});
   }catch(e){ res.status(400).json({error:e.message.includes('duplicate')?'Ese usuario ya existe, probá otro nombre':e.message}); }
@@ -598,9 +601,9 @@ app.post('/api/usuarios/rapido', authPerm('usuarios'), async (req,res)=>{
 app.put('/api/me', auth(), async (req,res)=>{
   try{
     const {nombre,telefono,email,direccion,nombre_fantasia,password}=req.body;
-    if(password){ const hash=await bcrypt.hash(password,10); await pool.query('UPDATE usuarios SET nombre=$1,telefono=$2,email=$3,direccion=$4,nombre_fantasia=$5,password=$6 WHERE id=$7', [nombre,telefono,email,direccion,nombre_fantasia||'',hash,req.user.id]); }
-    else{ await pool.query('UPDATE usuarios SET nombre=$1,telefono=$2,email=$3,direccion=$4,nombre_fantasia=$5 WHERE id=$6', [nombre,telefono,email,direccion,nombre_fantasia||'',req.user.id]); }
-    const {rows}=await pool.query('SELECT * FROM usuarios WHERE id=$1', [req.user.id]);
+    if(password){ const hash=await bcrypt.hash(password,10); await pool.query('UPDATE usuarios SET nombre=$1,telefono=$2,email=$3,direccion=$4,nombre_fantasia=$5,password=$6 WHERE id=$7 AND tenant_id=$8', [nombre,telefono,email,direccion,nombre_fantasia||'',hash,req.user.id, req.tenantId]); }
+    else{ await pool.query('UPDATE usuarios SET nombre=$1,telefono=$2,email=$3,direccion=$4,nombre_fantasia=$5 WHERE id=$6 AND tenant_id=$7', [nombre,telefono,email,direccion,nombre_fantasia||'',req.user.id, req.tenantId]); }
+    const {rows}=await pool.query('SELECT * FROM usuarios WHERE id=$1 AND tenant_id=$2', [req.user.id, req.tenantId]);
     res.json({...rows[0], password:undefined});
   }catch(e){ res.status(500).json({error:e.message}); }
 });
@@ -1090,12 +1093,12 @@ app.delete('/api/ordenes-compra/:id', authPerm('pedidos'), async (req,res)=>{
   catch(e){ res.status(500).json({error:e.message}); }
 });
 app.get('/api/precios-fijos', authPerm('productos'), async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM precios_fijos'); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
-app.post('/api/precios-fijos', authPerm('productos'), async (req,res)=>{ try{ const {producto_id,lista_precio_id,precio_fijo}=req.body; await pool.query('INSERT INTO precios_fijos (producto_id,lista_precio_id,precio_fijo) VALUES ($1,$2,$3) ON CONFLICT (producto_id,lista_precio_id) DO UPDATE SET precio_fijo=$3', [producto_id,lista_precio_id,precio_fijo]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.post('/api/precios-fijos', authPerm('productos'), async (req,res)=>{ try{ const {producto_id,lista_precio_id,precio_fijo}=req.body; await pool.query('INSERT INTO precios_fijos (tenant_id,producto_id,lista_precio_id,precio_fijo) VALUES ($4,$1,$2,$3) ON CONFLICT (producto_id,lista_precio_id) DO UPDATE SET precio_fijo=$3', [producto_id,lista_precio_id,precio_fijo, req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 
 // USUARIOS
 app.get('/api/usuarios/:id/cuenta', authPerm('usuarios'), async (req,res)=>{
   try{
-    const {rows:movs}=await pool.query('SELECT cc.*, p.tipo as pedido_tipo FROM cuenta_corriente cc LEFT JOIN pedidos p ON cc.pedido_id=p.id WHERE cc.usuario_id=$1 ORDER BY cc.created_at DESC LIMIT 200', [req.params.id]);
+    const {rows:movs}=await pool.query('SELECT cc.*, p.tipo as pedido_tipo FROM cuenta_corriente cc LEFT JOIN pedidos p ON cc.pedido_id=p.id WHERE cc.usuario_id=$1 AND cc.tenant_id=$2 ORDER BY cc.created_at DESC LIMIT 200', [req.params.id, req.tenantId]);
     const saldo=movs.reduce((s,m)=> s + (m.tipo==='cargo' ? Number(m.monto) : -Number(m.monto)), 0);
     res.json({ movimientos: movs, saldo });
   }catch(e){ res.status(500).json({error:e.message}); }
@@ -1104,17 +1107,17 @@ app.post('/api/usuarios/:id/cuenta', authPerm('usuarios'), async (req,res)=>{
   try{
     const {tipo, monto, concepto}=req.body;
     if(!['cargo','pago'].includes(tipo) || !monto) return res.status(400).json({error:'Datos inválidos'});
-    const {rows}=await pool.query('INSERT INTO cuenta_corriente (usuario_id,tipo,monto,concepto) VALUES ($1,$2,$3,$4) RETURNING *', [req.params.id, tipo, monto, concepto||'']);
+    const {rows}=await pool.query('INSERT INTO cuenta_corriente (tenant_id,usuario_id,tipo,monto,concepto) VALUES ($5,$1,$2,$3,$4) RETURNING *', [req.params.id, tipo, monto, concepto||'', req.tenantId]);
     res.json(rows[0]);
   }catch(e){ res.status(500).json({error:e.message}); }
 });
 app.delete('/api/cuenta-corriente/:id', authPerm('usuarios'), async (req,res)=>{
-  try{ await pool.query('DELETE FROM cuenta_corriente WHERE id=$1', [req.params.id]); res.json({ok:true}); }
+  try{ await pool.query('DELETE FROM cuenta_corriente WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); res.json({ok:true}); }
   catch(e){ res.status(500).json({error:e.message}); }
 });
 app.get('/api/usuarios/:id/historial', authPerm('usuarios'), async (req,res)=>{
   try{
-    const {rows:pedidos}=await pool.query(`SELECT p.*, s.nombre as seccion_nombre, s.color as seccion_color FROM pedidos p LEFT JOIN secciones s ON p.seccion_id=s.id WHERE p.usuario_id=$1 ORDER BY p.created_at DESC LIMIT 100`, [req.params.id]);
+    const {rows:pedidos}=await pool.query(`SELECT p.*, s.nombre as seccion_nombre, s.color as seccion_color FROM pedidos p LEFT JOIN secciones s ON p.seccion_id=s.id WHERE p.usuario_id=$1 AND p.tenant_id=$2 ORDER BY p.created_at DESC LIMIT 100`, [req.params.id, req.tenantId]);
     const activos=pedidos.filter(p=>p.tipo==='pedido' && !['cancelado','anulado','rechazado'].includes(String(p.estado).toLowerCase()));
     const totalGastado=activos.reduce((s,p)=>s+Number(p.total||0),0);
     const cantPedidos=pedidos.filter(p=>p.tipo==='pedido').length;
@@ -1123,9 +1126,9 @@ app.get('/api/usuarios/:id/historial', authPerm('usuarios'), async (req,res)=>{
   }catch(e){ res.status(500).json({error:e.message}); }
 });
 app.get('/api/usuarios', authPerm('usuarios'), async (req,res)=>{
-  try{ const {q}=req.query; let query='SELECT * FROM usuarios ORDER BY created_at DESC'; const params=[]; if(q){ query="SELECT * FROM usuarios WHERE nombre ILIKE $1 OR usuario ILIKE $1 OR nombre_fantasia ILIKE $1 OR email ILIKE $1 OR telefono ILIKE $1 ORDER BY created_at DESC"; params.push(`%${q}%`); } const {rows}=await pool.query(query, params); res.json(rows.map(u=>({...u,password:undefined}))); }catch(e){ res.status(500).json({error:e.message}); }
+  try{ const {q}=req.query; let query='SELECT * FROM usuarios WHERE tenant_id=$1 ORDER BY created_at DESC'; const params=[req.tenantId]; if(q){ query="SELECT * FROM usuarios WHERE tenant_id=$1 AND (nombre ILIKE $2 OR usuario ILIKE $2 OR nombre_fantasia ILIKE $2 OR email ILIKE $2 OR telefono ILIKE $2) ORDER BY created_at DESC"; params.push(`%${q}%`); } const {rows}=await pool.query(query, params); res.json(rows.map(u=>({...u,password:undefined}))); }catch(e){ res.status(500).json({error:e.message}); }
 });
-app.get('/api/usuarios/pendientes/count', authPerm('usuarios'), async (req,res)=>{ try{ const {rows}=await pool.query("SELECT COUNT(*) FROM usuarios WHERE aprobado=false AND activo=false"); res.json({count:parseInt(rows[0].count)}); }catch{ res.json({count:0}); } });
+app.get('/api/usuarios/pendientes/count', authPerm('usuarios'), async (req,res)=>{ try{ const {rows}=await pool.query("SELECT COUNT(*) FROM usuarios WHERE aprobado=false AND activo=false AND tenant_id=$1", [req.tenantId]); res.json({count:parseInt(rows[0].count)}); }catch{ res.json({count:0}); } });
 app.put('/api/usuarios/:id', authPerm('usuarios'), async (req,res)=>{
   try{
     const u=req.body; const sets=[]; const params=[]; let pi=1;
@@ -1133,25 +1136,25 @@ app.put('/api/usuarios/:id', authPerm('usuarios'), async (req,res)=>{
     for(const f of fields){ if(u[f]!==undefined){ sets.push(`${f}=$${pi++}`); params.push(u[f]); } }
     if(u.password){ const hash=await bcrypt.hash(u.password,10); sets.push(`password=$${pi++}`); params.push(hash); }
     if(!sets.length) return res.json({ok:true});
-    params.push(req.params.id);
-    await pool.query(`UPDATE usuarios SET ${sets.join(',')} WHERE id=$${pi}`, params);
+    params.push(req.params.id); params.push(req.tenantId);
+    await pool.query(`UPDATE usuarios SET ${sets.join(',')} WHERE id=$${pi} AND tenant_id=$${pi+1}`, params);
     res.json({ok:true});
   }catch(e){ res.status(500).json({error:e.message}); }
 });
-app.post('/api/usuarios/:id/aprobar', authPerm('usuarios'), async (req,res)=>{ try{ const {lista_precio_id}=req.body; await pool.query('UPDATE usuarios SET aprobado=true, activo=true, lista_precio_id=$1 WHERE id=$2', [lista_precio_id||'', req.params.id]); const {rows}=await pool.query('SELECT * FROM usuarios WHERE id=$1', [req.params.id]); res.json({ok:true, user:{...rows[0], password:undefined}}); }catch(e){ res.status(500).json({error:e.message}); } });
-app.post('/api/usuarios/:id/rechazar', authPerm('usuarios'), async (req,res)=>{ try{ await pool.query('UPDATE usuarios SET activo=false WHERE id=$1', [req.params.id]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
-app.post('/api/usuarios/:id/suspender', authPerm('usuarios'), async (req,res)=>{ try{ const {activo}=req.body; await pool.query('UPDATE usuarios SET activo=$1 WHERE id=$2', [activo, req.params.id]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.post('/api/usuarios/:id/aprobar', authPerm('usuarios'), async (req,res)=>{ try{ const {lista_precio_id}=req.body; await pool.query('UPDATE usuarios SET aprobado=true, activo=true, lista_precio_id=$1 WHERE id=$2 AND tenant_id=$3', [lista_precio_id||'', req.params.id, req.tenantId]); const {rows}=await pool.query('SELECT * FROM usuarios WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); res.json({ok:true, user:{...rows[0], password:undefined}}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.post('/api/usuarios/:id/rechazar', authPerm('usuarios'), async (req,res)=>{ try{ await pool.query('UPDATE usuarios SET activo=false WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.post('/api/usuarios/:id/suspender', authPerm('usuarios'), async (req,res)=>{ try{ const {activo}=req.body; await pool.query('UPDATE usuarios SET activo=$1 WHERE id=$2 AND tenant_id=$3', [activo, req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 // RESET MEJORADO - codigo largo
 app.post('/api/usuarios/:id/reset-password', authPerm('usuarios'), async (req,res)=>{
   try{
     const codigo='KICKS-'+crypto.randomBytes(4).toString('hex').toUpperCase();
     const hash=await bcrypt.hash(codigo,10);
-    await pool.query('UPDATE usuarios SET password=$1, reset_codigo=$2, reset_expira=NOW()+INTERVAL \'24 hours\' WHERE id=$3', [hash, codigo, req.params.id]);
-    const {rows}=await pool.query('SELECT nombre,telefono,email FROM usuarios WHERE id=$1', [req.params.id]);
+    await pool.query('UPDATE usuarios SET password=$1, reset_codigo=$2, reset_expira=NOW()+INTERVAL \'24 hours\' WHERE id=$3 AND tenant_id=$4', [hash, codigo, req.params.id, req.tenantId]);
+    const {rows}=await pool.query('SELECT nombre,telefono,email FROM usuarios WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]);
     res.json({ok:true, codigo, nombre:rows[0]?.nombre, telefono:rows[0]?.telefono, email:rows[0]?.email});
   }catch(e){ res.status(500).json({error:e.message}); }
 });
-app.delete('/api/usuarios/:id', authPerm('usuarios'), async (req,res)=>{ try{ await pool.query('DELETE FROM pedido_items WHERE pedido_id IN (SELECT id FROM pedidos WHERE usuario_id=$1)', [req.params.id]); await pool.query('DELETE FROM pedidos WHERE usuario_id=$1', [req.params.id]); await pool.query('DELETE FROM usuarios WHERE id=$1', [req.params.id]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.delete('/api/usuarios/:id', authPerm('usuarios'), async (req,res)=>{ try{ await pool.query('DELETE FROM pedido_items WHERE pedido_id IN (SELECT id FROM pedidos WHERE usuario_id=$1 AND tenant_id=$2)', [req.params.id, req.tenantId]); await pool.query('DELETE FROM pedidos WHERE usuario_id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); await pool.query('DELETE FROM usuarios WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 
 // PEDIDOS V4 - transaccion + is_test + costo_envio
 app.get('/api/pedidos', auth(), async (req,res)=>{
@@ -1282,11 +1285,11 @@ app.post('/api/pedidos/multi', auth(), async (req,res)=>{
           return res.status(400).json({error:`Sin stock: ${item.nombre_producto||''} (disponible: ${prod[0].stock})`});
         }
       }
-      const {rows}=await client.query('INSERT INTO pedidos (usuario_id,seccion_id,tipo,metodo_pago,notas,cupon_codigo,subtotal,descuento,total,datos_envio,costo_envio,metodo_envio,cp_destino,is_test,datos_facturacion,estado_pago) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) RETURNING *',
-        [req.user.id, seccion_id, 'pedido', metodo_pago||'', notas||'', cupon_codigo||'', subtotal||0, descuento||0, total||0, datos_envio||'', costo_envio||0, metodo_envio||'', cp_destino||'', is_test||false, ped.datos_facturacion||'', ped.estado_pago||'impago']);
+      const {rows}=await client.query('INSERT INTO pedidos (tenant_id,usuario_id,seccion_id,tipo,metodo_pago,notas,cupon_codigo,subtotal,descuento,total,datos_envio,costo_envio,metodo_envio,cp_destino,is_test,datos_facturacion,estado_pago) VALUES ($17,$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) RETURNING *',
+        [req.user.id, seccion_id, 'pedido', metodo_pago||'', notas||'', cupon_codigo||'', subtotal||0, descuento||0, total||0, datos_envio||'', costo_envio||0, metodo_envio||'', cp_destino||'', is_test||false, ped.datos_facturacion||'', ped.estado_pago||'impago', req.tenantId]);
       for(const item of (items||[])){
-        await client.query('INSERT INTO pedido_items (pedido_id,producto_id,categoria,modelo,nombre_producto,cantidad,precio_unitario,precio_base) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)',
-          [rows[0].id, item.producto_id, item.categoria||'', item.modelo||'', item.nombre_producto||'', item.cantidad||1, item.precio_unitario||0, item.precio_base||0]);
+        await client.query('INSERT INTO pedido_items (tenant_id,pedido_id,producto_id,categoria,modelo,nombre_producto,cantidad,precio_unitario,precio_base) VALUES ($9,$1,$2,$3,$4,$5,$6,$7,$8)',
+          [rows[0].id, item.producto_id, item.categoria||'', item.modelo||'', item.nombre_producto||'', item.cantidad||1, item.precio_unitario||0, item.precio_base||0, req.tenantId]);
         const {rows:pr}=await client.query('SELECT permitir_sin_stock, es_digital, es_preventa FROM productos WHERE id=$1', [item.producto_id]);
         if(pr[0] && (pr[0].es_preventa || item._preventa)){
           await client.query('UPDATE productos SET preventa_reservado = COALESCE(preventa_reservado,0) + $1 WHERE id=$2', [item.cantidad||1, item.producto_id]);
@@ -1296,7 +1299,7 @@ app.post('/api/pedidos/multi', auth(), async (req,res)=>{
       }
       creados.push(rows[0]);
     }
-    if(creados[0]?.cupon_codigo) await client.query("UPDATE cupones SET usos_actuales = usos_actuales + 1 WHERE codigo=$1", [creados[0].cupon_codigo]).catch(()=>{});
+    if(creados[0]?.cupon_codigo) await client.query("UPDATE cupones SET usos_actuales = usos_actuales + 1 WHERE codigo=$1 AND tenant_id=$2", [creados[0].cupon_codigo, req.tenantId]).catch(()=>{});
     await client.query('COMMIT');
     // Notificar al admin por email (nueva venta online)
     notificarVentaAdmin(creados, req.user).catch(()=>{});
