@@ -325,6 +325,25 @@ async function migrate(){
     `ALTER TABLE paginas_info ADD COLUMN IF NOT EXISTS orden INT DEFAULT 0`,
   ];
   for(const a of alters) await pool.query(a).catch(()=>{});
+  // Índices para performance (se crean solos, no bloquean ni borran datos)
+  const indices = [
+    `CREATE INDEX IF NOT EXISTS idx_productos_seccion ON productos(seccion_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_productos_categoria ON productos(categoria)`,
+    `CREATE INDEX IF NOT EXISTS idx_productos_visible ON productos(visible)`,
+    `CREATE INDEX IF NOT EXISTS idx_productos_created ON productos(created_at DESC)`,
+    `CREATE INDEX IF NOT EXISTS idx_productos_sku ON productos(sku)`,
+    `CREATE INDEX IF NOT EXISTS idx_productos_codigo ON productos(codigo_barras)`,
+    `CREATE INDEX IF NOT EXISTS idx_pedidos_usuario ON pedidos(usuario_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_pedidos_seccion ON pedidos(seccion_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_pedidos_created ON pedidos(created_at DESC)`,
+    `CREATE INDEX IF NOT EXISTS idx_pedido_items_pedido ON pedido_items(pedido_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_pedido_pagos_pedido ON pedido_pagos(pedido_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_usuarios_usuario ON usuarios(usuario)`,
+    `CREATE INDEX IF NOT EXISTS idx_usuarios_email ON usuarios(email)`,
+    `CREATE INDEX IF NOT EXISTS idx_usuarios_rol ON usuarios(rol)`,
+    `CREATE INDEX IF NOT EXISTS idx_precios_fijos_prod ON precios_fijos(producto_id)`,
+  ];
+  for(const ix of indices) await pool.query(ix).catch(()=>{});
   // Design defaults
   const defs = {nombre_tienda:'Mi Tienda',logo_url:'',favicon_url:'',color_primario:'#4A69E2',color_secundario:'#232321',color_acento:'#FFA52F',fuente:'Archivo',footer_texto:'',css_custom:'',hero_titulo:'',hero_subtitulo:'',promo_banner:'',whatsapp_numero:'',whatsapp_mensaje:'Hola, quiero consultar sobre un producto',confianza_1_icono:'truck',confianza_1_titulo:'Envío a todo el país',confianza_1_sub:'Andreani y más',confianza_2_icono:'shield',confianza_2_titulo:'Compra segura',confianza_2_sub:'Garantía incluida',confianza_3_icono:'message-circle',confianza_3_titulo:'Atención directa',confianza_3_sub:'WhatsApp'};
   for(const [k,v] of Object.entries(defs)){ await pool.query("INSERT INTO design_config (clave,valor) VALUES ($1,$2) ON CONFLICT (clave) DO NOTHING", [k,v]).catch(()=>{}); }
