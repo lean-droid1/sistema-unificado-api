@@ -499,8 +499,10 @@ async function migrate(){
   console.log('✅ Multi-tenant base OK (tenant_id en todas las tablas)');
   // Key-value tables: la clave ya no es única global, sino por tenant. Cambiar constraint a (tenant_id, clave).
   await pool.query(`ALTER TABLE configuracion DROP CONSTRAINT IF EXISTS configuracion_pkey`).catch(()=>{});
+  await pool.query(`ALTER TABLE configuracion DROP CONSTRAINT IF EXISTS configuracion_clave_key`).catch(()=>{});
   await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS uq_configuracion_tenant_clave ON configuracion(tenant_id, clave)`).catch(e=>console.log('uq config warn', e.message.slice(0,80)));
   await pool.query(`ALTER TABLE design_config DROP CONSTRAINT IF EXISTS design_config_clave_key`).catch(()=>{});
+  await pool.query(`ALTER TABLE design_config DROP CONSTRAINT IF EXISTS design_config_pkey`).catch(()=>{});
   await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS uq_design_config_tenant_clave ON design_config(tenant_id, clave)`).catch(e=>console.log('uq design warn', e.message.slice(0,80)));
   // usuario único por tenant (dos tiendas pueden tener el mismo nombre de usuario)
   await pool.query(`ALTER TABLE usuarios DROP CONSTRAINT IF EXISTS usuarios_usuario_key`).catch(()=>{});
