@@ -118,6 +118,15 @@ const authPerm = (permiso) => async (req,res,next)=>{
     return res.status(403).json({error:'Sin permiso'});
   }catch{ res.status(401).json({error:'Token inválido'}); }
 };
+// Middleware: exige que el tenant tenga habilitada una feature del plan. Uso: requiereFeature('marketing')
+const requiereFeature = (feature) => async (req,res,next)=>{
+  try{
+    const d=await getTenantData(req.tenantId);
+    const v=d.features?.[feature];
+    if(v===false || v==='no' || v===undefined || v===null) return res.status(403).json({error:'Esta función no está incluida en tu plan', feature, upgrade:true});
+    next();
+  }catch{ next(); } // ante error, no bloquear (fail-open, para no romper por un bug)
+};
 const optionalAuth = (req,res,next)=>{ try{ const t=req.headers.authorization?.split(' ')[1]; if(t) req.user=jwt.verify(t,JWT_SECRET);}catch{} next(); };
 
 // Middleware DUEÑO de la plataforma: solo el owner (Leandro) puede administrar tenants. NO filtra por tenant.
@@ -138,6 +147,75 @@ const authOwner = async (req,res,next)=>{
 // Determina a qué tienda pertenece cada request. Orden: header X-Tenant (slug o id) → tenant del user logueado → 1 (default).
 // Cachea slug→id en memoria para no consultar la DB en cada request.
 const tenantCache = new Map();
+
+// ═══════════ PLANES: qué funciones trae cada plan ═══════════
+// Siempre en TODOS los planes (no son llaves): editor visual+temas, contacto+QR, checkout, pagos, envíos, favoritos, buscador, WhatsApp flotante, notificación de venta por mail.
+// Llaves (on/off) por plan. Se pueden sobreescribir por tienda con la columna features (JSON).
+const PLAN_FEATURES = {
+  basic: {
+    pdv: 'no',            // punto de venta: 'no' | 'buscador' | 'lector'
+    marketing: false,     // cupones, promos, carritos abandonados, leads
+    caja: false,
+    presupuestos: false,
+    reportes: false,
+    analytics: false,
+    ordenes_compra: false,
+    mayorista: false,     // secciones mayoristas con aprobación de clientes
+    listas_precio: false,
+    cuenta_corriente: false,
+    dropshipping: false,
+    catalogo_pdf: false,
+    max_tiendas: 1,
+    max_subadmins: 0,
+  },
+  pro: {
+    pdv: 'buscador',
+    marketing: true,
+    caja: true,
+    presupuestos: true,
+    reportes: true,
+    analytics: true,
+    ordenes_compra: true,
+    mayorista: false,
+    listas_precio: false,
+    cuenta_corriente: false,
+    dropshipping: false,
+    catalogo_pdf: false,
+    max_tiendas: 3,
+    max_subadmins: 3,
+  },
+  full: {
+    pdv: 'lector',
+    marketing: true,
+    caja: true,
+    presupuestos: true,
+    reportes: true,
+    analytics: true,
+    ordenes_compra: true,
+    mayorista: true,
+    listas_precio: true,
+    cuenta_corriente: true,
+    dropshipping: true,
+    catalogo_pdf: true,
+    max_tiendas: 999,
+    max_subadmins: 999,
+  },
+};
+// Cache de datos del tenant (plan, estado, features) para no consultar en cada request
+const tenantDataCache = new Map();
+async function getTenantData(tenantId){
+  const key=String(tenantId);
+  if(tenantDataCache.has(key)) return tenantDataCache.get(key);
+  const {rows}=await pool.query('SELECT plan, estado, features FROM tenants WHERE id=$1', [tenantId]).catch(()=>({rows:[]}));
+  const t=rows[0]||{plan:'full', estado:'activo', features:null};
+  const base=PLAN_FEATURES[t.plan]||PLAN_FEATURES.full;
+  let overrides={}; try{ overrides = t.features ? (typeof t.features==='string'?JSON.parse(t.features):t.features) : {}; }catch{}
+  const features={...base, ...overrides};
+  const data={plan:t.plan||'full', estado:t.estado||'activo', features};
+  tenantDataCache.set(key, data);
+  return data;
+}
+
 async function slugToTenantId(slug){
   if(!slug) return null;
   if(tenantCache.has(slug)) return tenantCache.get(slug);
@@ -403,8 +481,10 @@ async function migrate(){
     fecha_fin_trial TIMESTAMP,
     descuento_hasta TIMESTAMP,
     notas TEXT DEFAULT '',
+    features JSONB,
     created_at TIMESTAMP DEFAULT NOW()
   )`).catch(e=>console.log('tenants warn', e.message.slice(0,80)));
+  await pool.query(`ALTER TABLE tenants ADD COLUMN IF NOT EXISTS features JSONB`).catch(()=>{});
   // Asegurar tenant 1 (la tienda actual) — dueño, plan full, activo para siempre
   await pool.query(`INSERT INTO tenants (id, nombre, slug, plan, estado) VALUES (1, 'Tienda principal', 'principal', 'full', 'activo') ON CONFLICT (id) DO NOTHING`).catch(()=>{});
   // Que el próximo tenant creado sea id 2+ (no pisar el 1)
@@ -505,7 +585,7 @@ app.post('/api/tenants', authOwner, async (req,res)=>{
       await client.query('INSERT INTO design_config (tenant_id,clave,valor) VALUES ($1,$2,$3) ON CONFLICT (tenant_id,clave) DO NOTHING', [tid,k,v]);
     }
     await client.query('COMMIT');
-    tenantCache.clear(); // refrescar cache slug→id
+    tenantCache.clear(); tenantDataCache.clear(); // refrescar caches del tenant
     res.json({ ...tRows[0], admin_usuario:admUser, admin_password:admPass });
   }catch(e){ await client.query('ROLLBACK').catch(()=>{}); res.status(500).json({error:e.message}); }
   finally{ client.release(); }
@@ -521,7 +601,7 @@ app.put('/api/tenants/:id', authOwner, async (req,res)=>{
     if(!sets.length) return res.json({ok:true});
     params.push(req.params.id);
     await pool.query(`UPDATE tenants SET ${sets.join(',')} WHERE id=$${pi}`, params);
-    tenantCache.clear();
+    tenantCache.clear(); tenantDataCache.clear();
     res.json({ok:true});
   }catch(e){ res.status(500).json({error:e.message}); }
 });
@@ -531,7 +611,7 @@ app.post('/api/tenants/:id/estado', authOwner, async (req,res)=>{
     const {estado}=req.body; // 'activo' | 'suspendido' | 'vencido'
     if(req.params.id==='1') return res.status(400).json({error:'No podés cambiar el estado de la tienda principal'});
     await pool.query('UPDATE tenants SET estado=$1 WHERE id=$2', [estado||'activo', req.params.id]);
-    tenantCache.clear();
+    tenantCache.clear(); tenantDataCache.clear();
     res.json({ok:true});
   }catch(e){ res.status(500).json({error:e.message}); }
 });
@@ -546,7 +626,7 @@ app.delete('/api/tenants/:id', authOwner, async (req,res)=>{
     for(const t of tablas){ await client.query(`DELETE FROM ${t} WHERE tenant_id=$1`, [tid]).catch(()=>{}); }
     await client.query('DELETE FROM tenants WHERE id=$1', [tid]);
     await client.query('COMMIT');
-    tenantCache.clear();
+    tenantCache.clear(); tenantDataCache.clear();
     res.json({ok:true});
   }catch(e){ await client.query('ROLLBACK').catch(()=>{}); res.status(500).json({error:e.message}); }
   finally{ client.release(); }
@@ -724,6 +804,11 @@ app.put('/api/me', auth(), async (req,res)=>{
 
 // CONFIG
 app.get('/api/config', async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM configuracion WHERE tenant_id=$1', [req.tenantId]); const cfg={}; rows.forEach(r=>cfg[r.clave]=r.valor); res.json(cfg); }catch(e){ res.status(500).json({error:e.message}); } });
+// Plan y funciones habilitadas del tenant actual (para que el frontend muestre/oculte)
+app.get('/api/mi-plan', async (req,res)=>{
+  try{ const d=await getTenantData(req.tenantId); res.json({ plan:d.plan, estado:d.estado, features:d.features }); }
+  catch(e){ res.status(500).json({error:e.message}); }
+});
 app.put('/api/config', authPerm('config'), async (req,res)=>{ try{ for(const [k,v] of Object.entries(req.body)){ await pool.query("INSERT INTO configuracion (tenant_id,clave,valor) VALUES ($1,$2,$3) ON CONFLICT (tenant_id,clave) DO UPDATE SET valor=$3", [req.tenantId,k,v]); } res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 
 // LISTAS
