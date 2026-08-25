@@ -120,6 +120,20 @@ const authPerm = (permiso) => async (req,res,next)=>{
 };
 const optionalAuth = (req,res,next)=>{ try{ const t=req.headers.authorization?.split(' ')[1]; if(t) req.user=jwt.verify(t,JWT_SECRET);}catch{} next(); };
 
+// Middleware DUEÑO de la plataforma: solo el owner (Leandro) puede administrar tenants. NO filtra por tenant.
+const authOwner = async (req,res,next)=>{
+  try{
+    const t = req.headers.authorization?.split(' ')[1];
+    if(!t) return res.status(401).json({error:'Token requerido'});
+    const revoked = await pool.query('SELECT 1 FROM tokens_revocados WHERE token_hash=$1', [hashToken(t)]).catch(()=>({rows:[]}));
+    if(revoked.rows.length) return res.status(401).json({error:'Sesión cerrada'});
+    const d = jwt.verify(t, JWT_SECRET);
+    const {rows} = await pool.query('SELECT es_owner, activo FROM usuarios WHERE id=$1', [d.id]).catch(()=>({rows:[]}));
+    if(!rows[0] || !rows[0].activo || !rows[0].es_owner) return res.status(403).json({error:'Solo el dueño de la plataforma'});
+    req.user=d; req._token=t; next();
+  }catch{ res.status(401).json({error:'Token inválido'}); }
+};
+
 // ═══ MULTI-TENANT: resolución del inquilino (etapa 2) ═══
 // Determina a qué tienda pertenece cada request. Orden: header X-Tenant (slug o id) → tenant del user logueado → 1 (default).
 // Cachea slug→id en memoria para no consultar la DB en cada request.
@@ -411,6 +425,9 @@ async function migrate(){
   // usuario único por tenant (dos tiendas pueden tener el mismo nombre de usuario)
   await pool.query(`ALTER TABLE usuarios DROP CONSTRAINT IF EXISTS usuarios_usuario_key`).catch(()=>{});
   await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS uq_usuarios_tenant_usuario ON usuarios(tenant_id, usuario)`).catch(e=>console.log('uq usuarios warn', e.message.slice(0,80)));
+  // Dueño de la plataforma (Leandro): puede administrar TODOS los tenants. El admin de tenant 1 es el dueño.
+  await pool.query(`ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS es_owner BOOLEAN DEFAULT false`).catch(()=>{});
+  await pool.query(`UPDATE usuarios SET es_owner=true WHERE tenant_id=1 AND rol='admin' AND usuario='admin'`).catch(()=>{});
   // Design defaults
   const defs = {nombre_tienda:'Mi Tienda',logo_url:'',favicon_url:'',color_primario:'#4A69E2',color_secundario:'#232321',color_acento:'#FFA52F',fuente:'Archivo',footer_texto:'',css_custom:'',hero_titulo:'',hero_subtitulo:'',promo_banner:'',whatsapp_numero:'',whatsapp_mensaje:'Hola, quiero consultar sobre un producto',confianza_1_icono:'truck',confianza_1_titulo:'Envío a todo el país',confianza_1_sub:'Andreani y más',confianza_2_icono:'shield',confianza_2_titulo:'Compra segura',confianza_2_sub:'Garantía incluida',confianza_3_icono:'message-circle',confianza_3_titulo:'Atención directa',confianza_3_sub:'WhatsApp'};
   for(const [k,v] of Object.entries(defs)){ await pool.query("INSERT INTO design_config (tenant_id,clave,valor) VALUES (1,$1,$2) ON CONFLICT (tenant_id,clave) DO NOTHING", [k,v]).catch(()=>{}); }
@@ -438,6 +455,103 @@ let dolarBlueCache={valor:null, ts:0};
 
 // === HEALTH ===
 app.get('/api/health', (req,res)=>res.json({ok:true, v:'4.4.0', cloudinary: !!process.env.CLOUDINARY_CLOUD_NAME}));
+
+// ═══════════ PANEL DUEÑO: administración de tenants (solo owner) ═══════════
+// Listar todos los tenants con métricas básicas
+app.get('/api/tenants', authOwner, async (req,res)=>{
+  try{
+    const {rows}=await pool.query(`
+      SELECT t.*,
+        (SELECT COUNT(*)::int FROM productos WHERE tenant_id=t.id) as productos,
+        (SELECT COUNT(*)::int FROM pedidos WHERE tenant_id=t.id AND tipo='pedido') as pedidos,
+        (SELECT COUNT(*)::int FROM usuarios WHERE tenant_id=t.id AND rol='cliente') as clientes
+      FROM tenants t ORDER BY t.id`);
+    res.json(rows);
+  }catch(e){ res.status(500).json({error:e.message}); }
+});
+// Detalle de un tenant
+app.get('/api/tenants/:id', authOwner, async (req,res)=>{
+  try{ const {rows}=await pool.query('SELECT * FROM tenants WHERE id=$1', [req.params.id]); if(!rows[0]) return res.status(404).json({error:'No encontrado'}); res.json(rows[0]); }
+  catch(e){ res.status(500).json({error:e.message}); }
+});
+// Crear tenant nuevo (+ su admin + seed de diseño mínimo)
+app.post('/api/tenants', authOwner, async (req,res)=>{
+  const client=await pool.connect();
+  try{
+    const {nombre, slug, plan, admin_usuario, admin_password, dias_trial}=req.body;
+    if(!nombre || !slug) return res.status(400).json({error:'Falta nombre o slug'});
+    const slugClean=String(slug).toLowerCase().trim().replace(/[^a-z0-9-]/g,'');
+    if(!slugClean) return res.status(400).json({error:'Slug inválido'});
+    await client.query('BEGIN');
+    // slug único
+    const {rows:ex}=await client.query('SELECT id FROM tenants WHERE slug=$1', [slugClean]);
+    if(ex[0]){ await client.query('ROLLBACK'); return res.status(400).json({error:'Ese slug ya existe'}); }
+    const estado = dias_trial>0 ? 'trial' : 'activo';
+    const finTrial = dias_trial>0 ? new Date(Date.now()+dias_trial*24*60*60*1000) : null;
+    const {rows:tRows}=await client.query(
+      `INSERT INTO tenants (nombre,slug,plan,estado,fecha_fin_trial) VALUES ($1,$2,$3,$4,$5) RETURNING *`,
+      [nombre, slugClean, plan||'full', estado, finTrial]);
+    const tid=tRows[0].id;
+    // admin del nuevo tenant
+    const admUser=(admin_usuario||'admin').toLowerCase().trim();
+    const admPass=admin_password||Math.random().toString(36).slice(2,10);
+    const hash=await bcrypt.hash(admPass, 12);
+    await client.query(
+      `INSERT INTO usuarios (tenant_id,nombre,usuario,password,rol,aprobado,activo) VALUES ($1,'Administrador',$2,$3,'admin',true,true)`,
+      [tid, admUser, hash]);
+    // seed diseño mínimo para el nuevo tenant
+    const seedDesign={nombre_tienda:nombre, color_primario:'#4A69E2', color_secundario:'#232321', color_acento:'#FFA52F', fuente:'Archivo'};
+    for(const [k,v] of Object.entries(seedDesign)){
+      await client.query('INSERT INTO design_config (tenant_id,clave,valor) VALUES ($1,$2,$3) ON CONFLICT (tenant_id,clave) DO NOTHING', [tid,k,v]);
+    }
+    await client.query('COMMIT');
+    tenantCache.clear(); // refrescar cache slug→id
+    res.json({ ...tRows[0], admin_usuario:admUser, admin_password:admPass });
+  }catch(e){ await client.query('ROLLBACK').catch(()=>{}); res.status(500).json({error:e.message}); }
+  finally{ client.release(); }
+});
+// Actualizar tenant (plan, estado, fechas, dominio, notas)
+app.put('/api/tenants/:id', authOwner, async (req,res)=>{
+  try{
+    const campos=['nombre','slug','plan','estado','dominio_propio','notas'];
+    const sets=[]; const params=[]; let pi=1;
+    for(const k of campos){ if(req.body[k]!==undefined){ sets.push(`${k}=$${pi}`); params.push(req.body[k]); pi++; } }
+    if(req.body.fecha_fin_trial!==undefined){ sets.push(`fecha_fin_trial=$${pi}`); params.push(req.body.fecha_fin_trial||null); pi++; }
+    if(req.body.descuento_hasta!==undefined){ sets.push(`descuento_hasta=$${pi}`); params.push(req.body.descuento_hasta||null); pi++; }
+    if(!sets.length) return res.json({ok:true});
+    params.push(req.params.id);
+    await pool.query(`UPDATE tenants SET ${sets.join(',')} WHERE id=$${pi}`, params);
+    tenantCache.clear();
+    res.json({ok:true});
+  }catch(e){ res.status(500).json({error:e.message}); }
+});
+// Activar / suspender rápido
+app.post('/api/tenants/:id/estado', authOwner, async (req,res)=>{
+  try{
+    const {estado}=req.body; // 'activo' | 'suspendido' | 'vencido'
+    if(req.params.id==='1') return res.status(400).json({error:'No podés cambiar el estado de la tienda principal'});
+    await pool.query('UPDATE tenants SET estado=$1 WHERE id=$2', [estado||'activo', req.params.id]);
+    tenantCache.clear();
+    res.json({ok:true});
+  }catch(e){ res.status(500).json({error:e.message}); }
+});
+// Borrar tenant (y TODOS sus datos) — peligroso, nunca el 1
+app.delete('/api/tenants/:id', authOwner, async (req,res)=>{
+  const client=await pool.connect();
+  try{
+    const tid=Number(req.params.id);
+    if(tid===1) return res.status(400).json({error:'No se puede borrar la tienda principal'});
+    await client.query('BEGIN');
+    const tablas=['productos','pedidos','pedido_items','pedido_pagos','usuarios','secciones','categorias_meta','configuracion','design_config','cupones','cupon_productos','promociones','listas_precio','precios_fijos','ordenes_compra','orden_compra_items','cuenta_corriente','leads','carritos_abandonados','badges','barras_texto','menu_items','metodos_pago','metodos_envio_custom','config_envio','notificaciones_stock','paginas_info','popups','redes_sociales','slider_banners','contactos','favoritos','historial_precios','producto_imagenes','variantes'];
+    for(const t of tablas){ await client.query(`DELETE FROM ${t} WHERE tenant_id=$1`, [tid]).catch(()=>{}); }
+    await client.query('DELETE FROM tenants WHERE id=$1', [tid]);
+    await client.query('COMMIT');
+    tenantCache.clear();
+    res.json({ok:true});
+  }catch(e){ await client.query('ROLLBACK').catch(()=>{}); res.status(500).json({error:e.message}); }
+  finally{ client.release(); }
+});
+
 
 // Dolar blue
 app.get('/api/dolar-blue', async (req,res)=>{
@@ -529,7 +643,7 @@ app.post('/api/login', async (req,res)=>{
       await pool.query('UPDATE otp_codes SET usado=true WHERE id=$1', [otps[0].id]);
     }
     delete loginAttempts[key];
-    const token=jwt.sign({id:rows[0].id, rol:rows[0].rol, usuario:rows[0].usuario, tenant_id:rows[0].tenant_id||1}, JWT_SECRET, {expiresIn:'7d'});
+    const token=jwt.sign({id:rows[0].id, rol:rows[0].rol, usuario:rows[0].usuario, tenant_id:rows[0].tenant_id||1, es_owner:rows[0].es_owner||false}, JWT_SECRET, {expiresIn:'7d'});
     res.json({token, user:{...rows[0], password:undefined}});
   }catch(e){ res.status(500).json({error:e.message}); }
 });
@@ -537,7 +651,7 @@ app.post('/api/logout', auth(), async (req,res)=>{
   try{ const decoded=jwt.decode(req._token); const expira=new Date(decoded.exp*1000); await pool.query('INSERT INTO tokens_revocados (token_hash,expira) VALUES ($1,$2) ON CONFLICT DO NOTHING', [hashToken(req._token), expira]); await pool.query('DELETE FROM tokens_revocados WHERE expira<NOW()').catch(()=>{}); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); }
 });
 app.post('/api/refresh-token', auth(), async (req,res)=>{
-  try{ const {rows}=await pool.query('SELECT id,rol,usuario,activo,tenant_id FROM usuarios WHERE id=$1', [req.user.id]); if(!rows[0]||!rows[0].activo) return res.status(401).json({error:'Cuenta desactivada'}); const decoded=jwt.decode(req._token); await pool.query('INSERT INTO tokens_revocados (token_hash,expira) VALUES ($1,$2) ON CONFLICT DO NOTHING', [hashToken(req._token), new Date(decoded.exp*1000)]); const newToken=jwt.sign({id:rows[0].id, rol:rows[0].rol, usuario:rows[0].usuario, tenant_id:rows[0].tenant_id||1}, JWT_SECRET, {expiresIn:'7d'}); res.json({token:newToken}); }catch(e){ res.status(500).json({error:e.message}); }
+  try{ const {rows}=await pool.query('SELECT id,rol,usuario,activo,tenant_id,es_owner FROM usuarios WHERE id=$1', [req.user.id]); if(!rows[0]||!rows[0].activo) return res.status(401).json({error:'Cuenta desactivada'}); const decoded=jwt.decode(req._token); await pool.query('INSERT INTO tokens_revocados (token_hash,expira) VALUES ($1,$2) ON CONFLICT DO NOTHING', [hashToken(req._token), new Date(decoded.exp*1000)]); const newToken=jwt.sign({id:rows[0].id, rol:rows[0].rol, usuario:rows[0].usuario, tenant_id:rows[0].tenant_id||1, es_owner:rows[0].es_owner||false}, JWT_SECRET, {expiresIn:'7d'}); res.json({token:newToken}); }catch(e){ res.status(500).json({error:e.message}); }
 });
 app.put('/api/me/otp', auth(), async (req,res)=>{ try{ const {activo}=req.body; await pool.query('UPDATE usuarios SET otp_activo=$1 WHERE id=$2 AND tenant_id=$3', [activo, req.user.id, req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 
