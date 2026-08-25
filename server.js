@@ -148,6 +148,8 @@ const authOwner = async (req,res,next)=>{
 // Cachea slug→id en memoria para no consultar la DB en cada request.
 const tenantCache = new Map();
 
+// Precios mensuales de cada plan (ARS). Editables acá sin tocar nada más.
+const PLAN_PRECIOS = { basic: 30000, pro: 45000, full: 60000 };
 // ═══════════ PLANES: qué funciones trae cada plan ═══════════
 // Siempre en TODOS los planes (no son llaves): editor visual+temas, contacto+QR, checkout, pagos, envíos, favoritos, buscador, WhatsApp flotante, notificación de venta por mail.
 // Llaves (on/off) por plan. Se pueden sobreescribir por tienda con la columna features (JSON).
@@ -549,6 +551,54 @@ app.get('/api/tenants', authOwner, async (req,res)=>{
         (SELECT COUNT(*)::int FROM usuarios WHERE tenant_id=t.id AND rol='cliente') as clientes
       FROM tenants t ORDER BY t.id`);
     res.json(rows);
+  }catch(e){ res.status(500).json({error:e.message}); }
+});
+// Estadísticas de negocio de la plataforma (para el panel de dueño)
+app.get('/api/plataforma/stats', authOwner, async (req,res)=>{
+  try{
+    const {rows:tenants}=await pool.query('SELECT id, plan, estado, fecha_fin_trial, descuento_hasta, created_at FROM tenants');
+    // conteos por estado y por plan
+    const porEstado={activo:0, trial:0, suspendido:0, vencido:0};
+    const porPlan={basic:0, pro:0, full:0};
+    let facturacionMensual=0; // solo tiendas activas (no trial, no suspendida) que pagan
+    const hoy=new Date();
+    for(const t of tenants){
+      if(t.id===1) continue; // la tienda propia de Leandro no cuenta como cliente que paga
+      porEstado[t.estado]=(porEstado[t.estado]||0)+1;
+      porPlan[t.plan]=(porPlan[t.plan]||0)+1;
+      if(t.estado==='activo'){
+        let precio=PLAN_PRECIOS[t.plan]||0;
+        // aplicar descuento si está vigente
+        if(t.descuento_hasta && new Date(t.descuento_hasta)>hoy) precio=Math.round(precio*0.75);
+        facturacionMensual+=precio;
+      }
+    }
+    // próximos vencimientos de prueba (trial que vence en <=7 días) y tiendas por vencer
+    const proximosTrials=tenants
+      .filter(t=>t.id!==1 && t.estado==='trial' && t.fecha_fin_trial)
+      .map(t=>({id:t.id, dias: Math.ceil((new Date(t.fecha_fin_trial)-hoy)/86400000)}))
+      .filter(t=>t.dias<=7)
+      .sort((a,b)=>a.dias-b.dias);
+    // tiendas nuevas por mes (últimos 6 meses)
+    const {rows:porMes}=await pool.query(`
+      SELECT to_char(date_trunc('month', created_at),'YYYY-MM') as mes, COUNT(*)::int as nuevas
+      FROM tenants WHERE id!=1 AND created_at >= NOW() - INTERVAL '6 months'
+      GROUP BY 1 ORDER BY 1`);
+    // uso total de la plataforma
+    const {rows:uso}=await pool.query(`SELECT
+      (SELECT COUNT(*)::int FROM productos) as productos,
+      (SELECT COUNT(*)::int FROM pedidos WHERE tipo='pedido') as pedidos,
+      (SELECT COUNT(*)::int FROM usuarios WHERE rol='cliente') as clientes`);
+    res.json({
+      total_tiendas: tenants.filter(t=>t.id!==1).length,
+      por_estado: porEstado,
+      por_plan: porPlan,
+      facturacion_mensual: facturacionMensual,
+      precios: PLAN_PRECIOS,
+      proximos_trials: proximosTrials,
+      nuevas_por_mes: porMes,
+      uso_total: uso[0],
+    });
   }catch(e){ res.status(500).json({error:e.message}); }
 });
 // Detalle de un tenant
