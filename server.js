@@ -90,7 +90,7 @@ const auth = (role) => async (req,res,next)=>{
     if(revoked.rows.length) return res.status(401).json({error:'Sesión cerrada'});
     const d = jwt.verify(t, JWT_SECRET);
     if(role){
-      const {rows} = await pool.query('SELECT rol, activo FROM usuarios WHERE id=$1', [d.id]).catch(()=>({rows:[]}));
+      const {rows} = await pool.query('SELECT rol, activo FROM usuarios WHERE id=$1 AND tenant_id=$2', [d.id, req.tenantId]).catch(()=>({rows:[]}));
       if(!rows[0] || !rows[0].activo) return res.status(401).json({error:'Cuenta desactivada'});
       if(role==='admin' && rows[0].rol!=='admin') return res.status(403).json({error:'Sin permiso'});
       req._rol = rows[0].rol;
@@ -106,7 +106,7 @@ const authPerm = (permiso) => async (req,res,next)=>{
     const revoked = await pool.query('SELECT 1 FROM tokens_revocados WHERE token_hash=$1', [hashToken(t)]).catch(()=>({rows:[]}));
     if(revoked.rows.length) return res.status(401).json({error:'Sesión cerrada'});
     const d = jwt.verify(t, JWT_SECRET);
-    const {rows} = await pool.query('SELECT rol, activo, permisos FROM usuarios WHERE id=$1', [d.id]).catch(()=>({rows:[]}));
+    const {rows} = await pool.query('SELECT rol, activo, permisos FROM usuarios WHERE id=$1 AND tenant_id=$2', [d.id, req.tenantId]).catch(()=>({rows:[]}));
     if(!rows[0] || !rows[0].activo) return res.status(401).json({error:'Cuenta desactivada'});
     const rol = rows[0].rol;
     if(rol === 'admin'){ req.user=d; req._token=t; req._rol=rol; return next(); }
@@ -832,7 +832,7 @@ app.post('/api/categorias/crear', authPerm('productos'), async (req,res)=>{
     const {nombre}=req.body;
     if(!nombre || !nombre.trim()) return res.status(400).json({error:'Falta el nombre'});
     const n=nombre.trim();
-    const {rows:ex}=await pool.query('SELECT 1 FROM productos WHERE categoria=$1 LIMIT 1', [n]);
+    const {rows:ex}=await pool.query('SELECT 1 FROM productos WHERE categoria=$1 AND tenant_id=$2 LIMIT 1', [n, req.tenantId]);
     const {rows:exM}=await pool.query('SELECT 1 FROM categorias_meta WHERE categoria=$1', [n]);
     if(ex.length || exM.length) return res.status(400).json({error:'Esa categoría ya existe'});
     await pool.query('INSERT INTO categorias_meta (categoria, orden, visible) VALUES ($1, 0, true) ON CONFLICT DO NOTHING', [n]);
@@ -844,10 +844,10 @@ app.post('/api/categorias/renombrar', authPerm('productos'), async (req,res)=>{
   try{
     const {desde, hasta, seccion_id}=req.body;
     if(!desde || !hasta) return res.status(400).json({error:'Faltan datos'});
-    let q='UPDATE productos SET categoria=$1 WHERE categoria=$2'; const params=[hasta, desde];
-    if(seccion_id && seccion_id!=='all'){ q+=' AND seccion_id=$3'; params.push(seccion_id); }
+    let q='UPDATE productos SET categoria=$1 WHERE categoria=$2 AND tenant_id=$3'; const params=[hasta, desde, req.tenantId];
+    if(seccion_id && seccion_id!=='all'){ q+=' AND seccion_id=$4'; params.push(seccion_id); }
     const r=await pool.query(q, params);
-    await pool.query('UPDATE categorias_meta SET categoria=$1 WHERE categoria=$2', [hasta, desde]).catch(()=>{});
+    await pool.query('UPDATE categorias_meta SET categoria=$1 WHERE categoria=$2 AND tenant_id=$3', [hasta, desde, req.tenantId]).catch(()=>{});
     res.json({ok:true, afectados:r.rowCount});
   }catch(e){ res.status(500).json({error:e.message}); }
 });
@@ -856,7 +856,7 @@ app.post('/api/categorias/reasignar', authPerm('productos'), async (req,res)=>{
   try{
     const {producto_ids, categoria}=req.body;
     if(!Array.isArray(producto_ids) || !producto_ids.length || !categoria) return res.status(400).json({error:'Faltan datos'});
-    const r=await pool.query('UPDATE productos SET categoria=$1 WHERE id = ANY($2)', [categoria, producto_ids]);
+    const r=await pool.query('UPDATE productos SET categoria=$1 WHERE id = ANY($2) AND tenant_id=$3', [categoria, producto_ids, req.tenantId]);
     res.json({ok:true, afectados:r.rowCount});
   }catch(e){ res.status(500).json({error:e.message}); }
 });
@@ -1003,10 +1003,10 @@ app.get('/api/productos/id/:id', async (req,res)=>{ try{ const {rows}=await pool
 // Validar presupuesto antes de convertir: chequear stock y precios actuales
 app.post('/api/pedidos/:id/validar-conversion', authPerm('pedidos'), async (req,res)=>{
   try{
-    const {rows:items}=await pool.query('SELECT * FROM pedido_items WHERE pedido_id=$1', [req.params.id]);
+    const {rows:items}=await pool.query('SELECT * FROM pedido_items WHERE pedido_id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]);
     if(!items.length) return res.status(400).json({error:'Sin items'});
     const prodIds=items.map(i=>i.producto_id).filter(Boolean);
-    const {rows:prods}=await pool.query(`SELECT id,nombre,modelo,precio_base,stock FROM productos WHERE id = ANY($1)`, [prodIds]);
+    const {rows:prods}=await pool.query(`SELECT id,nombre,modelo,precio_base,stock FROM productos WHERE id = ANY($1) AND tenant_id=$2`, [prodIds, req.tenantId]);
     const prodMap={}; prods.forEach(p=>prodMap[p.id]=p);
     const cambios=[];
     items.forEach(it=>{
@@ -1034,10 +1034,10 @@ app.post('/api/precios/ajustar', authPerm('productos'), async (req,res)=>{
   try{
     const {porcentaje,categoria}=req.body;
     // Capturar precios anteriores para el historial
-    const selQ = categoria ? 'SELECT id, precio_base FROM productos WHERE categoria=$1' : 'SELECT id, precio_base FROM productos';
-    const {rows:antes} = await pool.query(selQ, categoria ? [categoria] : []);
-    if(categoria) await pool.query('UPDATE productos SET precio_base = precio_base * $1 WHERE categoria=$2', [1+porcentaje/100, categoria]);
-    else await pool.query('UPDATE productos SET precio_base = precio_base * (1+$1/100)', [porcentaje]);
+    const selQ = categoria ? 'SELECT id, precio_base FROM productos WHERE categoria=$1 AND tenant_id=$2' : 'SELECT id, precio_base FROM productos WHERE tenant_id=$1';
+    const {rows:antes} = await pool.query(selQ, categoria ? [categoria, req.tenantId] : [req.tenantId]);
+    if(categoria) await pool.query('UPDATE productos SET precio_base = precio_base * $1 WHERE categoria=$2 AND tenant_id=$3', [1+porcentaje/100, categoria, req.tenantId]);
+    else await pool.query('UPDATE productos SET precio_base = precio_base * (1+$1/100) WHERE tenant_id=$2', [porcentaje, req.tenantId]);
     // Registrar historial (masivo)
     const usr = (req.user.usuario||'admin') + ' (ajuste masivo ' + (porcentaje>0?'+':'') + porcentaje + '%' + (categoria?' '+categoria:'') + ')';
     for(const a of antes){ const nuevo = Number(a.precio_base) * (1+porcentaje/100); if(Number(a.precio_base)!==nuevo) await pool.query('INSERT INTO historial_precios (producto_id,precio_anterior,precio_nuevo,usuario) VALUES ($1,$2,$3,$4)', [a.id, a.precio_base, nuevo.toFixed(2), usr]).catch(()=>{}); }
@@ -1440,10 +1440,10 @@ app.delete('/api/pedidos/:id', authPerm('pedidos'), async (req,res)=>{ try{ cons
 app.get('/api/caja', authPerm('stats'), async (req,res)=>{
   try{
     const {desde,hasta}=req.query;
-    const cond=[]; const params=[];
+    const cond=['pp.tenant_id=$1']; const params=[req.tenantId];
     if(desde){ params.push(desde); cond.push(`pp.created_at >= $${params.length}`); }
     if(hasta){ params.push(hasta); cond.push(`pp.created_at <= $${params.length}`); }
-    const where=cond.length?`WHERE ${cond.join(' AND ')}`:'';
+    const where=`WHERE ${cond.join(' AND ')}`;
     const {rows:porMetodo}=await pool.query(
       `SELECT COALESCE(NULLIF(pp.metodo,''),'sin método') as metodo,
               COALESCE(SUM(pp.recibido),0) as recibido,
@@ -1462,7 +1462,7 @@ app.get('/api/caja', authPerm('stats'), async (req,res)=>{
 app.get('/api/reportes', authPerm('stats'), async (req,res)=>{
   try{
     const {desde, hasta, seccion_id}=req.query;
-    const cond=["p.tipo='pedido'", "LOWER(p.estado) NOT IN ('cancelado','anulado','rechazado')"]; const params=[]; let pi=1;
+    const cond=["p.tenant_id=$1", "p.tipo='pedido'", "LOWER(p.estado) NOT IN ('cancelado','anulado','rechazado')"]; const params=[req.tenantId]; let pi=2;
     if(desde){ cond.push(`p.created_at >= $${pi}`); params.push(desde); pi++; }
     if(hasta){ cond.push(`p.created_at <= $${pi}`); params.push(hasta+' 23:59:59'); pi++; }
     if(seccion_id && seccion_id!=='all'){ cond.push(`p.seccion_id = $${pi}`); params.push(seccion_id); pi++; }
@@ -1505,20 +1505,20 @@ app.get('/api/reportes', authPerm('stats'), async (req,res)=>{
 app.get('/api/stats', authPerm('stats'), async (req,res)=>{
   try{
     const {seccion_id,desde,hasta,is_test}=req.query;
-    let secWhere=''; const params=[];
-    if(seccion_id && seccion_id!=='all'){ secWhere=' AND seccion_id=$1'; params.push(seccion_id); }
-    let dateWhere=''; const dp=params.length;
-    if(desde){ dateWhere+=` AND created_at >= $${dp+1}`; params.push(desde); }
-    if(hasta){ dateWhere+=` AND created_at <= $${dp+2}`; params.push(hasta); }
-    let testWhere='';
-    if(is_test==='false') testWhere=' AND is_test=false';
-    const totalPedidos=await pool.query(`SELECT COUNT(*) FROM pedidos WHERE archivado=false${secWhere}${dateWhere}${testWhere}`, params);
-    const totalVentas=await pool.query(`SELECT COALESCE(SUM(total),0) as total FROM pedidos WHERE estado NOT IN ('cancelado') AND archivado=false${secWhere}${dateWhere}${testWhere}`, params);
-    const totalProductos=await pool.query(`SELECT COUNT(*) FROM productos WHERE 1=1${secWhere.replace('seccion_id','seccion_id')}`, seccion_id && seccion_id!=='all' ? [seccion_id] : []);
-    const totalUsuarios=await pool.query('SELECT COUNT(*) FROM usuarios WHERE rol != $1', ['admin']);
-    const ventasPorDia=await pool.query(`SELECT DATE(created_at) as fecha, COUNT(*) as cantidad, COALESCE(SUM(total),0) as total FROM pedidos WHERE estado NOT IN ('cancelado') AND archivado=false${secWhere}${dateWhere}${testWhere} GROUP BY DATE(created_at) ORDER BY fecha DESC LIMIT 30`, params);
-    const topCat=await pool.query(`SELECT pi.categoria, COUNT(*) as cantidad, SUM(pi.precio_unitario * pi.cantidad) as total FROM pedido_items pi JOIN pedidos p ON pi.pedido_id=p.id WHERE p.estado NOT IN ('cancelado')${secWhere.replace('seccion_id','p.seccion_id')}${dateWhere.replace('created_at','p.created_at')}${testWhere.replace('p.','p.')} GROUP BY pi.categoria ORDER BY total DESC LIMIT 10`, params);
-    const abandonados=await pool.query('SELECT COUNT(*) FROM carritos_abandonados WHERE recuperado=false').catch(()=>({rows:[{count:0}]}));
+    // tenant_id siempre es $1; el resto se agrega después
+    const params=[req.tenantId];
+    let secWhere=''; if(seccion_id && seccion_id!=='all'){ params.push(seccion_id); secWhere=` AND seccion_id=$${params.length}`; }
+    let dateWhere='';
+    if(desde){ params.push(desde); dateWhere+=` AND created_at >= $${params.length}`; }
+    if(hasta){ params.push(hasta); dateWhere+=` AND created_at <= $${params.length}`; }
+    let testWhere=''; if(is_test==='false') testWhere=' AND is_test=false';
+    const totalPedidos=await pool.query(`SELECT COUNT(*) FROM pedidos WHERE tenant_id=$1 AND archivado=false${secWhere}${dateWhere}${testWhere}`, params);
+    const totalVentas=await pool.query(`SELECT COALESCE(SUM(total),0) as total FROM pedidos WHERE tenant_id=$1 AND estado NOT IN ('cancelado') AND archivado=false${secWhere}${dateWhere}${testWhere}`, params);
+    const totalProductos=await pool.query(`SELECT COUNT(*) FROM productos WHERE tenant_id=$1${seccion_id && seccion_id!=='all' ? ' AND seccion_id=$2' : ''}`, seccion_id && seccion_id!=='all' ? [req.tenantId, seccion_id] : [req.tenantId]);
+    const totalUsuarios=await pool.query('SELECT COUNT(*) FROM usuarios WHERE rol != $1 AND tenant_id=$2', ['admin', req.tenantId]);
+    const ventasPorDia=await pool.query(`SELECT DATE(created_at) as fecha, COUNT(*) as cantidad, COALESCE(SUM(total),0) as total FROM pedidos WHERE tenant_id=$1 AND estado NOT IN ('cancelado') AND archivado=false${secWhere}${dateWhere}${testWhere} GROUP BY DATE(created_at) ORDER BY fecha DESC LIMIT 30`, params);
+    const topCat=await pool.query(`SELECT pi.categoria, COUNT(*) as cantidad, SUM(pi.precio_unitario * pi.cantidad) as total FROM pedido_items pi JOIN pedidos p ON pi.pedido_id=p.id WHERE p.tenant_id=$1 AND p.estado NOT IN ('cancelado')${secWhere.replace('seccion_id','p.seccion_id')}${dateWhere.replace('created_at','p.created_at')}${testWhere} GROUP BY pi.categoria ORDER BY total DESC LIMIT 10`, params);
+    const abandonados=await pool.query('SELECT COUNT(*) FROM carritos_abandonados WHERE recuperado=false AND tenant_id=$1', [req.tenantId]).catch(()=>({rows:[{count:0}]}));
     res.json({ total_pedidos: parseInt(totalPedidos.rows[0].count), total_ventas: parseFloat(totalVentas.rows[0].total), total_productos: parseInt(totalProductos.rows[0].count), total_usuarios: parseInt(totalUsuarios.rows[0].count), ventas_por_dia: ventasPorDia.rows, top_categorias: topCat.rows, carritos_abandonados: parseInt(abandonados.rows[0].count) });
   }catch(e){ res.status(500).json({error:e.message}); }
 });
