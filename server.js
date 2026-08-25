@@ -150,6 +150,19 @@ const tenantCache = new Map();
 
 // Precios mensuales de cada plan (ARS). Editables acá sin tocar nada más.
 const PLAN_PRECIOS = { basic: 30000, pro: 45000, full: 60000 };
+// Lee los precios de los planes desde la config de la plataforma (tenant 1). Si no están cargados, usa los defaults de arriba.
+async function getPlanPrecios(){
+  try{
+    const {rows}=await pool.query("SELECT clave, valor FROM configuracion WHERE tenant_id=1 AND clave IN ('precio_basic','precio_pro','precio_full')");
+    const p={...PLAN_PRECIOS};
+    for(const r of rows){
+      const plan=r.clave.replace('precio_','');
+      const val=parseInt(r.valor);
+      if(!isNaN(val) && val>=0) p[plan]=val;
+    }
+    return p;
+  }catch{ return {...PLAN_PRECIOS}; }
+}
 // ═══════════ PLANES: qué funciones trae cada plan ═══════════
 // Siempre en TODOS los planes (no son llaves): editor visual+temas, contacto+QR, checkout, pagos, envíos, favoritos, buscador, WhatsApp flotante, notificación de venta por mail.
 // Llaves (on/off) por plan. Se pueden sobreescribir por tienda con la columna features (JSON).
@@ -556,6 +569,7 @@ app.get('/api/tenants', authOwner, async (req,res)=>{
 // Estadísticas de negocio de la plataforma (para el panel de dueño)
 app.get('/api/plataforma/stats', authOwner, async (req,res)=>{
   try{
+    const PRECIOS=await getPlanPrecios();
     const {rows:tenants}=await pool.query('SELECT id, plan, estado, fecha_fin_trial, descuento_hasta, created_at FROM tenants');
     // conteos por estado y por plan
     const porEstado={activo:0, trial:0, suspendido:0, vencido:0};
@@ -567,7 +581,7 @@ app.get('/api/plataforma/stats', authOwner, async (req,res)=>{
       porEstado[t.estado]=(porEstado[t.estado]||0)+1;
       porPlan[t.plan]=(porPlan[t.plan]||0)+1;
       if(t.estado==='activo'){
-        let precio=PLAN_PRECIOS[t.plan]||0;
+        let precio=PRECIOS[t.plan]||0;
         // aplicar descuento si está vigente
         if(t.descuento_hasta && new Date(t.descuento_hasta)>hoy) precio=Math.round(precio*0.75);
         facturacionMensual+=precio;
@@ -594,11 +608,29 @@ app.get('/api/plataforma/stats', authOwner, async (req,res)=>{
       por_estado: porEstado,
       por_plan: porPlan,
       facturacion_mensual: facturacionMensual,
-      precios: PLAN_PRECIOS,
+      precios: PRECIOS,
       proximos_trials: proximosTrials,
       nuevas_por_mes: porMes,
       uso_total: uso[0],
     });
+  }catch(e){ res.status(500).json({error:e.message}); }
+});
+// Leer precios de planes (owner)
+app.get('/api/plataforma/precios', authOwner, async (req,res)=>{
+  try{ res.json(await getPlanPrecios()); }catch(e){ res.status(500).json({error:e.message}); }
+});
+// Guardar precios de planes (owner) — se guardan en la config de la plataforma (tenant 1)
+app.put('/api/plataforma/precios', authOwner, async (req,res)=>{
+  try{
+    const {basic, pro, full}=req.body;
+    const vals={precio_basic:basic, precio_pro:pro, precio_full:full};
+    for(const [clave,val] of Object.entries(vals)){
+      if(val===undefined || val===null || val==='') continue;
+      const num=parseInt(val);
+      if(isNaN(num) || num<0) continue;
+      await pool.query("INSERT INTO configuracion (tenant_id,clave,valor) VALUES (1,$1,$2) ON CONFLICT (tenant_id,clave) DO UPDATE SET valor=$2", [clave, String(num)]);
+    }
+    res.json(await getPlanPrecios());
   }catch(e){ res.status(500).json({error:e.message}); }
 });
 // Detalle de un tenant
