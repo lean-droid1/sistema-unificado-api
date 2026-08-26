@@ -221,12 +221,20 @@ const tenantDataCache = new Map();
 async function getTenantData(tenantId){
   const key=String(tenantId);
   if(tenantDataCache.has(key)) return tenantDataCache.get(key);
-  const {rows}=await pool.query('SELECT plan, estado, features FROM tenants WHERE id=$1', [tenantId]).catch(()=>({rows:[]}));
+  const {rows}=await pool.query('SELECT plan, estado, features, fecha_fin_trial FROM tenants WHERE id=$1', [tenantId]).catch(()=>({rows:[]}));
   const t=rows[0]||{plan:'full', estado:'activo', features:null};
   const base=PLAN_FEATURES[t.plan]||PLAN_FEATURES.full;
   let overrides={}; try{ overrides = t.features ? (typeof t.features==='string'?JSON.parse(t.features):t.features) : {}; }catch{}
   const features={...base, ...overrides};
-  const data={plan:t.plan||'full', estado:t.estado||'activo', features};
+  // Estado efectivo: la tienda 1 (dueño) nunca se bloquea. Si es trial y venció la fecha → vencido.
+  let estado=t.estado||'activo';
+  let diasRestantes=null;
+  if(t.fecha_fin_trial){
+    diasRestantes=Math.ceil((new Date(t.fecha_fin_trial)-new Date())/86400000);
+    if(estado==='trial' && diasRestantes<0) estado='vencido';
+  }
+  if(Number(tenantId)===1) estado='activo';
+  const data={plan:t.plan||'full', estado, features, dias_restantes:diasRestantes};
   tenantDataCache.set(key, data);
   return data;
 }
@@ -944,7 +952,7 @@ app.put('/api/me', auth(), async (req,res)=>{
 app.get('/api/config', async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM configuracion WHERE tenant_id=$1', [req.tenantId]); const cfg={}; rows.forEach(r=>cfg[r.clave]=r.valor); res.json(cfg); }catch(e){ res.status(500).json({error:e.message}); } });
 // Plan y funciones habilitadas del tenant actual (para que el frontend muestre/oculte)
 app.get('/api/mi-plan', async (req,res)=>{
-  try{ const d=await getTenantData(req.tenantId); res.json({ plan:d.plan, estado:d.estado, features:d.features }); }
+  try{ const d=await getTenantData(req.tenantId); res.json({ plan:d.plan, estado:d.estado, features:d.features, dias_restantes:d.dias_restantes }); }
   catch(e){ res.status(500).json({error:e.message}); }
 });
 app.put('/api/config', authPerm('config'), async (req,res)=>{ try{ for(const [k,v] of Object.entries(req.body)){ await pool.query("INSERT INTO configuracion (tenant_id,clave,valor) VALUES ($1,$2,$3) ON CONFLICT (tenant_id,clave) DO UPDATE SET valor=$3", [req.tenantId,k,v]); } res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
