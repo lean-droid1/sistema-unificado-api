@@ -695,7 +695,24 @@ app.put('/api/plataforma/precios', authOwner, async (req,res)=>{
     res.json(await getPlanPrecios());
   }catch(e){ res.status(500).json({error:e.message}); }
 });
-// Detalle de un tenant
+// Oferta de lanzamiento (owner): leer / guardar descuento_pct y meses
+app.get('/api/plataforma/oferta', authOwner, async (req,res)=>{
+  try{ res.json(await getOfertaLanzamiento()); }catch(e){ res.status(500).json({error:e.message}); }
+});
+app.put('/api/plataforma/oferta', authOwner, async (req,res)=>{
+  try{
+    const {descuento_pct, meses}=req.body;
+    if(descuento_pct!==undefined && descuento_pct!==null && descuento_pct!==''){
+      const p=parseInt(descuento_pct);
+      if(!isNaN(p) && p>=0 && p<=100) await pool.query("INSERT INTO configuracion (tenant_id,clave,valor) VALUES (1,'oferta_descuento_pct',$1) ON CONFLICT (tenant_id,clave) DO UPDATE SET valor=$1", [String(p)]);
+    }
+    if(meses!==undefined && meses!==null && meses!==''){
+      const m=parseInt(meses);
+      if(!isNaN(m) && m>=0) await pool.query("INSERT INTO configuracion (tenant_id,clave,valor) VALUES (1,'oferta_meses',$1) ON CONFLICT (tenant_id,clave) DO UPDATE SET valor=$1", [String(m)]);
+    }
+    res.json(await getOfertaLanzamiento());
+  }catch(e){ res.status(500).json({error:e.message}); }
+});
 app.get('/api/tenants/:id', authOwner, async (req,res)=>{
   try{ const {rows}=await pool.query('SELECT * FROM tenants WHERE id=$1', [req.params.id]); if(!rows[0]) return res.status(404).json({error:'No encontrado'}); res.json(rows[0]); }
   catch(e){ res.status(500).json({error:e.message}); }
