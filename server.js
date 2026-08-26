@@ -616,6 +616,10 @@ app.get('/api/plataforma/stats', authOwner, async (req,res)=>{
   }catch(e){ res.status(500).json({error:e.message}); }
 });
 // Leer precios de planes (owner)
+// Precios públicos (para el landing de ComerciApp, sin login)
+app.get('/api/planes-publicos', async (req,res)=>{
+  try{ res.json(await getPlanPrecios()); }catch(e){ res.json(PLAN_PRECIOS); }
+});
 app.get('/api/plataforma/precios', authOwner, async (req,res)=>{
   try{ res.json(await getPlanPrecios()); }catch(e){ res.status(500).json({error:e.message}); }
 });
