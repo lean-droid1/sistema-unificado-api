@@ -616,9 +616,59 @@ app.get('/api/plataforma/stats', authOwner, async (req,res)=>{
   }catch(e){ res.status(500).json({error:e.message}); }
 });
 // Leer precios de planes (owner)
-// Precios públicos (para el landing de ComerciApp, sin login)
+// Precios + oferta públicos (para el landing de ComerciApp, sin login)
+async function getOfertaLanzamiento(){
+  try{
+    const {rows}=await pool.query("SELECT clave, valor FROM configuracion WHERE tenant_id=1 AND clave IN ('oferta_descuento_pct','oferta_meses')");
+    let pct=25, meses=3;
+    for(const r of rows){
+      if(r.clave==='oferta_descuento_pct'){ const v=parseInt(r.valor); if(!isNaN(v)&&v>=0&&v<=100) pct=v; }
+      if(r.clave==='oferta_meses'){ const v=parseInt(r.valor); if(!isNaN(v)&&v>=0) meses=v; }
+    }
+    return { descuento_pct:pct, meses };
+  }catch{ return { descuento_pct:25, meses:3 }; }
+}
 app.get('/api/planes-publicos', async (req,res)=>{
-  try{ res.json(await getPlanPrecios()); }catch(e){ res.json(PLAN_PRECIOS); }
+  try{
+    const precios=await getPlanPrecios();
+    const oferta=await getOfertaLanzamiento();
+    res.json({ ...precios, ...oferta });
+  }catch(e){ res.json({ ...PLAN_PRECIOS, descuento_pct:25, meses:3 }); }
+});
+// Registro self-service (público, con rate limit): crea una tienda nueva con 15 días gratis Full + su admin
+app.post('/api/registro-tienda', authLimiter, async (req,res)=>{
+  const client=await pool.connect();
+  try{
+    const {nombre_tienda, slug, nombre, usuario, password, email, telefono}=req.body;
+    if(!nombre_tienda || !slug || !usuario || !password) return res.status(400).json({error:'Faltan datos obligatorios'});
+    if(String(password).length<6) return res.status(400).json({error:'La contraseña debe tener al menos 6 caracteres'});
+    const slugClean=String(slug).toLowerCase().trim().replace(/[^a-z0-9-]/g,'');
+    if(!slugClean || slugClean.length<3) return res.status(400).json({error:'La dirección web debe tener al menos 3 letras (solo letras, números y guiones)'});
+    const admUser=String(usuario).toLowerCase().trim();
+    if(admUser.length<3) return res.status(400).json({error:'El usuario debe tener al menos 3 letras'});
+    await client.query('BEGIN');
+    const {rows:ex}=await client.query('SELECT id FROM tenants WHERE slug=$1', [slugClean]);
+    if(ex[0]){ await client.query('ROLLBACK'); return res.status(400).json({error:'Esa dirección web ya está en uso, probá con otra'}); }
+    // 15 días de prueba Full
+    const dias=15;
+    const finTrial=new Date(Date.now()+dias*24*60*60*1000);
+    const {rows:tRows}=await client.query(
+      `INSERT INTO tenants (nombre,slug,plan,estado,fecha_fin_trial) VALUES ($1,$2,'full','trial',$3) RETURNING *`,
+      [nombre_tienda, slugClean, finTrial]);
+    const tid=tRows[0].id;
+    const hash=await bcrypt.hash(password, 12);
+    await client.query(
+      `INSERT INTO usuarios (tenant_id,nombre,usuario,password,rol,aprobado,activo,email,telefono) VALUES ($1,$2,$3,$4,'admin',true,true,$5,$6)`,
+      [tid, nombre||'Administrador', admUser, hash, email||null, telefono||null]);
+    const seedDesign={nombre_tienda:nombre_tienda, color_primario:'#4A69E2', color_secundario:'#232321', color_acento:'#FFA52F', fuente:'Archivo'};
+    for(const [k,v] of Object.entries(seedDesign)){
+      await client.query('INSERT INTO design_config (tenant_id,clave,valor) VALUES ($1,$2,$3) ON CONFLICT (tenant_id,clave) DO NOTHING', [tid,k,v]);
+    }
+    await client.query('COMMIT');
+    tenantCache.clear(); tenantDataCache.clear();
+    res.json({ ok:true, slug:slugClean, usuario:admUser, dias });
+  }catch(e){ await client.query('ROLLBACK').catch(()=>{}); res.status(500).json({error:e.message}); }
+  finally{ client.release(); }
 });
 app.get('/api/plataforma/precios', authOwner, async (req,res)=>{
   try{ res.json(await getPlanPrecios()); }catch(e){ res.status(500).json({error:e.message}); }
