@@ -510,6 +510,19 @@ async function migrate(){
   await pool.query(`ALTER TABLE tenants ADD COLUMN IF NOT EXISTS features JSONB`).catch(()=>{});
   // Asegurar tenant 1 (la tienda actual) — dueño, plan full, activo para siempre
   await pool.query(`INSERT INTO tenants (id, nombre, slug, plan, estado) VALUES (1, 'Tienda principal', 'principal', 'full', 'activo') ON CONFLICT (id) DO NOTHING`).catch(()=>{});
+  // Pagos de suscripción de las tiendas cliente (para el panel de dueño)
+  await pool.query(`CREATE TABLE IF NOT EXISTS pagos_suscripcion (
+    id SERIAL PRIMARY KEY,
+    tenant_id INT NOT NULL,
+    monto NUMERIC(12,2) DEFAULT 0,
+    metodo VARCHAR(50) DEFAULT '',
+    periodo VARCHAR(20) DEFAULT '',
+    notas TEXT DEFAULT '',
+    pagado_en TIMESTAMP DEFAULT NOW(),
+    proximo_venc TIMESTAMP,
+    created_at TIMESTAMP DEFAULT NOW()
+  )`).catch(e=>console.log('pagos_suscripcion warn', e.message.slice(0,80)));
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_pagos_susc_tenant ON pagos_suscripcion(tenant_id)`).catch(()=>{});
   // Que el próximo tenant creado sea id 2+ (no pisar el 1)
   await pool.query(`SELECT setval(pg_get_serial_sequence('tenants','id'), GREATEST((SELECT MAX(id) FROM tenants), 1))`).catch(()=>{});
   // Agregar tenant_id DEFAULT 1 a todas las tablas con datos por tienda.
@@ -711,6 +724,36 @@ app.put('/api/plataforma/oferta', authOwner, async (req,res)=>{
       if(!isNaN(m) && m>=0) await pool.query("INSERT INTO configuracion (tenant_id,clave,valor) VALUES (1,'oferta_meses',$1) ON CONFLICT (tenant_id,clave) DO UPDATE SET valor=$1", [String(m)]);
     }
     res.json(await getOfertaLanzamiento());
+  }catch(e){ res.status(500).json({error:e.message}); }
+});
+// Pagos de suscripción (owner)
+app.get('/api/plataforma/pagos/:tenantId', authOwner, async (req,res)=>{
+  try{ const {rows}=await pool.query('SELECT * FROM pagos_suscripcion WHERE tenant_id=$1 ORDER BY pagado_en DESC', [req.params.tenantId]); res.json(rows); }
+  catch(e){ res.status(500).json({error:e.message}); }
+});
+app.post('/api/plataforma/pagos', authOwner, async (req,res)=>{
+  try{
+    const {tenant_id, monto, metodo, periodo, notas, proximo_venc}=req.body;
+    if(!tenant_id || monto===undefined) return res.status(400).json({error:'Faltan datos'});
+    const {rows}=await pool.query(
+      `INSERT INTO pagos_suscripcion (tenant_id, monto, metodo, periodo, notas, proximo_venc) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
+      [tenant_id, parseFloat(monto)||0, metodo||'', periodo||'', notas||'', proximo_venc||null]);
+    res.json(rows[0]);
+  }catch(e){ res.status(500).json({error:e.message}); }
+});
+app.delete('/api/plataforma/pagos/:id', authOwner, async (req,res)=>{
+  try{ await pool.query('DELETE FROM pagos_suscripcion WHERE id=$1', [req.params.id]); res.json({ok:true}); }
+  catch(e){ res.status(500).json({error:e.message}); }
+});
+// Resumen de cobros del mes en curso (owner)
+app.get('/api/plataforma/cobros', authOwner, async (req,res)=>{
+  try{
+    const {rows:mes}=await pool.query(`SELECT COALESCE(SUM(monto),0)::float as total, COUNT(*)::int as cant FROM pagos_suscripcion WHERE date_trunc('month', pagado_en)=date_trunc('month', NOW())`);
+    const {rows:ult}=await pool.query(`
+      SELECT p.id, p.tenant_id, p.monto, p.metodo, p.periodo, p.pagado_en, t.nombre as tienda
+      FROM pagos_suscripcion p LEFT JOIN tenants t ON t.id=p.tenant_id
+      ORDER BY p.pagado_en DESC LIMIT 10`);
+    res.json({ mes_total: mes[0].total, mes_cant: mes[0].cant, ultimos: ult });
   }catch(e){ res.status(500).json({error:e.message}); }
 });
 app.get('/api/tenants/:id', authOwner, async (req,res)=>{
@@ -1270,7 +1313,21 @@ app.put('/api/productos/:id', authPerm('productos'), async (req,res)=>{
     res.json({ok:true});
   }catch(e){ res.status(500).json({error:e.message}); }
 });
-app.delete('/api/productos/:id', authPerm('productos'), async (req,res)=>{ try{ await pool.query('DELETE FROM productos WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.delete('/api/productos/:id', authPerm('productos'), async (req,res)=>{
+  try{
+    const id=req.params.id, tid=req.tenantId;
+    // Limpiar referencias que NO tienen ON DELETE CASCADE (evita que el borrado falle o deje huérfanos)
+    await pool.query('DELETE FROM precios_fijos WHERE producto_id=$1', [id]).catch(()=>{});
+    await pool.query('DELETE FROM historial_precios WHERE producto_id=$1', [id]).catch(()=>{});
+    await pool.query('DELETE FROM notificaciones_stock WHERE producto_id=$1', [id]).catch(()=>{});
+    // pedido_items y orden_compra_items: desvincular (dejar el histórico del pedido, sin el id)
+    await pool.query('UPDATE pedido_items SET producto_id=NULL WHERE producto_id=$1', [id]).catch(()=>{});
+    await pool.query('UPDATE orden_compra_items SET producto_id=NULL WHERE producto_id=$1', [id]).catch(()=>{});
+    const r=await pool.query('DELETE FROM productos WHERE id=$1 AND tenant_id=$2', [id, tid]);
+    if(r.rowCount===0) return res.status(404).json({error:'Producto no encontrado'});
+    res.json({ok:true});
+  }catch(e){ res.status(500).json({error:e.message}); }
+});
 app.post('/api/productos/bulk', authPerm('productos'), async (req,res)=>{
   try{
     const {productos, reemplazar, modo, faltantes, seccion_id} = req.body;
@@ -1299,7 +1356,14 @@ app.post('/api/productos/bulk', authPerm('productos'), async (req,res)=>{
         if(p.sku && p.sku.trim()){ const {rows}=await pool.query('SELECT id FROM productos WHERE sku=$1 AND tenant_id=$2 LIMIT 1', [p.sku.trim(), req.tenantId]); existe=rows[0]; }
         if(!existe && (p.nombre||p.modelo)){ const {rows}=await pool.query('SELECT id FROM productos WHERE LOWER(TRIM(nombre))=LOWER(TRIM($1)) AND tenant_id=$2 LIMIT 1', [(p.nombre||p.modelo).trim(), req.tenantId]); existe=rows[0]; }
         if(existe){
-          await pool.query('UPDATE productos SET categoria=$1, precio_base=$2, stock=$3, precio_oferta=$4 WHERE id=$5 AND tenant_id=$6', [p.categoria||'', p.precio_base||0, p.stock||0, p.precio_oferta||0, existe.id, req.tenantId]);
+          // Actualiza precio/stock/categoría y también peso/medidas (COALESCE: si el Excel trae 0/vacío, conserva el valor actual)
+          await pool.query(`UPDATE productos SET categoria=$1, precio_base=$2, stock=$3, precio_oferta=$4,
+            peso=CASE WHEN $5>0 THEN $5 ELSE peso END,
+            alto=CASE WHEN $6>0 THEN $6 ELSE alto END,
+            ancho=CASE WHEN $7>0 THEN $7 ELSE ancho END,
+            largo=CASE WHEN $8>0 THEN $8 ELSE largo END
+            WHERE id=$9 AND tenant_id=$10`,
+            [p.categoria||'', p.precio_base||0, p.stock||0, p.precio_oferta||0, p.peso||0, p.alto||0, p.ancho||0, p.largo||0, existe.id, req.tenantId]);
           actualizados++;
         } else {
           await pool.query(`INSERT INTO productos (tenant_id,seccion_id,categoria,modelo,nombre,precio_base,stock,imagen,sku,descripcion,peso,alto,ancho,largo,visible) VALUES ($14,$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,true)`, [p.seccion_id||seccion_id||1, p.categoria||'', p.modelo||'', p.nombre||p.modelo||'', p.precio_base||0, p.stock||0, p.imagen||'', p.sku||'', p.descripcion||'', p.peso||0, p.alto||0, p.ancho||0, p.largo||0, req.tenantId]);
