@@ -16,7 +16,7 @@ const app = express();
 const helmet = require('helmet');
 app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));
 
-// CORS - V4 FIX: soporta * y *.vercel.app y no bloquea preflight
+// CORS - V5 FIX: permite header X-Tenant (multi-tenant) y dominios propios de clientes
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '').split(',').map(s=>s.trim()).filter(Boolean);
 app.use(cors({
   origin: (origin, cb) => {
@@ -29,13 +29,16 @@ app.use(cors({
       if(a === '*.vercel.app' && origin.endsWith('.vercel.app')) return cb(null, true);
     }
     if (ALLOWED_ORIGINS.some(a=>a.includes('vercel.app')) && origin.includes('vercel.app')) return cb(null, true);
+    // Multi-tenant: las tiendas cliente usan sus PROPIOS dominios (comerciapp.com.ar, subdominios, y dominios propios).
+    // El tenant se resuelve por el header X-Tenant / dominio_propio en la DB, así que aceptamos cualquier origen http(s).
+    // (No es un riesgo: la autorización real la dan el JWT y el filtrado por tenant, no el origin.)
+    if (/^https?:\/\//.test(origin)) return cb(null, true);
     console.log('CORS blocked:', origin, 'allowed:', ALLOWED_ORIGINS);
-    // no bloqueamos con error, devolvemos false para que no tire 500
     return cb(null, false);
   },
   credentials: true,
   methods: ['GET','POST','PUT','DELETE','PATCH','OPTIONS'],
-  allowedHeaders: ['Content-Type','Authorization']
+  allowedHeaders: ['Content-Type','Authorization','X-Tenant']
 }));
 
 app.use(express.json({ limit: '10mb' }));
