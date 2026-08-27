@@ -562,6 +562,9 @@ async function migrate(){
       console.log('✅ Admin creado -> usuario: admin  password: '+adminPass+'  (cambialo en Mi Cuenta)');
     }
   }catch(e){ console.log('seed admin warn', e.message); }
+  // Numeración de pedidos: continuar la correlatividad histórica (arrancar en 6000).
+  // Idempotente y SIN retroceso: si ya hay pedidos >= 6000 usa MAX(id)+1, así nunca pisa un número existente.
+  await pool.query(`SELECT setval(pg_get_serial_sequence('pedidos','id'), GREATEST(6000, (SELECT COALESCE(MAX(id),0)+1 FROM pedidos)), false)`).catch(e=>console.log('seq pedidos warn', e.message.slice(0,80)));
   console.log('✅ Migrate V4 OK');
 }
 
@@ -1449,10 +1452,16 @@ app.post('/api/pedidos/:id/validar-conversion', authPerm('pedidos'), async (req,
 });
 
 // IMAGENES y VARIANTES (igual que antes)
+// Sincroniza productos.imagen con la PRIMERA foto de la galería (la principal). Si la galería queda vacía, conserva la imagen actual.
+async function syncImagenPrincipal(productoId, tenantId){
+  try{
+    await pool.query(`UPDATE productos SET imagen = COALESCE((SELECT url FROM producto_imagenes WHERE producto_id=$1 AND tenant_id=$2 ORDER BY orden ASC, id ASC LIMIT 1), imagen) WHERE id=$1 AND tenant_id=$2`, [productoId, tenantId]);
+  }catch(e){ console.log('sync img principal warn', e.message.slice(0,80)); }
+}
 app.get('/api/producto-imagenes/:producto_id', async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM producto_imagenes WHERE producto_id=$1 AND tenant_id=$2 ORDER BY orden', [req.params.producto_id, req.tenantId]); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
-app.post('/api/producto-imagenes', authPerm('productos'), async (req,res)=>{ try{ const {producto_id,url,orden}=req.body; const {rows}=await pool.query('INSERT INTO producto_imagenes (tenant_id,producto_id,url,orden) VALUES ($4,$1,$2,$3) RETURNING *', [producto_id,url,orden||0, req.tenantId]); res.json(rows[0]); }catch(e){ res.status(500).json({error:e.message}); } });
-app.delete('/api/producto-imagenes/:id', authPerm('productos'), async (req,res)=>{ try{ await pool.query('DELETE FROM producto_imagenes WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
-app.put('/api/producto-imagenes/reorder', authPerm('productos'), async (req,res)=>{ try{ const {items}=req.body; for(const it of items){ await pool.query('UPDATE producto_imagenes SET orden=$1 WHERE id=$2 AND tenant_id=$3', [it.orden,it.id, req.tenantId]); } res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.post('/api/producto-imagenes', authPerm('productos'), async (req,res)=>{ try{ const {producto_id,url,orden}=req.body; const {rows}=await pool.query('INSERT INTO producto_imagenes (tenant_id,producto_id,url,orden) VALUES ($4,$1,$2,$3) RETURNING *', [producto_id,url,orden||0, req.tenantId]); await syncImagenPrincipal(producto_id, req.tenantId); res.json(rows[0]); }catch(e){ res.status(500).json({error:e.message}); } });
+app.delete('/api/producto-imagenes/:id', authPerm('productos'), async (req,res)=>{ try{ const {rows:pv}=await pool.query('SELECT producto_id FROM producto_imagenes WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); await pool.query('DELETE FROM producto_imagenes WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); if(pv[0]) await syncImagenPrincipal(pv[0].producto_id, req.tenantId); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.put('/api/producto-imagenes/reorder', authPerm('productos'), async (req,res)=>{ try{ const {items}=req.body; for(const it of items){ await pool.query('UPDATE producto_imagenes SET orden=$1 WHERE id=$2 AND tenant_id=$3', [it.orden,it.id, req.tenantId]); } if(items&&items[0]){ const {rows:pv}=await pool.query('SELECT producto_id FROM producto_imagenes WHERE id=$1 AND tenant_id=$2', [items[0].id, req.tenantId]); if(pv[0]) await syncImagenPrincipal(pv[0].producto_id, req.tenantId); } res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 app.get('/api/variantes/:producto_id', async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM variantes WHERE producto_id=$1 AND tenant_id=$2 ORDER BY id', [req.params.producto_id, req.tenantId]); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
 app.post('/api/variantes', authPerm('productos'), async (req,res)=>{ try{ const {producto_id,nombre,valor,stock,precio_extra}=req.body; const {rows}=await pool.query('INSERT INTO variantes (tenant_id,producto_id,nombre,valor,stock,precio_extra) VALUES ($6,$1,$2,$3,$4,$5) RETURNING *', [producto_id,nombre,valor||'',stock||0,precio_extra||0, req.tenantId]); res.json(rows[0]); }catch(e){ res.status(500).json({error:e.message}); } });
 app.put('/api/variantes/:id', authPerm('productos'), async (req,res)=>{ try{ const v=req.body; await pool.query('UPDATE variantes SET nombre=$1,valor=$2,stock=$3,precio_extra=$4 WHERE id=$5', [v.nombre,v.valor,v.stock||0,v.precio_extra||0,req.params.id]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
