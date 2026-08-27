@@ -565,6 +565,8 @@ async function migrate(){
   // Numeración de pedidos: continuar la correlatividad histórica (arrancar en 6000).
   // Idempotente y SIN retroceso: si ya hay pedidos >= 6000 usa MAX(id)+1, así nunca pisa un número existente.
   await pool.query(`SELECT setval(pg_get_serial_sequence('pedidos','id'), GREATEST(6000, (SELECT COALESCE(MAX(id),0)+1 FROM pedidos)), false)`).catch(e=>console.log('seq pedidos warn', e.message.slice(0,80)));
+  // Reparar productos que tienen fotos en la galería pero quedaron con imagen vacía (bug viejo): ponerles la primera de la galería. Idempotente.
+  await pool.query(`UPDATE productos p SET imagen = (SELECT url FROM producto_imagenes pi WHERE pi.producto_id=p.id AND pi.tenant_id=p.tenant_id ORDER BY orden ASC, id ASC LIMIT 1) WHERE (p.imagen IS NULL OR p.imagen='') AND EXISTS (SELECT 1 FROM producto_imagenes pi WHERE pi.producto_id=p.id AND pi.tenant_id=p.tenant_id)`).catch(e=>console.log('repair img warn', e.message.slice(0,80)));
   console.log('✅ Migrate V4 OK');
 }
 
@@ -1316,6 +1318,9 @@ app.put('/api/productos/:id', authPerm('productos'), async (req,res)=>{
     }
     params.push(req.params.id); params.push(req.tenantId);
     await pool.query(`UPDATE productos SET ${sets.join(',')} WHERE id=$${pi} AND tenant_id=$${pi+1}`, params);
+    // La galería manda: si el producto tiene fotos en la galería, la principal (primera) es la imagen visible.
+    // Evita que un guardado con imagen vacía (en edición se oculta el recuadro viejo) borre la foto.
+    await syncImagenPrincipal(req.params.id, req.tenantId);
     res.json({ok:true});
   }catch(e){ res.status(500).json({error:e.message}); }
 });
