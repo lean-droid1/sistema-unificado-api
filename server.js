@@ -1407,6 +1407,119 @@ app.post('/api/productos/bulk', authPerm('productos'), async (req,res)=>{
 });
 app.delete('/api/categorias/:categoria', authPerm('productos'), async (req,res)=>{ try{ const {mover_a}=req.query; const destino = mover_a || 'Sin categoría'; const r=await pool.query('UPDATE productos SET categoria=$1 WHERE categoria=$2 AND tenant_id=$3', [destino, req.params.categoria, req.tenantId]); await pool.query('DELETE FROM categorias_meta WHERE categoria=$1 AND tenant_id=$2', [req.params.categoria, req.tenantId]).catch(()=>{}); res.json({ok:true, movidos:r.rowCount, destino}); }catch(e){ res.status(500).json({error:e.message}); } });
 app.delete('/api/productos/all', authPerm('productos'), async (req,res)=>{ try{ await pool.query('DELETE FROM productos WHERE tenant_id=$1', [req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+
+// ═══════════════════════════════════════════════════════════════
+// BOT DE DROPSHIPPING — sync desde el proveedor (rxzweb)
+// Auth por API key fija (header X-Bot-Key). El bot NO usa login de usuario.
+// Tenant fijo por env BOT_TENANT_ID (default 1 = tienda de Leandro).
+// Match por SKU = "RXZ-{woo_id}". Los productos que se caen del proveedor
+// quedan en stock 0 (siguen visibles como "sin stock").
+// ═══════════════════════════════════════════════════════════════
+const botAuth = (req, res, next) => {
+  const key = req.headers['x-bot-key'] || '';
+  if (!process.env.BOT_API_KEY) return res.status(503).json({ error: 'BOT_API_KEY no configurada en el servidor' });
+  if (key !== process.env.BOT_API_KEY) return res.status(401).json({ error: 'X-Bot-Key inválida' });
+  req.botTenantId = parseInt(process.env.BOT_TENANT_ID || '1', 10);
+  next();
+};
+
+// POST /api/bot/sync — recibe un lote de productos del proveedor y hace upsert por SKU.
+// Body: { productos: [ { sku, nombre, precio_base, precio_oferta, stock, imagen, categoria, envio_gratis, variantes:[{nombre,valor,stock,precio}] } ], seccion_id? }
+app.post('/api/bot/sync', botAuth, async (req, res) => {
+  const t = req.botTenantId;
+  try {
+    const { productos, seccion_id } = req.body;
+    if (!Array.isArray(productos)) return res.status(400).json({ error: 'productos debe ser un array' });
+
+    // Sección destino: la que mande el bot, o la primera que tenga slug/nombre DEPOSITO, o la primera que exista.
+    let secId = seccion_id;
+    if (!secId) {
+      const { rows } = await pool.query(
+        "SELECT id FROM secciones WHERE tenant_id=$1 AND (LOWER(slug)='deposito' OR LOWER(nombre)='deposito' OR UPPER(nombre)='DEPOSITO') ORDER BY id LIMIT 1", [t]);
+      secId = rows[0]?.id;
+      if (!secId) { const { rows: r2 } = await pool.query('SELECT id FROM secciones WHERE tenant_id=$1 ORDER BY orden, id LIMIT 1', [t]); secId = r2[0]?.id || 1; }
+    }
+
+    let insertados = 0, actualizados = 0, errores = 0;
+    const detalles = [];
+
+    for (const p of productos) {
+      const sku = String(p.sku || '').trim();
+      if (!sku) { errores++; continue; }
+      try {
+        const { rows } = await pool.query('SELECT id FROM productos WHERE sku=$1 AND tenant_id=$2 LIMIT 1', [sku, t]);
+        let prodId;
+        if (rows[0]) {
+          // Existe → actualiza SOLO precio/stock/oferta/envío gratis. NO pisa nombre/imagen/categoría (por si Leandro las editó a mano).
+          prodId = rows[0].id;
+          await pool.query(
+            `UPDATE productos SET precio_base=$1, precio_oferta=$2, stock=$3, envio_gratis=$4 WHERE id=$5 AND tenant_id=$6`,
+            [p.precio_base || 0, p.precio_oferta || 0, p.stock || 0, p.envio_gratis || false, prodId, t]);
+          actualizados++;
+        } else {
+          // Nuevo → inserta completo en la sección destino.
+          const { rows: ins } = await pool.query(
+            `INSERT INTO productos (tenant_id,seccion_id,categoria,nombre,precio_base,precio_oferta,stock,imagen,sku,envio_gratis,visible)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,true) RETURNING id`,
+            [t, secId, p.categoria || '', p.nombre || '', p.precio_base || 0, p.precio_oferta || 0, p.stock || 0, p.imagen || '', sku, p.envio_gratis || false]);
+          prodId = ins[0].id;
+          if (p.imagen) await pool.query('INSERT INTO producto_imagenes (tenant_id,producto_id,url,orden) VALUES ($1,$2,$3,0) ON CONFLICT DO NOTHING', [t, prodId, p.imagen]).catch(()=>{});
+          insertados++;
+        }
+
+        // Variantes: si el proveedor manda variantes, sincronizarlas (borra las que no vengan y upsert por nombre+valor).
+        if (Array.isArray(p.variantes) && p.variantes.length) {
+          const { rows: existentes } = await pool.query('SELECT id,nombre,valor FROM variantes WHERE producto_id=$1 AND tenant_id=$2', [prodId, t]);
+          const vistos = new Set();
+          for (const v of p.variantes) {
+            const vnom = String(v.nombre || 'Opción').trim();
+            const vval = String(v.valor || v.nombre || '').trim();
+            const key = (vnom + '|' + vval).toLowerCase();
+            vistos.add(key);
+            const ya = existentes.find(e => (String(e.nombre||'')+'|'+String(e.valor||'')).toLowerCase() === key);
+            if (ya) {
+              await pool.query('UPDATE variantes SET stock=$1, precio=$2 WHERE id=$3 AND tenant_id=$4', [v.stock || 0, v.precio || 0, ya.id, t]);
+            } else {
+              await pool.query('INSERT INTO variantes (tenant_id,producto_id,nombre,valor,stock,precio_extra,precio) VALUES ($1,$2,$3,$4,$5,0,$6)', [t, prodId, vnom, vval, v.stock || 0, v.precio || 0]);
+            }
+          }
+          // Borra variantes que ya no vienen del proveedor
+          for (const e of existentes) {
+            const key = (String(e.nombre||'')+'|'+String(e.valor||'')).toLowerCase();
+            if (!vistos.has(key)) await pool.query('DELETE FROM variantes WHERE id=$1 AND tenant_id=$2', [e.id, t]).catch(()=>{});
+          }
+        }
+      } catch (ep) {
+        errores++;
+        if (detalles.length < 10) detalles.push({ sku, error: String(ep.message || ep).slice(0, 120) });
+      }
+    }
+
+    res.json({ ok: true, seccion_id: secId, total: productos.length, insertados, actualizados, errores, detalles: detalles.length ? detalles : undefined });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/bot/skus — lista los SKU RXZ- que existen (para que el bot sepa qué poner en stock 0 si se cayeron del proveedor)
+app.get('/api/bot/skus', botAuth, async (req, res) => {
+  const t = req.botTenantId;
+  try {
+    const { rows } = await pool.query("SELECT sku, stock FROM productos WHERE tenant_id=$1 AND sku LIKE 'RXZ-%'", [t]);
+    res.json({ ok: true, skus: rows });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// POST /api/bot/stock-cero — pone stock 0 a una lista de SKU (los que se cayeron del proveedor)
+app.post('/api/bot/stock-cero', botAuth, async (req, res) => {
+  const t = req.botTenantId;
+  try {
+    const { skus } = req.body;
+    if (!Array.isArray(skus) || !skus.length) return res.json({ ok: true, afectados: 0 });
+    const r = await pool.query("UPDATE productos SET stock=0 WHERE tenant_id=$1 AND sku = ANY($2)", [t, skus]);
+    res.json({ ok: true, afectados: r.rowCount });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
 app.get('/api/productos/buscar', async (req,res)=>{ try{ const {q}=req.query; if(!q) return res.json([]); const {rows}=await pool.query("SELECT p.id,p.nombre,p.modelo,p.categoria,p.precio_base,p.stock,p.imagen,p.sku,p.codigo_barras,p.seccion_id,p.permitir_sin_stock,p.es_digital,s.nombre as seccion_nombre,s.color as seccion_color FROM productos p LEFT JOIN secciones s ON p.seccion_id=s.id WHERE p.tenant_id=$2 AND (p.nombre ILIKE $1 OR p.modelo ILIKE $1 OR p.categoria ILIKE $1 OR p.sku ILIKE $1) ORDER BY p.nombre LIMIT 20", [`%${q}%`, req.tenantId]); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
 // Buscar producto por código de barras/SKU exacto (para el escáner). Devuelve 1 producto.
 app.get('/api/productos/por-codigo/:codigo', async (req,res)=>{
