@@ -1456,6 +1456,11 @@ app.post('/api/bot/sync', botAuth, async (req, res) => {
         const categoria = String(p.categoria || '').slice(0, 200);
         const skuT = sku.slice(0, 100);
         const imagen = String(p.imagen || '');
+        const descripcion = String(p.descripcion || '');
+        const peso = Number(p.peso) || 0;
+        const alto = Number(p.alto) || 0;
+        const ancho = Number(p.ancho) || 0;
+        const largo = Number(p.largo) || 0;
         const precioBase = Number(p.precio_base) || 0;
         const precioOferta = Number(p.precio_oferta) || 0;
         const stock = parseInt(p.stock) || 0;
@@ -1473,9 +1478,9 @@ app.post('/api/bot/sync', botAuth, async (req, res) => {
         } else {
           // Nuevo → inserta completo en la sección destino.
           const { rows: ins } = await pool.query(
-            `INSERT INTO productos (tenant_id,seccion_id,categoria,modelo,nombre,precio_base,precio_oferta,stock,imagen,sku,envio_gratis,visible)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,true) RETURNING id`,
-            [t, secId, categoria, nombre, nombre, precioBase, precioOferta, stock, imagen, skuT, envioGratis]);
+            `INSERT INTO productos (tenant_id,seccion_id,categoria,modelo,nombre,descripcion,precio_base,precio_oferta,stock,imagen,sku,envio_gratis,peso,alto,ancho,largo,visible)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,true) RETURNING id`,
+            [t, secId, categoria, nombre, nombre, descripcion, precioBase, precioOferta, stock, imagen, skuT, envioGratis, peso, alto, ancho, largo]);
           prodId = ins[0].id;
           // Galería completa: todas las imágenes del proveedor
           const galeria = Array.isArray(p.imagenes) && p.imagenes.length ? p.imagenes : (imagen ? [imagen] : []);
