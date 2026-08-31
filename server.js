@@ -1435,35 +1435,49 @@ app.post('/api/bot/sync', botAuth, async (req, res) => {
     let secId = seccion_id;
     if (!secId) {
       const { rows } = await pool.query(
-        "SELECT id FROM secciones WHERE tenant_id=$1 AND (LOWER(slug)='deposito' OR LOWER(nombre)='deposito' OR UPPER(nombre)='DEPOSITO') ORDER BY id LIMIT 1", [t]);
+        "SELECT id FROM secciones WHERE tenant_id=$1 AND (LOWER(slug)='deposito' OR LOWER(nombre)='deposito' OR UPPER(nombre)='DEPOSITO' OR LOWER(nombre) LIKE '%deposito%') ORDER BY id LIMIT 1", [t]);
       secId = rows[0]?.id;
-      if (!secId) { const { rows: r2 } = await pool.query('SELECT id FROM secciones WHERE tenant_id=$1 ORDER BY orden, id LIMIT 1', [t]); secId = r2[0]?.id || 1; }
+      if (!secId) { const { rows: r2 } = await pool.query('SELECT id FROM secciones WHERE tenant_id=$1 ORDER BY orden, id LIMIT 1', [t]); secId = r2[0]?.id; }
+    }
+    if (!secId) {
+      return res.status(400).json({ error: 'No se encontró ninguna sección en la tienda. Creá al menos una sección (ej. DEPOSITO) antes de sincronizar.' });
     }
 
     let insertados = 0, actualizados = 0, errores = 0;
     const detalles = [];
+    let primerError = null;
 
     for (const p of productos) {
       const sku = String(p.sku || '').trim();
       if (!sku) { errores++; continue; }
       try {
-        const { rows } = await pool.query('SELECT id FROM productos WHERE sku=$1 AND tenant_id=$2 LIMIT 1', [sku, t]);
+        // Truncar campos de texto para no exceder los límites de VARCHAR
+        const nombre = String(p.nombre || '').slice(0, 300);
+        const categoria = String(p.categoria || '').slice(0, 200);
+        const skuT = sku.slice(0, 100);
+        const imagen = String(p.imagen || '');
+        const precioBase = Number(p.precio_base) || 0;
+        const precioOferta = Number(p.precio_oferta) || 0;
+        const stock = parseInt(p.stock) || 0;
+        const envioGratis = !!p.envio_gratis;
+
+        const { rows } = await pool.query('SELECT id FROM productos WHERE sku=$1 AND tenant_id=$2 LIMIT 1', [skuT, t]);
         let prodId;
         if (rows[0]) {
           // Existe → actualiza SOLO precio/stock/oferta/envío gratis. NO pisa nombre/imagen/categoría (por si Leandro las editó a mano).
           prodId = rows[0].id;
           await pool.query(
             `UPDATE productos SET precio_base=$1, precio_oferta=$2, stock=$3, envio_gratis=$4 WHERE id=$5 AND tenant_id=$6`,
-            [p.precio_base || 0, p.precio_oferta || 0, p.stock || 0, p.envio_gratis || false, prodId, t]);
+            [precioBase, precioOferta, stock, envioGratis, prodId, t]);
           actualizados++;
         } else {
           // Nuevo → inserta completo en la sección destino.
           const { rows: ins } = await pool.query(
             `INSERT INTO productos (tenant_id,seccion_id,categoria,nombre,precio_base,precio_oferta,stock,imagen,sku,envio_gratis,visible)
              VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,true) RETURNING id`,
-            [t, secId, p.categoria || '', p.nombre || '', p.precio_base || 0, p.precio_oferta || 0, p.stock || 0, p.imagen || '', sku, p.envio_gratis || false]);
+            [t, secId, categoria, nombre, precioBase, precioOferta, stock, imagen, skuT, envioGratis]);
           prodId = ins[0].id;
-          if (p.imagen) await pool.query('INSERT INTO producto_imagenes (tenant_id,producto_id,url,orden) VALUES ($1,$2,$3,0) ON CONFLICT DO NOTHING', [t, prodId, p.imagen]).catch(()=>{});
+          if (imagen) await pool.query('INSERT INTO producto_imagenes (tenant_id,producto_id,url,orden) VALUES ($1,$2,$3,0) ON CONFLICT DO NOTHING', [t, prodId, imagen]).catch(()=>{});
           insertados++;
         }
 
@@ -1491,11 +1505,13 @@ app.post('/api/bot/sync', botAuth, async (req, res) => {
         }
       } catch (ep) {
         errores++;
-        if (detalles.length < 10) detalles.push({ sku, error: String(ep.message || ep).slice(0, 120) });
+        const msg = String(ep.message || ep).slice(0, 160);
+        if (!primerError) primerError = msg;
+        if (detalles.length < 10) detalles.push({ sku, error: msg });
       }
     }
 
-    res.json({ ok: true, seccion_id: secId, total: productos.length, insertados, actualizados, errores, detalles: detalles.length ? detalles : undefined });
+    res.json({ ok: true, seccion_id: secId, total: productos.length, insertados, actualizados, errores, primer_error: primerError || undefined, detalles: detalles.length ? detalles : undefined });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
