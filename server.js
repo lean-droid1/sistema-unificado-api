@@ -1477,7 +1477,11 @@ app.post('/api/bot/sync', botAuth, async (req, res) => {
              VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,true) RETURNING id`,
             [t, secId, categoria, nombre, nombre, precioBase, precioOferta, stock, imagen, skuT, envioGratis]);
           prodId = ins[0].id;
-          if (imagen) await pool.query('INSERT INTO producto_imagenes (tenant_id,producto_id,url,orden) VALUES ($1,$2,$3,0) ON CONFLICT DO NOTHING', [t, prodId, imagen]).catch(()=>{});
+          // Galería completa: todas las imágenes del proveedor
+          const galeria = Array.isArray(p.imagenes) && p.imagenes.length ? p.imagenes : (imagen ? [imagen] : []);
+          for (let gi = 0; gi < galeria.length; gi++) {
+            await pool.query('INSERT INTO producto_imagenes (tenant_id,producto_id,url,orden) VALUES ($1,$2,$3,$4) ON CONFLICT DO NOTHING', [t, prodId, galeria[gi], gi]).catch(()=>{});
+          }
           insertados++;
         }
 
@@ -1518,6 +1522,34 @@ app.post('/api/bot/sync', botAuth, async (req, res) => {
 });
 
 // GET /api/bot/skus — lista los SKU RXZ- que existen (para que el bot sepa qué poner en stock 0 si se cayeron del proveedor)
+// POST /api/bot/limpiar-deposito — borra TODOS los productos de la sección DEPOSITO (para recarga limpia)
+// Úsalo UNA vez para eliminar duplicados del catálogo viejo antes de resincronizar desde cero.
+app.post('/api/bot/limpiar-deposito', botAuth, async (req, res) => {
+  const t = req.botTenantId;
+  try {
+    // Resolver sección DEPOSITO
+    let secId = req.body?.seccion_id;
+    if (!secId) {
+      const { rows } = await pool.query(
+        "SELECT id FROM secciones WHERE tenant_id=$1 AND (LOWER(slug)='deposito' OR LOWER(nombre)='deposito' OR UPPER(nombre)='DEPOSITO' OR LOWER(nombre) LIKE '%deposito%') ORDER BY id LIMIT 1", [t]);
+      secId = rows[0]?.id;
+    }
+    if (!secId) return res.status(400).json({ error: 'No se encontró la sección DEPOSITO' });
+
+    // Contar antes de borrar
+    const { rows: cnt } = await pool.query('SELECT COUNT(*)::int as n FROM productos WHERE seccion_id=$1 AND tenant_id=$2', [secId, t]);
+    const total = cnt[0]?.n || 0;
+
+    // Borrar imágenes y variantes primero (por si no hay ON DELETE CASCADE), después productos
+    await pool.query('DELETE FROM producto_imagenes WHERE tenant_id=$1 AND producto_id IN (SELECT id FROM productos WHERE seccion_id=$2 AND tenant_id=$1)', [t, secId]).catch(()=>{});
+    await pool.query('DELETE FROM variantes WHERE tenant_id=$1 AND producto_id IN (SELECT id FROM productos WHERE seccion_id=$2 AND tenant_id=$1)', [t, secId]).catch(()=>{});
+    await pool.query('DELETE FROM favoritos WHERE producto_id IN (SELECT id FROM productos WHERE seccion_id=$1 AND tenant_id=$2)', [secId, t]).catch(()=>{});
+    const r = await pool.query('DELETE FROM productos WHERE seccion_id=$1 AND tenant_id=$2', [secId, t]);
+
+    res.json({ ok: true, seccion_id: secId, borrados: r.rowCount, total_previo: total });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 app.get('/api/bot/skus', botAuth, async (req, res) => {
   const t = req.botTenantId;
   try {
