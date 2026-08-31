@@ -1473,9 +1473,9 @@ app.post('/api/bot/sync', botAuth, async (req, res) => {
         } else {
           // Nuevo → inserta completo en la sección destino.
           const { rows: ins } = await pool.query(
-            `INSERT INTO productos (tenant_id,seccion_id,categoria,nombre,precio_base,precio_oferta,stock,imagen,sku,envio_gratis,visible)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,true) RETURNING id`,
-            [t, secId, categoria, nombre, precioBase, precioOferta, stock, imagen, skuT, envioGratis]);
+            `INSERT INTO productos (tenant_id,seccion_id,categoria,modelo,nombre,precio_base,precio_oferta,stock,imagen,sku,envio_gratis,visible)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,true) RETURNING id`,
+            [t, secId, categoria, nombre, nombre, precioBase, precioOferta, stock, imagen, skuT, envioGratis]);
           prodId = ins[0].id;
           if (imagen) await pool.query('INSERT INTO producto_imagenes (tenant_id,producto_id,url,orden) VALUES ($1,$2,$3,0) ON CONFLICT DO NOTHING', [t, prodId, imagen]).catch(()=>{});
           insertados++;
