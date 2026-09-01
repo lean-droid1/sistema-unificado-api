@@ -1555,6 +1555,68 @@ app.post('/api/bot/limpiar-deposito', botAuth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// POST /api/bot/fotos-por-nombre — matchea fotos por nombre y las agrega SOLO a productos sin imagen
+// Body: { fotos: [ { nombre, imagenes: [url, ...] } ], modo: 'reportar' | 'aplicar' }
+app.post('/api/bot/fotos-por-nombre', botAuth, async (req, res) => {
+  const t = req.botTenantId;
+  try {
+    const { fotos, modo } = req.body;
+    if (!Array.isArray(fotos)) return res.status(400).json({ error: 'fotos debe ser un array' });
+    const soloReportar = (modo === 'reportar');
+
+    const norm = (s) => String(s || '')
+      .toLowerCase().trim()
+      .normalize('NFD').replace(/[\u0300-\u036f]/g, '')  // sin tildes
+      .replace(/[^a-z0-9 ]/g, ' ')                        // sin puntuación
+      .replace(/\s+/g, ' ').trim();
+
+    // Traer TODOS los productos de la tienda con su estado de imagen
+    const { rows: prods } = await pool.query(
+      `SELECT p.id, p.nombre, p.modelo, p.imagen,
+              (SELECT COUNT(*)::int FROM producto_imagenes pi WHERE pi.producto_id=p.id AND pi.tenant_id=p.tenant_id) as n_imgs
+       FROM productos p WHERE p.tenant_id=$1`, [t]);
+
+    // Indexar productos por nombre normalizado
+    const idx = {};
+    for (const p of prods) {
+      const k = norm(p.nombre || p.modelo);
+      if (k && !idx[k]) idx[k] = p;
+    }
+
+    let matcheados = 0, sinFoto = 0, yaConFoto = 0, sinMatch = 0, aplicados = 0;
+    const noMatch = [];
+
+    for (const f of fotos) {
+      const k = norm(f.nombre);
+      const prod = idx[k];
+      if (!prod) { sinMatch++; if (noMatch.length < 50) noMatch.push(f.nombre); continue; }
+      matcheados++;
+      const tieneFoto = (prod.imagen && prod.imagen.trim()) || (prod.n_imgs > 0);
+      if (tieneFoto) { yaConFoto++; continue; }
+      sinFoto++;
+      // Aplicar solo si no es modo reportar
+      if (!soloReportar) {
+        const imgs = Array.isArray(f.imagenes) && f.imagenes.length ? f.imagenes : (f.imagen ? [f.imagen] : []);
+        if (imgs.length) {
+          for (let gi = 0; gi < imgs.length; gi++) {
+            await pool.query('INSERT INTO producto_imagenes (tenant_id,producto_id,url,orden) VALUES ($1,$2,$3,$4) ON CONFLICT DO NOTHING', [t, prod.id, imgs[gi], gi]).catch(()=>{});
+          }
+          await pool.query("UPDATE productos SET imagen=$1 WHERE id=$2 AND tenant_id=$3 AND (imagen IS NULL OR imagen='')", [imgs[0], prod.id, t]);
+          aplicados++;
+        }
+      }
+    }
+
+    res.json({
+      ok: true, modo: soloReportar ? 'reportar' : 'aplicar',
+      total_fotos: fotos.length, total_productos: prods.length,
+      matcheados, ya_con_foto: yaConFoto, sin_foto_matcheados: sinFoto,
+      sin_match: sinMatch, aplicados,
+      ejemplos_sin_match: noMatch.length ? noMatch.slice(0, 30) : undefined
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 app.get('/api/bot/skus', botAuth, async (req, res) => {
   const t = req.botTenantId;
   try {
