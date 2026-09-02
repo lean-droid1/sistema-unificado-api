@@ -280,6 +280,7 @@ async function migrate(){
     `CREATE TABLE IF NOT EXISTS productos (id SERIAL PRIMARY KEY, seccion_id INT, categoria VARCHAR(200) DEFAULT '', modelo VARCHAR(200) DEFAULT '', nombre VARCHAR(300) DEFAULT '', precio_base NUMERIC(12,2) DEFAULT 0, precio_original NUMERIC(12,2) DEFAULT 0, stock INT DEFAULT 0, stock_minimo INT DEFAULT 0, imagen TEXT DEFAULT '', notas TEXT DEFAULT '', compatibilidad TEXT DEFAULT '', descripcion TEXT DEFAULT '', sku VARCHAR(100) DEFAULT '', tipo VARCHAR(20) DEFAULT 'fisico', moneda VARCHAR(10) DEFAULT 'ARS', precio_oferta NUMERIC(12,2) DEFAULT 0, envio_gratis BOOLEAN DEFAULT false, visible BOOLEAN DEFAULT true, peso NUMERIC(8,2) DEFAULT 0, alto NUMERIC(8,2) DEFAULT 0, ancho NUMERIC(8,2) DEFAULT 0, largo NUMERIC(8,2) DEFAULT 0, permitir_sin_stock BOOLEAN DEFAULT false, es_digital BOOLEAN DEFAULT false, created_at TIMESTAMP DEFAULT NOW())`,
     `CREATE TABLE IF NOT EXISTS precios_fijos (id SERIAL PRIMARY KEY, producto_id INT, lista_precio_id VARCHAR(50), precio_fijo NUMERIC(12,2), UNIQUE(producto_id, lista_precio_id))`,
     `CREATE TABLE IF NOT EXISTS historial_precios (id SERIAL PRIMARY KEY, producto_id INT, precio_anterior NUMERIC(12,2), precio_nuevo NUMERIC(12,2), usuario VARCHAR(100), created_at TIMESTAMP DEFAULT NOW())`,
+    `CREATE TABLE IF NOT EXISTS pedido_historial (id SERIAL PRIMARY KEY, tenant_id INT DEFAULT 1, pedido_id INT, tipo VARCHAR(30), detalle TEXT, usuario_id INT, usuario_nombre VARCHAR(100), created_at TIMESTAMP DEFAULT NOW())`,
     `CREATE TABLE IF NOT EXISTS pedidos (id SERIAL PRIMARY KEY, usuario_id INT, seccion_id INT, tipo VARCHAR(20) DEFAULT 'pedido', estado VARCHAR(30) DEFAULT 'pendiente', total NUMERIC(12,2) DEFAULT 0, subtotal NUMERIC(12,2) DEFAULT 0, descuento NUMERIC(12,2) DEFAULT 0, cupon_codigo VARCHAR(50) DEFAULT '', metodo_pago VARCHAR(100) DEFAULT '', notas TEXT DEFAULT '', datos_envio TEXT DEFAULT '', archivado BOOLEAN DEFAULT false, notificar_wa BOOLEAN DEFAULT true, is_test BOOLEAN DEFAULT false, costo_envio NUMERIC(12,2) DEFAULT 0, metodo_envio VARCHAR(100) DEFAULT '', cp_destino VARCHAR(20) DEFAULT '', created_at TIMESTAMP DEFAULT NOW(), updated_at TIMESTAMP DEFAULT NOW())`,
     `CREATE TABLE IF NOT EXISTS pedido_items (id SERIAL PRIMARY KEY, pedido_id INT REFERENCES pedidos(id), producto_id INT, categoria VARCHAR(200) DEFAULT '', modelo VARCHAR(200) DEFAULT '', nombre_producto VARCHAR(300) DEFAULT '', cantidad INT DEFAULT 1, precio_unitario NUMERIC(12,2) DEFAULT 0, precio_base NUMERIC(12,2) DEFAULT 0)`,
     `CREATE TABLE IF NOT EXISTS cupones (id SERIAL PRIMARY KEY, codigo VARCHAR(50) UNIQUE, tipo VARCHAR(20) DEFAULT 'porcentaje', valor NUMERIC(12,2) DEFAULT 0, secciones_ids TEXT DEFAULT '', categoria VARCHAR(200) DEFAULT '', uso_maximo INT DEFAULT 0, usos_actuales INT DEFAULT 0, monto_minimo NUMERIC(12,2) DEFAULT 0, metodo_pago VARCHAR(100) DEFAULT '', activo BOOLEAN DEFAULT true, fecha_desde DATE, fecha_hasta DATE, created_at TIMESTAMP DEFAULT NOW())`,
@@ -1999,6 +2000,12 @@ app.get('/api/pedidos/:id/pagos', auth(), async (req,res)=>{
   try{ const {rows}=await pool.query('SELECT * FROM pedido_pagos WHERE pedido_id=$1 ORDER BY created_at',[req.params.id]); res.json(rows); }
   catch(e){ res.status(500).json({error:e.message}); }
 });
+
+// Historial de cambios del pedido (estado de pago, quién y cuándo) — para auditoría
+app.get('/api/pedidos/:id/historial', authPerm('pedidos'), async (req,res)=>{
+  try{ const {rows}=await pool.query('SELECT * FROM pedido_historial WHERE pedido_id=$1 AND tenant_id=$2 ORDER BY created_at DESC',[req.params.id, req.tenantId]); res.json(rows); }
+  catch(e){ res.status(500).json({error:e.message}); }
+});
 app.post('/api/pedidos/:id/pagos', authPerm('pedidos'), async (req,res)=>{
   try{
     const {metodo,recibido,cuenta_como,ajuste_pct,nota}=req.body;
@@ -2040,6 +2047,33 @@ app.put('/api/pedidos/:id', authPerm('pedidos'), async (req,res)=>{  try{
     // ── CUENTA CORRIENTE automática al cambiar estado de pago ──
     const nuevoEstadoPago = (p.estado_pago!==undefined) ? String(p.estado_pago) : oldEstadoPago;
     if(pedUsuarioId && nuevoEstadoPago !== oldEstadoPago){
+      // ── HISTORIAL: registrar quién cambió el estado y cuándo ──
+      try {
+        const labels = { impago:'Impago', senado:'Señado', pagado:'Pagado', debe:'Debe', pendiente:'Impago' };
+        const de = labels[oldEstadoPago] || oldEstadoPago || 'Impago';
+        const a = labels[nuevoEstadoPago] || nuevoEstadoPago;
+        const rolLabel = req.user?.rol === 'admin' ? 'dueño' : (req.user?.rol === 'subadmin' ? 'empleado' : (req.user?.rol || ''));
+        const quien = (req.user?.usuario || 'sistema') + (rolLabel ? ` (${rolLabel})` : '');
+        await pool.query(
+          'INSERT INTO pedido_historial (tenant_id,pedido_id,tipo,detalle,usuario_id,usuario_nombre) VALUES ($1,$2,$3,$4,$5,$6)',
+          [req.tenantId, req.params.id, 'estado_pago', `Estado de pago: ${de} → ${a}`, req.user?.id || null, quien]
+        );
+      } catch(e){}
+      // ── AUTO-PAGO: si pasa a "pagado", registrar un pago por el total (si no hay pagos ya) ──
+      if(nuevoEstadoPago==='pagado'){
+        try {
+          const {rows:pagosYa}=await pool.query('SELECT COALESCE(SUM(cuenta_como),0) as saldado FROM pedido_pagos WHERE pedido_id=$1', [req.params.id]);
+          const yaSaldado=Number(pagosYa[0]?.saldado||0);
+          const totalPed=(p.total!==undefined)?Number(p.total):Number((oldPedRows[0]||{}).total||0);
+          const falta=totalPed-yaSaldado;
+          if(falta>0.01){
+            await pool.query(
+              'INSERT INTO pedido_pagos (tenant_id,pedido_id,metodo,monto,recibido,cuenta_como,ajuste_pct,ajuste_monto,nota) VALUES ($1,$2,$3,$4,$5,$6,0,0,$7)',
+              [req.tenantId, req.params.id, (p.metodo_pago||'efectivo'), falta, falta, falta, 'Marcado como pagado']
+            ).catch(()=>{});
+          }
+        } catch(e){}
+      }
       if(nuevoEstadoPago==='debe' && oldEstadoPago!=='debe'){
         // Pasó a "debe" (fiado): registrar cargo si no existe ya para este pedido
         const {rows:ya}=await pool.query("SELECT id FROM cuenta_corriente WHERE pedido_id=$1 AND tipo='cargo'", [req.params.id]);
