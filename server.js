@@ -2406,8 +2406,12 @@ app.get('/api/busqueda-global', optionalAuth, async (req,res)=>{
     const {q}=req.query; if(!q||q.length<2) return res.json({resultados:[], total:0});
     const {rows:secciones}=await pool.query('SELECT * FROM secciones WHERE visible=true AND tenant_id=$1 ORDER BY orden, id', [req.tenantId]);
     const resultados=[];
+    const toks = String(q).trim().split(/\s+/).filter(Boolean).slice(0,8);
+    const campos = `(coalesce(nombre,'')||' '||coalesce(modelo,'')||' '||coalesce(categoria,'')||' '||coalesce(marca,'')||' '||coalesce(sku,'')||' '||coalesce(compatibilidad,'')||' '||coalesce(descripcion,''))`;
     for(const sec of secciones){
-      const {rows}=await pool.query("SELECT id,nombre,modelo,categoria,precio_base,precio_oferta,imagen,stock,envio_gratis,permitir_sin_stock,es_digital FROM productos WHERE seccion_id=$1 AND tenant_id=$3 AND visible=true AND (nombre ILIKE $2 OR modelo ILIKE $2 OR categoria ILIKE $2 OR compatibilidad ILIKE $2 OR sku ILIKE $2) ORDER BY stock DESC LIMIT 10", [sec.id, `%${q}%`, req.tenantId]);
+      const params=[sec.id, req.tenantId]; let pi=3; const cond=[];
+      for(const tk of toks){ cond.push(`${campos} ILIKE $${pi}`); params.push(`%${tk}%`); pi++; }
+      const {rows}=await pool.query(`SELECT id,nombre,modelo,categoria,precio_base,precio_oferta,imagen,stock,envio_gratis,permitir_sin_stock,es_digital,usa_variantes,(SELECT MIN(CASE WHEN v.precio_oferta>0 AND v.precio_oferta<v.precio THEN v.precio_oferta ELSE v.precio END) FROM variantes v WHERE v.producto_id=productos.id AND v.tenant_id=productos.tenant_id AND v.precio>0) AS precio_desde,(SELECT v.moneda FROM variantes v WHERE v.producto_id=productos.id AND v.tenant_id=productos.tenant_id AND v.precio>0 ORDER BY (CASE WHEN v.precio_oferta>0 AND v.precio_oferta<v.precio THEN v.precio_oferta ELSE v.precio END) ASC LIMIT 1) AS moneda_desde FROM productos WHERE seccion_id=$1 AND tenant_id=$2 AND visible=true${cond.length?' AND '+cond.join(' AND '):''} ORDER BY stock DESC LIMIT 50`, params);
       if(rows.length){ const hidePrice=sec.slug==='mayorista' && !req.user; resultados.push({seccion:sec, productos: hidePrice? rows.map(r=>({...r, precio_base:0, precio_oferta:0})) : rows}); }
     }
     res.json({resultados, total: resultados.reduce((s,r)=>s+r.productos.length,0)});
