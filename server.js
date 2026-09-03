@@ -1215,7 +1215,11 @@ app.get('/api/productos', optionalAuth, async (req,res)=>{
   try{
     const {q,categoria,page=1,limit=50,seccion_id,marca}=req.query;
     let where=[`tenant_id=$1`, 'visible=true']; const params=[req.tenantId]; let pi=2;
-    if(q){ where.push(`(nombre ILIKE $${pi} OR modelo ILIKE $${pi} OR categoria ILIKE $${pi} OR sku ILIKE $${pi} OR descripcion ILIKE $${pi})`); params.push(`%${q}%`); pi++; }
+    if(q){
+      const toks = String(q).trim().split(/\s+/).filter(Boolean).slice(0,8);
+      const campos = `(coalesce(nombre,'')||' '||coalesce(modelo,'')||' '||coalesce(categoria,'')||' '||coalesce(marca,'')||' '||coalesce(sku,'')||' '||coalesce(compatibilidad,'')||' '||coalesce(descripcion,''))`;
+      for(const tk of toks){ where.push(`${campos} ILIKE $${pi}`); params.push(`%${tk}%`); pi++; }
+    }
     if(categoria){ where.push(`categoria=$${pi}`); params.push(categoria); pi++; }
     if(seccion_id){ where.push(`seccion_id=$${pi}`); params.push(seccion_id); pi++; }
     if(marca){ where.push(`marca ILIKE $${pi}`); params.push(`%${marca}%`); pi++; }
@@ -1223,7 +1227,7 @@ app.get('/api/productos', optionalAuth, async (req,res)=>{
     const countQ=`SELECT COUNT(*) FROM productos WHERE ${where.join(' AND ')}`;
     const {rows:cRows}=await pool.query(countQ, params);
     const total=parseInt(cRows[0].count);
-    const query=`SELECT * FROM productos WHERE ${where.join(' AND ')} ORDER BY created_at DESC LIMIT $${pi} OFFSET $${pi+1}`;
+    const query=`SELECT *, (SELECT MIN(CASE WHEN v.precio_oferta>0 AND v.precio_oferta<v.precio THEN v.precio_oferta ELSE v.precio END) FROM variantes v WHERE v.producto_id=productos.id AND v.tenant_id=productos.tenant_id AND v.precio>0) AS precio_desde, (SELECT v.moneda FROM variantes v WHERE v.producto_id=productos.id AND v.tenant_id=productos.tenant_id AND v.precio>0 ORDER BY (CASE WHEN v.precio_oferta>0 AND v.precio_oferta<v.precio THEN v.precio_oferta ELSE v.precio END) ASC LIMIT 1) AS moneda_desde FROM productos WHERE ${where.join(' AND ')} ORDER BY created_at DESC LIMIT $${pi} OFFSET $${pi+1}`;
     const {rows}=await pool.query(query, [...params, parseInt(limit), offset]);
     // hide price mayorista sin login
     let result=rows;
@@ -1650,7 +1654,7 @@ app.post('/api/bot/stock-cero', botAuth, async (req, res) => {
     res.json({ ok: true, afectados: r.rowCount });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
-app.get('/api/productos/buscar', async (req,res)=>{ try{ const {q}=req.query; if(!q) return res.json([]); const {rows}=await pool.query("SELECT p.id,p.nombre,p.modelo,p.categoria,p.precio_base,p.stock,p.imagen,p.sku,p.codigo_barras,p.seccion_id,p.permitir_sin_stock,p.es_digital,s.nombre as seccion_nombre,s.color as seccion_color FROM productos p LEFT JOIN secciones s ON p.seccion_id=s.id WHERE p.tenant_id=$2 AND (p.nombre ILIKE $1 OR p.modelo ILIKE $1 OR p.categoria ILIKE $1 OR p.sku ILIKE $1) ORDER BY p.nombre LIMIT 20", [`%${q}%`, req.tenantId]); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
+app.get('/api/productos/buscar', async (req,res)=>{ try{ const {q}=req.query; if(!q) return res.json([]); const toks=String(q).trim().split(/\s+/).filter(Boolean).slice(0,8); const campos=`(coalesce(p.nombre,'')||' '||coalesce(p.modelo,'')||' '||coalesce(p.categoria,'')||' '||coalesce(p.marca,'')||' '||coalesce(p.sku,'')||' '||coalesce(p.compatibilidad,''))`; const cond=[]; const params=[req.tenantId]; let pi=2; for(const tk of toks){ cond.push(`${campos} ILIKE $${pi}`); params.push(`%${tk}%`); pi++; } const whereTok=cond.length?(' AND '+cond.join(' AND ')):''; const {rows}=await pool.query(`SELECT p.id,p.nombre,p.modelo,p.categoria,p.precio_base,p.precio_oferta,p.stock,p.imagen,p.sku,p.codigo_barras,p.seccion_id,p.permitir_sin_stock,p.es_digital,p.usa_variantes,(SELECT MIN(CASE WHEN v.precio_oferta>0 AND v.precio_oferta<v.precio THEN v.precio_oferta ELSE v.precio END) FROM variantes v WHERE v.producto_id=p.id AND v.tenant_id=p.tenant_id AND v.precio>0) AS precio_desde,s.nombre as seccion_nombre,s.color as seccion_color FROM productos p LEFT JOIN secciones s ON p.seccion_id=s.id WHERE p.tenant_id=$1${whereTok} ORDER BY p.nombre LIMIT 20`, params); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
 // Buscar producto por código de barras/SKU exacto (para el escáner). Devuelve 1 producto.
 app.get('/api/productos/por-codigo/:codigo', async (req,res)=>{
   try{
@@ -2434,7 +2438,7 @@ app.get('/api/leads', authPerm('stats'), async (req,res)=>{ try{ const {rows}=aw
 app.put('/api/leads/:id', authPerm('stats'), async (req,res)=>{ try{ await pool.query('UPDATE leads SET contactado=$1 WHERE id=$2 AND tenant_id=$3', [req.body.contactado!==false, req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 app.delete('/api/leads/:id', authPerm('stats'), async (req,res)=>{ try{ await pool.query('DELETE FROM leads WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 
-app.get('/api/favoritos', auth(), async (req,res)=>{ try{ const {rows}=await pool.query('SELECT f.*, p.nombre, p.modelo, p.imagen, p.precio_base, p.precio_oferta, p.stock, p.categoria, p.seccion_id FROM favoritos f JOIN productos p ON f.producto_id=p.id WHERE f.usuario_id=$1 AND f.tenant_id=$2 ORDER BY f.created_at DESC', [req.user.id, req.tenantId]); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
+app.get('/api/favoritos', auth(), async (req,res)=>{ try{ const {rows}=await pool.query('SELECT f.*, p.nombre, p.modelo, p.imagen, p.precio_base, p.precio_oferta, p.stock, p.categoria, p.seccion_id, p.usa_variantes FROM favoritos f JOIN productos p ON f.producto_id=p.id WHERE f.usuario_id=$1 AND f.tenant_id=$2 ORDER BY f.created_at DESC', [req.user.id, req.tenantId]); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
 app.post('/api/favoritos/:producto_id', auth(), async (req,res)=>{ try{ await pool.query('INSERT INTO favoritos (usuario_id,producto_id,tenant_id) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING', [req.user.id, req.params.producto_id, req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 app.delete('/api/favoritos/:producto_id', auth(), async (req,res)=>{ try{ await pool.query('DELETE FROM favoritos WHERE usuario_id=$1 AND producto_id=$2 AND tenant_id=$3', [req.user.id, req.params.producto_id, req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 
