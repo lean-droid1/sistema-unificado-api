@@ -315,6 +315,20 @@ async function migrate(){
     `ALTER TABLE secciones ADD COLUMN IF NOT EXISTS cp_origen VARCHAR(20) DEFAULT '1888'`,
     `ALTER TABLE historial_precios ADD COLUMN IF NOT EXISTS usuario VARCHAR(100) DEFAULT ''`,
     `ALTER TABLE variantes ADD COLUMN IF NOT EXISTS precio NUMERIC(12,2) DEFAULT 0`,
+    // ── Atributos + variantes combinadas de N dimensiones (modelo Empretienda) ──
+    `CREATE TABLE IF NOT EXISTS producto_atributos (id SERIAL PRIMARY KEY, tenant_id INT DEFAULT 1, producto_id INT REFERENCES productos(id) ON DELETE CASCADE, nombre VARCHAR(120) DEFAULT '', orden INT DEFAULT 0)`,
+    `CREATE TABLE IF NOT EXISTS producto_atributo_valores (id SERIAL PRIMARY KEY, tenant_id INT DEFAULT 1, atributo_id INT REFERENCES producto_atributos(id) ON DELETE CASCADE, valor VARCHAR(120) DEFAULT '', orden INT DEFAULT 0)`,
+    `ALTER TABLE variantes ADD COLUMN IF NOT EXISTS combinacion JSONB DEFAULT '{}'::jsonb`,
+    `ALTER TABLE variantes ADD COLUMN IF NOT EXISTS precio_oferta NUMERIC(12,2) DEFAULT 0`,
+    `ALTER TABLE variantes ADD COLUMN IF NOT EXISTS moneda VARCHAR(10) DEFAULT 'ARS'`,
+    `ALTER TABLE variantes ADD COLUMN IF NOT EXISTS orden INT DEFAULT 0`,
+    `ALTER TABLE variantes ADD COLUMN IF NOT EXISTS sku VARCHAR(120) DEFAULT ''`,
+    `ALTER TABLE productos ADD COLUMN IF NOT EXISTS usa_variantes BOOLEAN DEFAULT false`,
+    `ALTER TABLE pedido_items ADD COLUMN IF NOT EXISTS variante_id INT`,
+    `ALTER TABLE pedido_items ADD COLUMN IF NOT EXISTS variante_combinacion TEXT DEFAULT ''`,
+    `CREATE INDEX IF NOT EXISTS idx_prod_atrib_prod ON producto_atributos(producto_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_prod_atrib_val_atrib ON producto_atributo_valores(atributo_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_variantes_prod ON variantes(producto_id)`,
     `CREATE TABLE IF NOT EXISTS categorias_meta (categoria VARCHAR(200) PRIMARY KEY, orden INT DEFAULT 0, visible BOOLEAN DEFAULT true)`,
     `ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS estado_pago VARCHAR(20) DEFAULT 'impago'`,
     `ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS sena NUMERIC(12,2) DEFAULT 0`,
@@ -1702,6 +1716,52 @@ app.post('/api/variantes', authPerm('productos'), async (req,res)=>{ try{ const 
 app.put('/api/variantes/:id', authPerm('productos'), async (req,res)=>{ try{ const v=req.body; await pool.query('UPDATE variantes SET nombre=$1,valor=$2,stock=$3,precio_extra=$4,precio=$5 WHERE id=$6', [v.nombre,v.valor,v.stock||0,v.precio_extra||0,v.precio||0,req.params.id]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 app.delete('/api/variantes/:id', authPerm('productos'), async (req,res)=>{ try{ await pool.query('DELETE FROM variantes WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 
+// ── ATRIBUTOS + VARIANTES COMBINADAS (modelo Empretienda) ──
+// Lee atributos + valores + variantes (combinaciones) de un producto en una sola llamada
+app.get('/api/productos/:id/variantes-full', async (req,res)=>{
+  try{
+    const t=req.tenantId; const pid=req.params.id;
+    const {rows:prod}=await pool.query('SELECT usa_variantes FROM productos WHERE id=$1 AND tenant_id=$2',[pid,t]);
+    if(!prod[0]) return res.status(404).json({error:'Producto no encontrado'});
+    const {rows:atrs}=await pool.query('SELECT id,nombre,orden FROM producto_atributos WHERE producto_id=$1 AND tenant_id=$2 ORDER BY orden,id',[pid,t]);
+    const atributos=[];
+    for(const a of atrs){
+      const {rows:vals}=await pool.query('SELECT valor FROM producto_atributo_valores WHERE atributo_id=$1 AND tenant_id=$2 ORDER BY orden,id',[a.id,t]);
+      atributos.push({ nombre:a.nombre, orden:a.orden, valores: vals.map(v=>v.valor) });
+    }
+    const {rows:variantes}=await pool.query('SELECT id,combinacion,precio,precio_oferta,stock,moneda,sku,orden FROM variantes WHERE producto_id=$1 AND tenant_id=$2 ORDER BY orden,id',[pid,t]);
+    res.json({ usa_variantes: !!prod[0].usa_variantes, atributos, variantes });
+  }catch(e){ res.status(500).json({error:e.message}); }
+});
+
+// Guarda TODO junto: reemplaza atributos, valores y variantes del producto (transaccional)
+app.put('/api/productos/:id/variantes-full', authPerm('productos'), async (req,res)=>{
+  const client=await pool.connect();
+  try{
+    const t=req.tenantId; const pid=req.params.id;
+    const { usa_variantes, atributos=[], variantes=[] } = req.body;
+    await client.query('BEGIN');
+    await client.query('UPDATE productos SET usa_variantes=$1 WHERE id=$2 AND tenant_id=$3',[!!usa_variantes, pid, t]);
+    await client.query('DELETE FROM producto_atributos WHERE producto_id=$1 AND tenant_id=$2',[pid,t]); // cascade borra valores
+    await client.query('DELETE FROM variantes WHERE producto_id=$1 AND tenant_id=$2',[pid,t]);
+    let ao=0;
+    for(const a of atributos){
+      const nom=(a.nombre||'').trim(); if(!nom) continue;
+      const {rows:ar}=await client.query('INSERT INTO producto_atributos (tenant_id,producto_id,nombre,orden) VALUES ($1,$2,$3,$4) RETURNING id',[t,pid,nom,ao++]);
+      let vo=0;
+      for(const v of (a.valores||[])){ const val=(''+v).trim(); if(!val) continue; await client.query('INSERT INTO producto_atributo_valores (tenant_id,atributo_id,valor,orden) VALUES ($1,$2,$3,$4)',[t,ar[0].id,val,vo++]); }
+    }
+    let vo2=0;
+    for(const v of variantes){
+      await client.query('INSERT INTO variantes (tenant_id,producto_id,combinacion,precio,precio_oferta,stock,moneda,sku,orden,nombre,valor) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)',
+        [t,pid, JSON.stringify(v.combinacion||{}), v.precio||0, v.precio_oferta||0, v.stock||0, v.moneda||'ARS', v.sku||'', vo2++, '', '']);
+    }
+    await client.query('COMMIT');
+    res.json({ok:true});
+  }catch(e){ await client.query('ROLLBACK').catch(()=>{}); res.status(500).json({error:e.message}); }
+  finally{ client.release(); }
+});
+
 // PRECIOS
 app.post('/api/precios/ajustar', authPerm('productos'), async (req,res)=>{
   try{
@@ -1887,16 +1947,21 @@ app.post('/api/pedidos', auth(), async (req,res)=>{
     const {rows}=await client.query('INSERT INTO pedidos (tenant_id,usuario_id,seccion_id,tipo,metodo_pago,notas,cupon_codigo,subtotal,descuento,total,datos_envio,notificar_wa,costo_envio,metodo_envio,cp_destino,is_test,estado,estado_pago,sena,es_reserva) VALUES ($20,$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19) RETURNING *',
       [pedidoUserId, seccion_id, tipo||'pedido', metodo_pago||'', notas||'', cupon_codigo||'', subtotal||0, descuento||0, total||0, datos_envio||'', notificar_wa!==false, costo_envio||0, metodo_envio||'', cp_destino||'', is_test||false, req.body.estado||'pendiente', req.body.estado_pago||'impago', req.body.sena||0, esReserva, req.tenantId]);
     for(const item of (items||[])){
-      await client.query('INSERT INTO pedido_items (tenant_id,pedido_id,producto_id,categoria,modelo,nombre_producto,cantidad,precio_unitario,precio_base) VALUES ($9,$1,$2,$3,$4,$5,$6,$7,$8)',
-        [rows[0].id, item.producto_id, item.categoria||'', item.modelo||'', item.nombre_producto||'', item.cantidad||1, item.precio_unitario||0, item.precio_base||0, req.tenantId]);
+      await client.query('INSERT INTO pedido_items (tenant_id,pedido_id,producto_id,categoria,modelo,nombre_producto,cantidad,precio_unitario,precio_base,variante_id,variante_combinacion) VALUES ($9,$1,$2,$3,$4,$5,$6,$7,$8,$10,$11)',
+        [rows[0].id, item.producto_id, item.categoria||'', item.modelo||'', item.nombre_producto||'', item.cantidad||1, item.precio_unitario||0, item.precio_base||0, req.tenantId, item.variante_id||null, item.variante_label||item.variante_combinacion||'']);
       // Descontar stock solo si NO es presupuesto
       if (!esPresupuesto) {
+      if(item.variante_id){
+        // Variante: descontar stock de la combinación elegida
+        await client.query('UPDATE variantes SET stock = GREATEST(0, stock - $1) WHERE id=$2 AND tenant_id=$3', [item.cantidad||1, item.variante_id, req.tenantId]);
+      } else {
       const {rows:prod}=await client.query('SELECT permitir_sin_stock, es_digital, es_preventa FROM productos WHERE id=$1', [item.producto_id]);
       if(prod[0] && (prod[0].es_preventa || item._preventa)){
         // Preventa: aumentar reservado, NO tocar stock físico
         await client.query('UPDATE productos SET preventa_reservado = COALESCE(preventa_reservado,0) + $1 WHERE id=$2', [item.cantidad||1, item.producto_id]);
       } else if(prod[0] && !prod[0].permitir_sin_stock && !prod[0].es_digital){
         await client.query('UPDATE productos SET stock = GREATEST(0, stock - $1) WHERE id=$2 AND permitir_sin_stock=false AND es_digital=false', [item.cantidad||1, item.producto_id]);
+      }
       }
       }
     }
@@ -1941,6 +2006,17 @@ app.post('/api/pedidos/multi', auth(), async (req,res)=>{
       for(const item of (items||[])){
         const {rows:prod}=await client.query('SELECT stock, permitir_sin_stock, es_digital, seccion_id, es_preventa, preventa_cupo, preventa_reservado FROM productos WHERE id=$1', [item.producto_id]);
         if(!prod[0]) continue;
+        // Variante: validar stock de la combinación elegida
+        if(item.variante_id){
+          const {rows:vr}=await client.query('SELECT stock FROM variantes WHERE id=$1 AND tenant_id=$2', [item.variante_id, req.tenantId]);
+          const vsec=await client.query('SELECT ignorar_stock, permitir_sin_stock FROM secciones WHERE id=$1', [prod[0].seccion_id]).then(r=>r.rows[0]).catch(()=>null);
+          const vSinStock = prod[0].permitir_sin_stock || prod[0].es_digital || vsec?.permitir_sin_stock || vsec?.ignorar_stock;
+          if(vr[0] && !vSinStock && Number(vr[0].stock) < (item.cantidad||1)){
+            await client.query('ROLLBACK');
+            return res.status(400).json({error:`Sin stock: ${item.nombre_producto||''} (disponible: ${vr[0].stock})`});
+          }
+          continue;
+        }
         // Preventa: validar contra cupo (si cupo>0). Cupo 0 = ilimitado
         if(item._preventa || prod[0].es_preventa){
           const cupo=Number(prod[0].preventa_cupo)||0;
@@ -1961,13 +2037,17 @@ app.post('/api/pedidos/multi', auth(), async (req,res)=>{
       const {rows}=await client.query('INSERT INTO pedidos (tenant_id,usuario_id,seccion_id,tipo,metodo_pago,notas,cupon_codigo,subtotal,descuento,total,datos_envio,costo_envio,metodo_envio,cp_destino,is_test,datos_facturacion,estado_pago) VALUES ($17,$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) RETURNING *',
         [req.user.id, seccion_id, 'pedido', metodo_pago||'', notas||'', cupon_codigo||'', subtotal||0, descuento||0, total||0, datos_envio||'', costo_envio||0, metodo_envio||'', cp_destino||'', is_test||false, ped.datos_facturacion||'', ped.estado_pago||'impago', req.tenantId]);
       for(const item of (items||[])){
-        await client.query('INSERT INTO pedido_items (tenant_id,pedido_id,producto_id,categoria,modelo,nombre_producto,cantidad,precio_unitario,precio_base) VALUES ($9,$1,$2,$3,$4,$5,$6,$7,$8)',
-          [rows[0].id, item.producto_id, item.categoria||'', item.modelo||'', item.nombre_producto||'', item.cantidad||1, item.precio_unitario||0, item.precio_base||0, req.tenantId]);
+        await client.query('INSERT INTO pedido_items (tenant_id,pedido_id,producto_id,categoria,modelo,nombre_producto,cantidad,precio_unitario,precio_base,variante_id,variante_combinacion) VALUES ($9,$1,$2,$3,$4,$5,$6,$7,$8,$10,$11)',
+          [rows[0].id, item.producto_id, item.categoria||'', item.modelo||'', item.nombre_producto||'', item.cantidad||1, item.precio_unitario||0, item.precio_base||0, req.tenantId, item.variante_id||null, item.variante_label||item.variante_combinacion||'']);
+        if(item.variante_id){
+          await client.query('UPDATE variantes SET stock = GREATEST(0, stock - $1) WHERE id=$2 AND tenant_id=$3', [item.cantidad||1, item.variante_id, req.tenantId]);
+        } else {
         const {rows:pr}=await client.query('SELECT permitir_sin_stock, es_digital, es_preventa FROM productos WHERE id=$1', [item.producto_id]);
         if(pr[0] && (pr[0].es_preventa || item._preventa)){
           await client.query('UPDATE productos SET preventa_reservado = COALESCE(preventa_reservado,0) + $1 WHERE id=$2', [item.cantidad||1, item.producto_id]);
         } else if(pr[0] && !pr[0].permitir_sin_stock && !pr[0].es_digital){
           await client.query('UPDATE productos SET stock = GREATEST(0, stock - $1) WHERE id=$2 AND permitir_sin_stock=false AND es_digital=false', [item.cantidad||1, item.producto_id]);
+        }
         }
       }
       creados.push(rows[0]);
@@ -2138,7 +2218,7 @@ app.put('/api/pedidos/:id', authPerm('pedidos'), async (req,res)=>{  try{
 });
 app.post('/api/pedidos/:id/archivar', authPerm('pedidos'), async (req,res)=>{ try{ await pool.query('UPDATE pedidos SET archivado=true WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 app.post('/api/pedidos/:id/desarchivar', authPerm('pedidos'), async (req,res)=>{ try{ await pool.query('UPDATE pedidos SET archivado=false WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
-app.delete('/api/pedidos/:id', authPerm('pedidos'), async (req,res)=>{ try{ const {rows:oep}=await pool.query('SELECT estado, tipo FROM pedidos WHERE id=$1 AND tenant_id=$2',[req.params.id, req.tenantId]); if(!oep[0]) return res.status(404).json({error:'No encontrado'}); const oe=String((oep[0]||{}).estado||'').toLowerCase(); const ot=String((oep[0]||{}).tipo||''); const afectabaStock = ot==='pedido' && !['cancelado','anulado','rechazado'].includes(oe); const {rows:its}=await pool.query('SELECT producto_id, cantidad FROM pedido_items WHERE pedido_id=$1',[req.params.id]); const preIds=[]; if(afectabaStock){ for(const it of its){ if(!it.producto_id) continue; const {rows:pp}=await pool.query('SELECT es_preventa FROM productos WHERE id=$1',[it.producto_id]); if(pp[0] && pp[0].es_preventa){ preIds.push(it.producto_id); } else { await pool.query('UPDATE productos SET stock=GREATEST(0, stock + $1) WHERE id=$2 AND permitir_sin_stock=false AND es_digital=false',[it.cantidad||0, it.producto_id]); } } } await pool.query('DELETE FROM pedido_items WHERE pedido_id=$1', [req.params.id]); await pool.query('DELETE FROM pedidos WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); for(const pid of preIds) await recalcReservado(pid); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.delete('/api/pedidos/:id', authPerm('pedidos'), async (req,res)=>{ try{ const {rows:oep}=await pool.query('SELECT estado, tipo FROM pedidos WHERE id=$1 AND tenant_id=$2',[req.params.id, req.tenantId]); if(!oep[0]) return res.status(404).json({error:'No encontrado'}); const oe=String((oep[0]||{}).estado||'').toLowerCase(); const ot=String((oep[0]||{}).tipo||''); const afectabaStock = ot==='pedido' && !['cancelado','anulado','rechazado'].includes(oe); const {rows:its}=await pool.query('SELECT producto_id, cantidad, variante_id FROM pedido_items WHERE pedido_id=$1',[req.params.id]); const preIds=[]; if(afectabaStock){ for(const it of its){ if(it.variante_id){ await pool.query('UPDATE variantes SET stock=GREATEST(0, stock + $1) WHERE id=$2 AND tenant_id=$3',[it.cantidad||0, it.variante_id, req.tenantId]); continue; } if(!it.producto_id) continue; const {rows:pp}=await pool.query('SELECT es_preventa FROM productos WHERE id=$1',[it.producto_id]); if(pp[0] && pp[0].es_preventa){ preIds.push(it.producto_id); } else { await pool.query('UPDATE productos SET stock=GREATEST(0, stock + $1) WHERE id=$2 AND permitir_sin_stock=false AND es_digital=false',[it.cantidad||0, it.producto_id]); } } } await pool.query('DELETE FROM pedido_items WHERE pedido_id=$1', [req.params.id]); await pool.query('DELETE FROM pedidos WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); for(const pid of preIds) await recalcReservado(pid); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 
 // STATS
 // REPORTES: más vendidos, ventas por sección, por mes, ganancias
