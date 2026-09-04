@@ -1214,7 +1214,10 @@ app.get('/api/productos/novedades', async (req,res)=>{
 app.get('/api/productos', optionalAuth, async (req,res)=>{
   try{
     const {q,categoria,page=1,limit=50,seccion_id,marca}=req.query;
-    let where=[`tenant_id=$1`, 'visible=true']; const params=[req.tenantId]; let pi=2;
+    const esAdminReq = req.user && ['admin', 'subadmin'].includes(req.user.rol);
+    const incluirOcultos = esAdminReq && (req.query.incluir_ocultos === '1' || req.query.incluir_ocultos === 'true');
+    let where = [`tenant_id=$1`]; if (!incluirOcultos) where.push('visible=true');
+    const params = [req.tenantId]; let pi = 2;
     if(q){
       const toks = String(q).trim().split(/\s+/).filter(Boolean).slice(0,8);
       const campos = `(coalesce(nombre,'')||' '||coalesce(modelo,'')||' '||coalesce(categoria,'')||' '||coalesce(marca,'')||' '||coalesce(sku,'')||' '||coalesce(compatibilidad,'')||' '||coalesce(descripcion,''))`;
