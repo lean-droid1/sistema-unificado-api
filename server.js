@@ -1001,7 +1001,10 @@ app.post('/api/register', async (req,res)=>{
     if(!usuario||usuario.length<3) return res.status(400).json({error:'Min 3 caracteres'});
     const pwError=validatePassword(password); if(pwError) return res.status(400).json({error:pwError});
     const hash=await bcrypt.hash(password,12);
-    const {rows}=await pool.query('INSERT INTO usuarios (tenant_id,nombre,usuario,password,telefono,email,direccion,nombre_fantasia,aprobado,activo) VALUES ($8,$1,$2,$3,$4,$5,$6,$7,false,false) RETURNING id,nombre,usuario,telefono,email,aprobado,activo', [nombre,usuario,hash,telefono||'',email||'',direccion||'',nombre_fantasia||'', req.tenantId]);
+    const {rows:cfgAprob}=await pool.query("SELECT valor FROM configuracion WHERE tenant_id=$1 AND clave='registro_requiere_aprobacion'", [req.tenantId]);
+    const requiereAprob = cfgAprob[0] && cfgAprob[0].valor==='true';
+    const aprobado = !requiereAprob; // por defecto (sin config) el registro entra DIRECTO
+    const {rows}=await pool.query('INSERT INTO usuarios (tenant_id,nombre,usuario,password,telefono,email,direccion,nombre_fantasia,aprobado,activo) VALUES ($8,$1,$2,$3,$4,$5,$6,$7,$9,$9) RETURNING id,nombre,usuario,telefono,email,aprobado,activo', [nombre,usuario,hash,telefono||'',email||'',direccion||'',nombre_fantasia||'', req.tenantId, aprobado]);
     res.json(rows[0]);
   }catch(e){ res.status(400).json({error:e.message.includes('duplicate')?'Usuario ya existe':e.message}); }
 });
