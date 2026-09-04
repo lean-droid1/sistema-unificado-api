@@ -1316,14 +1316,39 @@ app.post('/api/productos', authPerm('productos'), async (req,res)=>{
   }catch(e){ res.status(500).json({error:e.message}); }
 });
 app.post('/api/productos/:id/duplicar', authPerm('productos'), async (req,res)=>{
+  const client=await pool.connect();
   try{
-    const {rows:orig}=await pool.query('SELECT * FROM productos WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]);
-    if(!orig[0]) return res.status(404).json({error:'No encontrado'});
+    const t=req.tenantId;
+    const {rows:orig}=await client.query('SELECT * FROM productos WHERE id=$1 AND tenant_id=$2', [req.params.id, t]);
+    if(!orig[0]){ client.release(); return res.status(404).json({error:'No encontrado'}); }
     const p=orig[0];
-    const {rows}=await pool.query(`INSERT INTO productos (tenant_id,seccion_id,categoria,modelo,nombre,precio_base,precio_original,stock,stock_minimo,imagen,notas,compatibilidad,descripcion,sku,tipo,moneda,precio_oferta,envio_gratis,visible,peso,alto,ancho,largo,permitir_sin_stock,es_digital) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25) RETURNING *`,
-      [req.tenantId, p.seccion_id, p.categoria, p.modelo, (p.nombre||p.modelo||'')+' (copia)', p.precio_base, p.precio_original, 0, p.stock_minimo, p.imagen, p.notas, p.compatibilidad, p.descripcion, p.sku?p.sku+'-copia':'', p.tipo, p.moneda, p.precio_oferta, p.envio_gratis, false, p.peso, p.alto, p.ancho, p.largo, p.permitir_sin_stock, p.es_digital]);
-    res.json(rows[0]);
-  }catch(e){ res.status(500).json({error:e.message}); }
+    await client.query('BEGIN');
+    const {rows}=await client.query(`INSERT INTO productos (tenant_id,seccion_id,categoria,modelo,nombre,precio_base,precio_original,stock,stock_minimo,imagen,notas,compatibilidad,descripcion,sku,tipo,moneda,precio_oferta,envio_gratis,visible,peso,alto,ancho,largo,permitir_sin_stock,es_digital,marca,usa_variantes) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27) RETURNING *`,
+      [t, p.seccion_id, p.categoria, p.modelo, (p.nombre||p.modelo||'')+' (copia)', p.precio_base, p.precio_original, 0, p.stock_minimo, p.imagen, p.notas, p.compatibilidad, p.descripcion, p.sku?p.sku+'-copia':'', p.tipo, p.moneda, p.precio_oferta, p.envio_gratis, false, p.peso, p.alto, p.ancho, p.largo, p.permitir_sin_stock, p.es_digital, p.marca, p.usa_variantes]);
+    const nuevo=rows[0];
+    // Atributos + sus valores (mapeando al nuevo producto)
+    const {rows:atrs}=await client.query('SELECT * FROM producto_atributos WHERE producto_id=$1 AND tenant_id=$2 ORDER BY orden,id', [p.id, t]);
+    for(const a of atrs){
+      const {rows:na}=await client.query('INSERT INTO producto_atributos (tenant_id,producto_id,nombre,orden) VALUES ($1,$2,$3,$4) RETURNING id', [t, nuevo.id, a.nombre, a.orden||0]);
+      const {rows:vals}=await client.query('SELECT valor,orden FROM producto_atributo_valores WHERE atributo_id=$1 AND tenant_id=$2 ORDER BY orden,id', [a.id, t]);
+      for(const v of vals){ await client.query('INSERT INTO producto_atributo_valores (tenant_id,atributo_id,valor,orden) VALUES ($1,$2,$3,$4)', [t, na[0].id, v.valor, v.orden||0]); }
+    }
+    // Variantes (combinaciones con precio/stock/moneda)
+    const {rows:vars}=await client.query('SELECT * FROM variantes WHERE producto_id=$1 AND tenant_id=$2 ORDER BY orden,id', [p.id, t]);
+    for(const v of vars){
+      await client.query('INSERT INTO variantes (tenant_id,producto_id,combinacion,precio,precio_oferta,stock,moneda,sku,orden,nombre,valor) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)',
+        [t, nuevo.id, JSON.stringify(v.combinacion||{}), v.precio||0, v.precio_oferta||0, v.stock||0, v.moneda||'ARS', v.sku||'', v.orden||0, v.nombre||'', v.valor||'']);
+    }
+    // Galería de fotos
+    const {rows:imgs}=await client.query('SELECT url,orden FROM producto_imagenes WHERE producto_id=$1 AND tenant_id=$2 ORDER BY orden,id', [p.id, t]);
+    for(const im of imgs){ await client.query('INSERT INTO producto_imagenes (tenant_id,producto_id,url,orden) VALUES ($1,$2,$3,$4)', [t, nuevo.id, im.url, im.orden||0]); }
+    // Precios por lista
+    const {rows:pf}=await client.query('SELECT lista_precio_id,precio_fijo FROM precios_fijos WHERE producto_id=$1 AND tenant_id=$2', [p.id, t]);
+    for(const f of pf){ await client.query('INSERT INTO precios_fijos (tenant_id,producto_id,lista_precio_id,precio_fijo) VALUES ($1,$2,$3,$4) ON CONFLICT (producto_id,lista_precio_id) DO NOTHING', [t, nuevo.id, f.lista_precio_id, f.precio_fijo]); }
+    await client.query('COMMIT');
+    res.json(nuevo);
+  }catch(e){ await client.query('ROLLBACK').catch(()=>{}); res.status(500).json({error:e.message}); }
+  finally{ client.release(); }
 });
 app.put('/api/productos/:id', authPerm('productos'), async (req,res)=>{
   try{
