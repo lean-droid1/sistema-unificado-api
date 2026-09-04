@@ -323,6 +323,7 @@ async function migrate(){
     `ALTER TABLE variantes ADD COLUMN IF NOT EXISTS moneda VARCHAR(10) DEFAULT 'ARS'`,
     `ALTER TABLE variantes ADD COLUMN IF NOT EXISTS orden INT DEFAULT 0`,
     `ALTER TABLE variantes ADD COLUMN IF NOT EXISTS sku VARCHAR(120) DEFAULT ''`,
+    `ALTER TABLE producto_atributo_valores ADD COLUMN IF NOT EXISTS imagen TEXT DEFAULT ''`,
     `ALTER TABLE productos ADD COLUMN IF NOT EXISTS usa_variantes BOOLEAN DEFAULT false`,
     `ALTER TABLE pedido_items ADD COLUMN IF NOT EXISTS variante_id INT`,
     `ALTER TABLE pedido_items ADD COLUMN IF NOT EXISTS variante_combinacion TEXT DEFAULT ''`,
@@ -1333,8 +1334,8 @@ app.post('/api/productos/:id/duplicar', authPerm('productos'), async (req,res)=>
     const {rows:atrs}=await client.query('SELECT * FROM producto_atributos WHERE producto_id=$1 AND tenant_id=$2 ORDER BY orden,id', [p.id, t]);
     for(const a of atrs){
       const {rows:na}=await client.query('INSERT INTO producto_atributos (tenant_id,producto_id,nombre,orden) VALUES ($1,$2,$3,$4) RETURNING id', [t, nuevo.id, a.nombre, a.orden||0]);
-      const {rows:vals}=await client.query('SELECT valor,orden FROM producto_atributo_valores WHERE atributo_id=$1 AND tenant_id=$2 ORDER BY orden,id', [a.id, t]);
-      for(const v of vals){ await client.query('INSERT INTO producto_atributo_valores (tenant_id,atributo_id,valor,orden) VALUES ($1,$2,$3,$4)', [t, na[0].id, v.valor, v.orden||0]); }
+      const {rows:vals}=await client.query('SELECT valor,orden,imagen FROM producto_atributo_valores WHERE atributo_id=$1 AND tenant_id=$2 ORDER BY orden,id', [a.id, t]);
+      for(const v of vals){ await client.query('INSERT INTO producto_atributo_valores (tenant_id,atributo_id,valor,orden,imagen) VALUES ($1,$2,$3,$4,$5)', [t, na[0].id, v.valor, v.orden||0, v.imagen||'']); }
     }
     // Variantes (combinaciones con precio/stock/moneda)
     const {rows:vars}=await client.query('SELECT * FROM variantes WHERE producto_id=$1 AND tenant_id=$2 ORDER BY orden,id', [p.id, t]);
@@ -1761,8 +1762,8 @@ app.get('/api/productos/:id/variantes-full', async (req,res)=>{
     const {rows:atrs}=await pool.query('SELECT id,nombre,orden FROM producto_atributos WHERE producto_id=$1 AND tenant_id=$2 ORDER BY orden,id',[pid,t]);
     const atributos=[];
     for(const a of atrs){
-      const {rows:vals}=await pool.query('SELECT valor FROM producto_atributo_valores WHERE atributo_id=$1 AND tenant_id=$2 ORDER BY orden,id',[a.id,t]);
-      atributos.push({ nombre:a.nombre, orden:a.orden, valores: vals.map(v=>v.valor) });
+      const {rows:vals}=await pool.query('SELECT valor,imagen FROM producto_atributo_valores WHERE atributo_id=$1 AND tenant_id=$2 ORDER BY orden,id',[a.id,t]);
+      atributos.push({ nombre:a.nombre, orden:a.orden, valores: vals.map(v=>({ valor:v.valor, imagen:v.imagen||'' })) });
     }
     const {rows:variantes}=await pool.query('SELECT id,combinacion,precio,precio_oferta,stock,moneda,sku,orden FROM variantes WHERE producto_id=$1 AND tenant_id=$2 ORDER BY orden,id',[pid,t]);
     res.json({ usa_variantes: !!prod[0].usa_variantes, atributos, variantes });
@@ -1784,7 +1785,7 @@ app.put('/api/productos/:id/variantes-full', authPerm('productos'), async (req,r
       const nom=(a.nombre||'').trim(); if(!nom) continue;
       const {rows:ar}=await client.query('INSERT INTO producto_atributos (tenant_id,producto_id,nombre,orden) VALUES ($1,$2,$3,$4) RETURNING id',[t,pid,nom,ao++]);
       let vo=0;
-      for(const v of (a.valores||[])){ const val=(''+v).trim(); if(!val) continue; await client.query('INSERT INTO producto_atributo_valores (tenant_id,atributo_id,valor,orden) VALUES ($1,$2,$3,$4)',[t,ar[0].id,val,vo++]); }
+      for(const v of (a.valores||[])){ const val=(typeof v==='string'?v:(v.valor||'')).trim(); if(!val) continue; const img=(typeof v==='object'&&v)?(v.imagen||''):''; await client.query('INSERT INTO producto_atributo_valores (tenant_id,atributo_id,valor,orden,imagen) VALUES ($1,$2,$3,$4,$5)',[t,ar[0].id,val,vo++,img]); }
     }
     let vo2=0;
     for(const v of variantes){
