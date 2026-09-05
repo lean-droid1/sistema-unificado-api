@@ -2108,17 +2108,9 @@ app.post('/api/pedidos/multi', auth(), async (req,res)=>{
       for(const item of (items||[])){
         const {rows:prod}=await client.query('SELECT stock, permitir_sin_stock, es_digital, seccion_id, es_preventa, preventa_cupo, preventa_reservado FROM productos WHERE id=$1', [item.producto_id]);
         if(!prod[0]) continue;
-        // Variante: validar stock de la combinación elegida
-        if(item.variante_id){
-          const {rows:vr}=await client.query('SELECT stock FROM variantes WHERE id=$1 AND tenant_id=$2', [item.variante_id, req.tenantId]);
-          const vsec=await client.query('SELECT ignorar_stock, permitir_sin_stock FROM secciones WHERE id=$1', [prod[0].seccion_id]).then(r=>r.rows[0]).catch(()=>null);
-          const vSinStock = prod[0].permitir_sin_stock || prod[0].es_digital || vsec?.permitir_sin_stock || vsec?.ignorar_stock;
-          if(vr[0] && !vSinStock && Number(vr[0].stock) < (item.cantidad||1)){
-            await client.query('ROLLBACK');
-            return res.status(400).json({error:`Sin stock: ${item.nombre_producto||''} (disponible: ${vr[0].stock})`});
-          }
-          continue;
-        }
+        // Variante: el stock se descuenta más abajo, pero NUNCA bloquea la venta
+        // (las licencias/digitales tienen stock 0 y no deben frenar el pedido).
+        if(item.variante_id){ continue; }
         // Preventa: validar contra cupo (si cupo>0). Cupo 0 = ilimitado
         if(item._preventa || prod[0].es_preventa){
           const cupo=Number(prod[0].preventa_cupo)||0;
