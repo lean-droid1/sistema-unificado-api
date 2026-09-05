@@ -905,18 +905,19 @@ async function notificarVentaAdmin(pedidos, comprador){
     const baseUrl = process.env.PUBLIC_URL || process.env.FRONTEND_URL || '';
     const total = pedidos.reduce((s,p)=>s+Number(p.total||0),0);
     const nombreCliente = (comprador && (comprador.nombre||comprador.usuario)) || 'Cliente';
-    const filas = pedidos.map(p=>{
+    let filas = '';
+    for(const p of pedidos){
       const link = baseUrl ? `${baseUrl}/?pedido=${p.id}` : '';
       const num = String(p.id).padStart(4,'0');
-      return `<tr><td style="padding:8px 12px;border-bottom:1px solid #eee">#${num}</td><td style="padding:8px 12px;border-bottom:1px solid #eee">$${Number(p.total||0).toLocaleString('es-AR')}</td><td style="padding:8px 12px;border-bottom:1px solid #eee">${link?`<a href="${link}">Ver orden →</a>`:''}</td></tr>`;
-    }).join('');
+      const items = await _itemsPedidoHtml(p.id);
+      filas += `<tr><td colspan="2" style="padding:10px 12px;border-top:2px solid #333;font-weight:700">Pedido #${num} — $${Number(p.total||0).toLocaleString('es-AR')} ${link?`· <a href="${link}">Ver orden →</a>`:''}</td></tr>${items}`;
+    }
     const html = `
       <div style="font-family:system-ui,sans-serif;max-width:520px;margin:0 auto">
-        <h2 style="color:#16a34a">🛒 Nueva venta en ${tienda}</h2>
+        <h2 style="color:#16a34a">Nueva venta en ${tienda}</h2>
         <p>Cliente: <strong>${nombreCliente}</strong></p>
         <p>Total: <strong style="font-size:20px">$${total.toLocaleString('es-AR')}</strong></p>
         <table style="width:100%;border-collapse:collapse;margin-top:12px">
-          <thead><tr><th style="text-align:left;padding:8px 12px;border-bottom:2px solid #333">Pedido</th><th style="text-align:left;padding:8px 12px;border-bottom:2px solid #333">Total</th><th style="text-align:left;padding:8px 12px;border-bottom:2px solid #333"></th></tr></thead>
           <tbody>${filas}</tbody>
         </table>
         <p style="color:#888;font-size:12px;margin-top:20px">Entró recién a tu tienda. Ingresá al panel para gestionarla.</p>
@@ -924,12 +925,66 @@ async function notificarVentaAdmin(pedidos, comprador){
     const r = await resend.emails.send({
       from: process.env.RESEND_FROM || 'onboarding@resend.dev',
       to: destino,
-      subject: `🛒 Nueva venta $${total.toLocaleString('es-AR')} — ${tienda}`,
+      subject: `Nueva venta $${total.toLocaleString('es-AR')} — ${tienda}`,
       html,
     });
     if(r && r.error){ console.log('[venta-mail] Resend error:', JSON.stringify(r.error)); }
     else { console.log('[venta-mail] enviado a', destino); }
   }catch(e){ console.log('[venta-mail] excepción:', e.message); }
+}
+// ── Helpers de mail reutilizables ──
+async function _itemsPedidoHtml(pedidoId){
+  const {rows}=await pool.query('SELECT nombre_producto, cantidad, precio_unitario, variante_combinacion FROM pedido_items WHERE pedido_id=$1', [pedidoId]).catch(()=>({rows:[]}));
+  return rows.map(i=>{
+    const sub=Number(i.precio_unitario||0)*Number(i.cantidad||1);
+    const varTxt=i.variante_combinacion?`<div style="color:#888;font-size:12px">${i.variante_combinacion}</div>`:'';
+    return `<tr><td style="padding:8px 12px;border-bottom:1px solid #eee">${i.cantidad||1}× ${i.nombre_producto||'Producto'}${varTxt}</td><td style="padding:8px 12px;border-bottom:1px solid #eee;text-align:right;white-space:nowrap">$${sub.toLocaleString('es-AR')}</td></tr>`;
+  }).join('');
+}
+async function _sendMail(to, subject, html){
+  if(!resend || !to) return;
+  try{ const r=await resend.emails.send({ from: process.env.RESEND_FROM || 'onboarding@resend.dev', to, subject, html }); if(r&&r.error) console.log('[mail] error:', JSON.stringify(r.error)); else console.log('[mail] enviado a', to); }catch(e){ console.log('[mail] exc:', e.message); }
+}
+async function _tiendaInfo(tenantId){
+  const {rows:dc}=await pool.query("SELECT valor FROM design_config WHERE clave='nombre_tienda' AND tenant_id=$1", [tenantId]).catch(()=>({rows:[]}));
+  return { tienda:(dc[0]&&dc[0].valor)||'Tu tienda', baseUrl: process.env.PUBLIC_URL||process.env.FRONTEND_URL||'' };
+}
+async function emailBienvenida(tenantId, email, nombre){
+  if(!email) return;
+  const {tienda, baseUrl}=await _tiendaInfo(tenantId);
+  const html=`<div style="font-family:system-ui,sans-serif;max-width:520px;margin:0 auto">
+    <h2 style="color:#111">¡Bienvenido/a a ${tienda}!</h2>
+    <p>Hola ${nombre||''}, tu cuenta ya está creada. Ya podés comprar y seguir tus pedidos.</p>
+    ${baseUrl?`<p style="margin-top:16px"><a href="${baseUrl}" style="background:#111;color:#fff;padding:10px 18px;border-radius:8px;text-decoration:none">Ir a la tienda</a></p>`:''}
+    <p style="color:#888;font-size:12px;margin-top:20px">${tienda}</p>
+  </div>`;
+  await _sendMail(email, `¡Bienvenido/a a ${tienda}!`, html);
+}
+async function emailCompraCliente(tenantId, pedidos, comprador){
+  try{
+    if(!pedidos || !pedidos.length) return;
+    let email='';
+    try{ const df=pedidos[0].datos_facturacion; const o=typeof df==='string'?JSON.parse(df):df; email=(o&&(o.email||o.mail))||''; }catch(e){}
+    if(!email && comprador && comprador.id){ const {rows}=await pool.query('SELECT email FROM usuarios WHERE id=$1',[comprador.id]).catch(()=>({rows:[]})); email=rows[0]&&rows[0].email; }
+    if(!email) return;
+    const {tienda, baseUrl}=await _tiendaInfo(tenantId);
+    const total=pedidos.reduce((s,p)=>s+Number(p.total||0),0);
+    let bloques='';
+    for(const p of pedidos){
+      const filas=await _itemsPedidoHtml(p.id);
+      const num=String(p.id).padStart(4,'0');
+      bloques+=`<div style="margin-top:14px"><div style="font-weight:700;margin-bottom:6px">Pedido #${num}</div><table style="width:100%;border-collapse:collapse">${filas}<tr><td style="padding:8px 12px;font-weight:700">Total</td><td style="padding:8px 12px;text-align:right;font-weight:700">$${Number(p.total||0).toLocaleString('es-AR')}</td></tr></table></div>`;
+    }
+    const html=`<div style="font-family:system-ui,sans-serif;max-width:560px;margin:0 auto">
+      <h2 style="color:#16a34a">¡Gracias por tu compra en ${tienda}!</h2>
+      <p>Recibimos tu pedido. Este es el detalle:</p>
+      ${bloques}
+      <p style="font-size:18px;margin-top:14px">Total: <strong>$${total.toLocaleString('es-AR')}</strong></p>
+      ${baseUrl?`<p style="margin-top:16px"><a href="${baseUrl}" style="background:#16a34a;color:#fff;padding:10px 18px;border-radius:8px;text-decoration:none">Ver la tienda</a></p>`:''}
+      <p style="color:#888;font-size:12px;margin-top:20px">Cualquier duda, respondé este mail. ${tienda}</p>
+    </div>`;
+    await _sendMail(email, `Tu compra en ${tienda} — Pedido #${String(pedidos[0].id).padStart(4,'0')}`, html);
+  }catch(e){ console.log('[mail-cliente] exc:', e.message); }
 }
 const loginAttempts={};
 app.post('/api/login', async (req,res)=>{
@@ -1006,6 +1061,7 @@ app.post('/api/register', async (req,res)=>{
     const requiereAprob = cfgAprob[0] && cfgAprob[0].valor==='true';
     const aprobado = !requiereAprob; // por defecto (sin config) el registro entra DIRECTO
     const {rows}=await pool.query('INSERT INTO usuarios (tenant_id,nombre,usuario,password,telefono,email,direccion,nombre_fantasia,aprobado,activo) VALUES ($8,$1,$2,$3,$4,$5,$6,$7,$9,$9) RETURNING id,nombre,usuario,telefono,email,aprobado,activo', [nombre,usuario,hash,telefono||'',email||'',direccion||'',nombre_fantasia||'', req.tenantId, aprobado]);
+    if(email) emailBienvenida(req.tenantId, email, nombre).catch(()=>{});
     res.json(rows[0]);
   }catch(e){ res.status(400).json({error:e.message.includes('duplicate')?'Usuario ya existe':e.message}); }
 });
@@ -2092,6 +2148,7 @@ app.post('/api/pedidos/multi', auth(), async (req,res)=>{
     await client.query('COMMIT');
     // Notificar al admin por email (nueva venta online)
     notificarVentaAdmin(creados, req.user).catch(()=>{});
+    emailCompraCliente(req.tenantId, creados, req.user).catch(()=>{});
     res.json({ok:true, pedidos: creados});
   }catch(e){ await client.query('ROLLBACK').catch(()=>{}); res.status(500).json({error:e.message}); }
   finally{ client.release(); }
