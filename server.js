@@ -1063,7 +1063,8 @@ app.post('/api/register', async (req,res)=>{
   try{
     const {nombre,usuario,password,telefono,email,direccion,nombre_fantasia}=req.body;
     if(!usuario||usuario.length<3) return res.status(400).json({error:'Min 3 caracteres'});
-    if(!telefono||!String(telefono).trim()) return res.status(400).json({error:'El teléfono es obligatorio'});
+    if(!telefono||String(telefono).replace(/\D/g,'').length<8) return res.status(400).json({error:'Teléfono inválido (con característica)'});
+    if(!email||!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(String(email).trim())) return res.status(400).json({error:'Email inválido'});
     const pwError=validatePassword(password); if(pwError) return res.status(400).json({error:pwError});
     const hash=await bcrypt.hash(password,12);
     const {rows:cfgAprob}=await pool.query("SELECT valor FROM configuracion WHERE tenant_id=$1 AND clave='registro_requiere_aprobacion'", [req.tenantId]);
@@ -2247,8 +2248,9 @@ app.put('/api/pedidos/:id', authPerm('pedidos'), async (req,res)=>{  try{
           const {rows:pagosYa}=await pool.query('SELECT COALESCE(SUM(cuenta_como),0) as saldado FROM pedido_pagos WHERE pedido_id=$1', [req.params.id]);
           const yaSaldado=Number(pagosYa[0]?.saldado||0);
           const totalPed=(p.total!==undefined)?Number(p.total):Number((oldPedRows[0]||{}).total||0);
-          const falta=totalPed-yaSaldado;
-          if(falta>0.01){
+          let falta=totalPed-yaSaldado;
+          if(falta>totalPed) falta=totalPed; // nunca registrar un pago mayor al total del pedido
+          if(falta>0.01 && totalPed>0){
             await pool.query(
               'INSERT INTO pedido_pagos (tenant_id,pedido_id,metodo,monto,recibido,cuenta_como,ajuste_pct,ajuste_monto,nota) VALUES ($1,$2,$3,$4,$5,$6,0,0,$7)',
               [req.tenantId, req.params.id, (p.metodo_pago||'efectivo'), falta, falta, falta, 'Marcado como pagado']
