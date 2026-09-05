@@ -2276,7 +2276,7 @@ app.put('/api/pedidos/:id', authPerm('pedidos'), async (req,res)=>{  try{
       // Capturar productos afectados (viejos + nuevos) para recalcular preventa
       const {rows:viejos}=await pool.query('SELECT DISTINCT producto_id FROM pedido_items WHERE pedido_id=$1', [req.params.id]);
       await pool.query('DELETE FROM pedido_items WHERE pedido_id=$1', [req.params.id]);
-      for(const item of p.items){ await pool.query('INSERT INTO pedido_items (pedido_id,producto_id,categoria,modelo,nombre_producto,cantidad,precio_unitario,precio_base) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)', [req.params.id, item.producto_id||item.id, item.categoria||'', item.modelo||'', item.nombre_producto||`${item.categoria} - ${item.modelo}`, item.cantidad||item.qty||1, item.precio_unitario||0, item.precio_base||0]); }
+      for(const item of p.items){ await pool.query('INSERT INTO pedido_items (pedido_id,producto_id,categoria,modelo,nombre_producto,cantidad,precio_unitario,precio_base,variante_id,variante_combinacion) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)', [req.params.id, item.producto_id||item.id, item.categoria||'', item.modelo||'', item.nombre_producto||`${item.categoria} - ${item.modelo}`, item.cantidad||item.qty||1, item.precio_unitario||0, item.precio_base||0, item.variante_id||null, item.variante_label||item.variante_combinacion||'']); }
       // Recalcular reservado de preventa para todos los productos tocados
       const afectados=new Set([...viejos.map(v=>v.producto_id), ...p.items.map(it=>it.producto_id||it.id)].filter(Boolean));
       for(const pid of afectados) await recalcReservado(pid);
