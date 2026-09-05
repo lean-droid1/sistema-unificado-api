@@ -905,6 +905,8 @@ async function notificarVentaAdmin(pedidos, comprador){
     const baseUrl = process.env.PUBLIC_URL || process.env.FRONTEND_URL || '';
     const total = pedidos.reduce((s,p)=>s+Number(p.total||0),0);
     const nombreCliente = (comprador && (comprador.nombre||comprador.usuario)) || 'Cliente';
+    let compradorEmail = (comprador && comprador.email) || '';
+    try{ const df=pedidos[0].datos_facturacion; const o=typeof df==='string'?JSON.parse(df):df; compradorEmail = compradorEmail || (o&&(o.email||o.mail))||''; }catch(e){}
     let filas = '';
     for(const p of pedidos){
       const link = baseUrl ? `${baseUrl}/?pedido=${p.id}` : '';
@@ -923,8 +925,9 @@ async function notificarVentaAdmin(pedidos, comprador){
         <p style="color:#888;font-size:12px;margin-top:20px">Entró recién a tu tienda. Ingresá al panel para gestionarla.</p>
       </div>`;
     const r = await resend.emails.send({
-      from: process.env.RESEND_FROM || 'onboarding@resend.dev',
+      from: `${tienda} <${process.env.RESEND_FROM || 'onboarding@resend.dev'}>`,
       to: destino,
+      reply_to: compradorEmail || undefined,
       subject: `Nueva venta $${total.toLocaleString('es-AR')} — ${tienda}`,
       html,
     });
@@ -941,24 +944,29 @@ async function _itemsPedidoHtml(pedidoId){
     return `<tr><td style="padding:8px 12px;border-bottom:1px solid #eee">${i.cantidad||1}× ${i.nombre_producto||'Producto'}${varTxt}</td><td style="padding:8px 12px;border-bottom:1px solid #eee;text-align:right;white-space:nowrap">$${sub.toLocaleString('es-AR')}</td></tr>`;
   }).join('');
 }
-async function _sendMail(to, subject, html){
+async function _sendMail(to, subject, html, opts={}){
   if(!resend || !to) return;
-  try{ const r=await resend.emails.send({ from: process.env.RESEND_FROM || 'onboarding@resend.dev', to, subject, html }); if(r&&r.error) console.log('[mail] error:', JSON.stringify(r.error)); else console.log('[mail] enviado a', to); }catch(e){ console.log('[mail] exc:', e.message); }
+  const addr = process.env.RESEND_FROM || 'onboarding@resend.dev';
+  const from = opts.fromName ? `${opts.fromName} <${addr}>` : addr;
+  const payload = { from, to, subject, html };
+  if(opts.replyTo) payload.reply_to = opts.replyTo;
+  try{ const r=await resend.emails.send(payload); if(r&&r.error) console.log('[mail] error:', JSON.stringify(r.error)); else console.log('[mail] enviado a', to); }catch(e){ console.log('[mail] exc:', e.message); }
 }
 async function _tiendaInfo(tenantId){
   const {rows:dc}=await pool.query("SELECT valor FROM design_config WHERE clave='nombre_tienda' AND tenant_id=$1", [tenantId]).catch(()=>({rows:[]}));
-  return { tienda:(dc[0]&&dc[0].valor)||'Tu tienda', baseUrl: process.env.PUBLIC_URL||process.env.FRONTEND_URL||'' };
+  const {rows:ev}=await pool.query("SELECT valor FROM configuracion WHERE clave='email_ventas' AND tenant_id=$1", [tenantId]).catch(()=>({rows:[]}));
+  return { tienda:(dc[0]&&dc[0].valor)||'Tu tienda', baseUrl: process.env.PUBLIC_URL||process.env.FRONTEND_URL||'', email:(ev[0]&&ev[0].valor)||'' };
 }
 async function emailBienvenida(tenantId, email, nombre){
   if(!email) return;
-  const {tienda, baseUrl}=await _tiendaInfo(tenantId);
+  const {tienda, baseUrl, email:tiendaEmail}=await _tiendaInfo(tenantId);
   const html=`<div style="font-family:system-ui,sans-serif;max-width:520px;margin:0 auto">
     <h2 style="color:#111">¡Bienvenido/a a ${tienda}!</h2>
     <p>Hola ${nombre||''}, tu cuenta ya está creada. Ya podés comprar y seguir tus pedidos.</p>
     ${baseUrl?`<p style="margin-top:16px"><a href="${baseUrl}" style="background:#111;color:#fff;padding:10px 18px;border-radius:8px;text-decoration:none">Ir a la tienda</a></p>`:''}
     <p style="color:#888;font-size:12px;margin-top:20px">${tienda}</p>
   </div>`;
-  await _sendMail(email, `¡Bienvenido/a a ${tienda}!`, html);
+  await _sendMail(email, `¡Bienvenido/a a ${tienda}!`, html, { fromName: tienda, replyTo: tiendaEmail || undefined });
 }
 async function emailCompraCliente(tenantId, pedidos, comprador){
   try{
@@ -967,7 +975,7 @@ async function emailCompraCliente(tenantId, pedidos, comprador){
     try{ const df=pedidos[0].datos_facturacion; const o=typeof df==='string'?JSON.parse(df):df; email=(o&&(o.email||o.mail))||''; }catch(e){}
     if(!email && comprador && comprador.id){ const {rows}=await pool.query('SELECT email FROM usuarios WHERE id=$1',[comprador.id]).catch(()=>({rows:[]})); email=rows[0]&&rows[0].email; }
     if(!email) return;
-    const {tienda, baseUrl}=await _tiendaInfo(tenantId);
+    const {tienda, baseUrl, email:tiendaEmail}=await _tiendaInfo(tenantId);
     const total=pedidos.reduce((s,p)=>s+Number(p.total||0),0);
     let bloques='';
     for(const p of pedidos){
@@ -983,7 +991,7 @@ async function emailCompraCliente(tenantId, pedidos, comprador){
       ${baseUrl?`<p style="margin-top:16px"><a href="${baseUrl}" style="background:#16a34a;color:#fff;padding:10px 18px;border-radius:8px;text-decoration:none">Ver la tienda</a></p>`:''}
       <p style="color:#888;font-size:12px;margin-top:20px">Cualquier duda, respondé este mail. ${tienda}</p>
     </div>`;
-    await _sendMail(email, `Tu compra en ${tienda} — Pedido #${String(pedidos[0].id).padStart(4,'0')}`, html);
+    await _sendMail(email, `Tu compra en ${tienda} — Pedido #${String(pedidos[0].id).padStart(4,'0')}`, html, { fromName: tienda, replyTo: tiendaEmail || undefined });
   }catch(e){ console.log('[mail-cliente] exc:', e.message); }
 }
 const loginAttempts={};
@@ -1055,6 +1063,7 @@ app.post('/api/register', async (req,res)=>{
   try{
     const {nombre,usuario,password,telefono,email,direccion,nombre_fantasia}=req.body;
     if(!usuario||usuario.length<3) return res.status(400).json({error:'Min 3 caracteres'});
+    if(!telefono||!String(telefono).trim()) return res.status(400).json({error:'El teléfono es obligatorio'});
     const pwError=validatePassword(password); if(pwError) return res.status(400).json({error:pwError});
     const hash=await bcrypt.hash(password,12);
     const {rows:cfgAprob}=await pool.query("SELECT valor FROM configuracion WHERE tenant_id=$1 AND clave='registro_requiere_aprobacion'", [req.tenantId]);
