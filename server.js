@@ -2239,7 +2239,9 @@ app.put('/api/pedidos/:id', authPerm('pedidos'), async (req,res)=>{  try{
         try {
           const {rows:pagosYa}=await pool.query('SELECT COALESCE(SUM(cuenta_como),0) as saldado FROM pedido_pagos WHERE pedido_id=$1', [req.params.id]);
           const yaSaldado=Number(pagosYa[0]?.saldado||0);
-          const totalPed=(p.total!==undefined)?Number(p.total):Number((oldPedRows[0]||{}).total||0);
+          const {rows:itPed}=await client.query('SELECT precio_unitario, cantidad FROM pedido_items WHERE pedido_id=$1',[req.params.id]);
+          const totItems=itPed.reduce((a,it)=>a+Number(it.precio_unitario||0)*Number(it.cantidad||1),0);
+          const totalPed=totItems>0 ? (totItems - Number((oldPedRows[0]||{}).descuento||0) + Number((oldPedRows[0]||{}).costo_envio||0)) : ((p.total!==undefined)?Number(p.total):Number((oldPedRows[0]||{}).total||0));
           let falta=totalPed-yaSaldado;
           if(falta>totalPed) falta=totalPed; // nunca registrar un pago mayor al total del pedido
           if(falta>0.01 && totalPed>0){
@@ -2254,7 +2256,9 @@ app.put('/api/pedidos/:id', authPerm('pedidos'), async (req,res)=>{  try{
         // Pasó a "debe" (fiado): registrar cargo si no existe ya para este pedido
         const {rows:ya}=await pool.query("SELECT id FROM cuenta_corriente WHERE pedido_id=$1 AND tipo='cargo'", [req.params.id]);
         if(!ya.length){
-          const totalPed=(p.total!==undefined)?Number(p.total):Number((oldPedRows[0]||{}).total||0);
+          const {rows:itPed}=await client.query('SELECT precio_unitario, cantidad FROM pedido_items WHERE pedido_id=$1',[req.params.id]);
+          const totItems=itPed.reduce((a,it)=>a+Number(it.precio_unitario||0)*Number(it.cantidad||1),0);
+          const totalPed=totItems>0 ? (totItems - Number((oldPedRows[0]||{}).descuento||0) + Number((oldPedRows[0]||{}).costo_envio||0)) : ((p.total!==undefined)?Number(p.total):Number((oldPedRows[0]||{}).total||0));
           const senaPed=(p.sena!==undefined)?Number(p.sena):Number((oldPedRows[0]||{}).sena||0);
           const deuda=totalPed-senaPed;
           if(deuda>0) await pool.query('INSERT INTO cuenta_corriente (usuario_id,tipo,monto,concepto,pedido_id) VALUES ($1,$2,$3,$4,$5)', [pedUsuarioId,'cargo',deuda,`Pedido #${String(req.params.id).padStart(4,'0')}`,req.params.id]).catch(()=>{});
