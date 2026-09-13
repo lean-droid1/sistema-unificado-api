@@ -1181,6 +1181,21 @@ const uploadToCloudinary = (buffer, folder='productos')=> new Promise((resolve,r
   const stream=cloudinary.uploader.upload_stream({folder, resource_type:'image', quality:'auto', fetch_format:'auto'}, (err,result)=>{ if(err) reject(err); else resolve(result); });
   stream.end(buffer);
 });
+// Re-hostea una imagen remota (ej. rxzweb.com) en Cloudinary. Cloudinary la baja desde SUS
+// servidores (no Railway), así esquiva el bloqueo de Cloudflare. Si falla, devuelve la URL original.
+const esCloudinaria = (u='') => /res\.cloudinary\.com|cloudinary/i.test(String(u));
+const rehostImagen = async (url) => {
+  const u = String(url || '').trim();
+  if (!u || !/^https?:\/\//i.test(u) || esCloudinaria(u)) return u;
+  if (!useCloudinary) return u;
+  try {
+    const r = await cloudinary.uploader.upload(u, { folder: 'productos/rxz', resource_type: 'image', quality: 'auto', fetch_format: 'auto' });
+    return r.secure_url || u;
+  } catch (e) {
+    console.warn('rehostImagen falló:', u.slice(0,80), '-', String(e.message||e).slice(0,80));
+    return u;
+  }
+};
 app.post('/api/upload', authPerm('config'), upload.single('imagen'), async (req,res)=>{
   try{
     if(!req.file) return res.status(400).json({error:'No file'});
@@ -1209,6 +1224,42 @@ app.post('/api/upload-base64', authPerm('config'), async (req,res)=>{
       fs.writeFileSync(path.join(uploadsDir,name), buffer);
       return res.json({url:`/uploads/${name}`});
     }
+  }catch(e){ res.status(500).json({error:e.message}); }
+});
+
+// POST /api/productos/rehost-imagenes — mueve a Cloudinary las imágenes que aún apuntan a rxzweb.com
+// (Cloudinary las baja desde sus servidores, esquivando el bloqueo de Cloudflare). Procesa por lotes.
+app.post('/api/productos/rehost-imagenes', authPerm('productos'), async (req,res)=>{
+  const t = req.tenantId;
+  try{
+    if(!useCloudinary) return res.status(503).json({error:'Cloudinary no configurado'});
+    const limit = Math.min(Math.max(parseInt(req.body && req.body.limit)||15, 1), 40);
+    const { rows } = await pool.query(
+      `SELECT DISTINCT p.id FROM productos p
+       LEFT JOIN producto_imagenes pi ON pi.producto_id=p.id AND pi.tenant_id=p.tenant_id
+       WHERE p.tenant_id=$1 AND (p.imagen ILIKE '%rxzweb%' OR pi.url ILIKE '%rxzweb%')
+       ORDER BY p.id LIMIT $2`, [t, limit]);
+    let migradas=0, fallidas=0; const detalle=[];
+    for(const row of rows){
+      try{
+        const { rows:pr } = await pool.query('SELECT imagen FROM productos WHERE id=$1 AND tenant_id=$2', [row.id, t]);
+        const img = (pr[0] && pr[0].imagen) || '';
+        if(/rxzweb/i.test(img)){
+          const nueva = await rehostImagen(img);
+          if(nueva && nueva!==img){ await pool.query('UPDATE productos SET imagen=$1 WHERE id=$2 AND tenant_id=$3', [nueva, row.id, t]); migradas++; } else { fallidas++; }
+        }
+        const { rows:gi } = await pool.query("SELECT id,url FROM producto_imagenes WHERE producto_id=$1 AND tenant_id=$2 AND url ILIKE '%rxzweb%'", [row.id, t]);
+        for(const g of gi){
+          const nu = await rehostImagen(g.url);
+          if(nu && nu!==g.url){ await pool.query('UPDATE producto_imagenes SET url=$1 WHERE id=$2', [nu, g.id]); migradas++; } else { fallidas++; }
+        }
+      }catch(ep){ fallidas++; if(detalle.length<10) detalle.push({id:row.id, error:String(ep.message||ep).slice(0,120)}); }
+    }
+    const { rows:rest } = await pool.query(
+      `SELECT COUNT(DISTINCT p.id)::int AS n FROM productos p
+       LEFT JOIN producto_imagenes pi ON pi.producto_id=p.id AND pi.tenant_id=p.tenant_id
+       WHERE p.tenant_id=$1 AND (p.imagen ILIKE '%rxzweb%' OR pi.url ILIKE '%rxzweb%')`, [t]);
+    res.json({ ok:true, migradas, fallidas, restantes: (rest[0] && rest[0].n) || 0, detalle: detalle.length?detalle:undefined });
   }catch(e){ res.status(500).json({error:e.message}); }
 });
 
@@ -1594,15 +1645,18 @@ app.post('/api/bot/sync', botAuth, async (req, res) => {
           actualizados++;
         } else {
           // Nuevo → inserta completo en la sección destino.
+          // Re-hostear la imagen principal en Cloudinary (independiza de rxz/hotlink).
+          const imagenRe = await rehostImagen(imagen);
           const { rows: ins } = await pool.query(
             `INSERT INTO productos (tenant_id,seccion_id,categoria,modelo,nombre,descripcion,precio_base,precio_oferta,stock,imagen,sku,envio_gratis,peso,alto,ancho,largo,visible)
              VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,true) RETURNING id`,
-            [t, secId, categoria, nombre, nombre, descripcion, precioBase, precioOferta, stock, imagen, skuT, envioGratis, peso, alto, ancho, largo]);
+            [t, secId, categoria, nombre, nombre, descripcion, precioBase, precioOferta, stock, imagenRe, skuT, envioGratis, peso, alto, ancho, largo]);
           prodId = ins[0].id;
-          // Galería completa: todas las imágenes del proveedor
+          // Galería completa: todas las imágenes del proveedor (también re-hosteadas)
           const galeria = Array.isArray(p.imagenes) && p.imagenes.length ? p.imagenes : (imagen ? [imagen] : []);
           for (let gi = 0; gi < galeria.length; gi++) {
-            await pool.query('INSERT INTO producto_imagenes (tenant_id,producto_id,url,orden) VALUES ($1,$2,$3,$4) ON CONFLICT DO NOTHING', [t, prodId, galeria[gi], gi]).catch(()=>{});
+            const urlRe = await rehostImagen(galeria[gi]);
+            await pool.query('INSERT INTO producto_imagenes (tenant_id,producto_id,url,orden) VALUES ($1,$2,$3,$4) ON CONFLICT DO NOTHING', [t, prodId, urlRe, gi]).catch(()=>{});
           }
           insertados++;
         }
