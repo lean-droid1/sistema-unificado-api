@@ -2445,21 +2445,61 @@ app.get('/api/reportes', authPerm('stats'), async (req,res)=>{
 app.get('/api/stats', authPerm('stats'), async (req,res)=>{
   try{
     const {seccion_id,desde,hasta,is_test}=req.query;
-    // tenant_id siempre es $1; el resto se agrega después
     const params=[req.tenantId];
     let secWhere=''; if(seccion_id && seccion_id!=='all'){ params.push(seccion_id); secWhere=` AND seccion_id=$${params.length}`; }
     let dateWhere='';
     if(desde){ params.push(desde); dateWhere+=` AND created_at >= $${params.length}`; }
     if(hasta){ params.push(hasta); dateWhere+=` AND created_at <= $${params.length}`; }
     let testWhere=''; if(is_test==='false') testWhere=' AND is_test=false';
-    const totalPedidos=await pool.query(`SELECT COUNT(*) FROM pedidos WHERE tenant_id=$1 AND archivado=false${secWhere}${dateWhere}${testWhere}`, params);
-    const totalVentas=await pool.query(`SELECT COALESCE(SUM(total),0) as total FROM pedidos WHERE tenant_id=$1 AND estado NOT IN ('cancelado') AND archivado=false${secWhere}${dateWhere}${testWhere}`, params);
-    const totalProductos=await pool.query(`SELECT COUNT(*) FROM productos WHERE tenant_id=$1${seccion_id && seccion_id!=='all' ? ' AND seccion_id=$2' : ''}`, seccion_id && seccion_id!=='all' ? [req.tenantId, seccion_id] : [req.tenantId]);
-    const totalUsuarios=await pool.query('SELECT COUNT(*) FROM usuarios WHERE rol != $1 AND tenant_id=$2', ['admin', req.tenantId]);
-    const ventasPorDia=await pool.query(`SELECT DATE(created_at) as fecha, COUNT(*) as cantidad, COALESCE(SUM(total),0) as total FROM pedidos WHERE tenant_id=$1 AND estado NOT IN ('cancelado') AND archivado=false${secWhere}${dateWhere}${testWhere} GROUP BY DATE(created_at) ORDER BY fecha DESC LIMIT 30`, params);
-    const topCat=await pool.query(`SELECT pi.categoria, COUNT(*) as cantidad, SUM(pi.precio_unitario * pi.cantidad) as total FROM pedido_items pi JOIN pedidos p ON pi.pedido_id=p.id WHERE p.tenant_id=$1 AND p.estado NOT IN ('cancelado')${secWhere.replace('seccion_id','p.seccion_id')}${dateWhere.replace('created_at','p.created_at')}${testWhere} GROUP BY pi.categoria ORDER BY total DESC LIMIT 10`, params);
-    const abandonados=await pool.query('SELECT COUNT(*) FROM carritos_abandonados WHERE recuperado=false AND tenant_id=$1', [req.tenantId]).catch(()=>({rows:[{count:0}]}));
-    res.json({ total_pedidos: parseInt(totalPedidos.rows[0].count), total_ventas: parseFloat(totalVentas.rows[0].total), total_productos: parseInt(totalProductos.rows[0].count), total_usuarios: parseInt(totalUsuarios.rows[0].count), ventas_por_dia: ventasPorDia.rows, top_categorias: topCat.rows, carritos_abandonados: parseInt(abandonados.rows[0].count) });
+    // Base: pedidos reales (no presupuestos), no archivados
+    const base = `tenant_id=$1 AND archivado=false AND tipo='pedido'${secWhere}${dateWhere}${testWhere}`;
+    const vivos = `${base} AND estado NOT IN ('cancelado')`;
+    // COBRADO = pagado→total, señado→sena (lo efectivamente cobrado), impago→0
+    const COBR = `CASE WHEN estado_pago='pagado' THEN total WHEN estado_pago='senado' THEN COALESCE(sena,0) ELSE 0 END`;
+
+    const totalPedidos = await pool.query(`SELECT COUNT(*) FROM pedidos WHERE ${vivos}`, params);
+    const ventas = await pool.query(`SELECT COALESCE(SUM(${COBR}),0) AS total, COUNT(*) FILTER (WHERE estado_pago='pagado') AS pagados FROM pedidos WHERE ${vivos}`, params);
+    const aCobrar = await pool.query(`SELECT COALESCE(SUM(total - ${COBR}),0) AS total, COUNT(*) FILTER (WHERE estado_pago<>'pagado') AS cant FROM pedidos WHERE ${vivos}`, params);
+    const totalProductos = await pool.query(`SELECT COUNT(*) FROM productos WHERE tenant_id=$1${seccion_id && seccion_id!=='all' ? ' AND seccion_id=$2' : ''}`, seccion_id && seccion_id!=='all' ? [req.tenantId, seccion_id] : [req.tenantId]);
+    const totalUsuarios = await pool.query('SELECT COUNT(*) FROM usuarios WHERE rol <> $1 AND tenant_id=$2', ['admin', req.tenantId]);
+    const ventasPorDia = await pool.query(`SELECT DATE(created_at) AS fecha, COUNT(*) FILTER (WHERE estado_pago<>'impago') AS cantidad, COALESCE(SUM(${COBR}),0) AS total FROM pedidos WHERE ${vivos} GROUP BY DATE(created_at) ORDER BY fecha DESC LIMIT 30`, params);
+    const porEstado = await pool.query(`SELECT LOWER(estado) AS estado, COUNT(*) AS cantidad FROM pedidos WHERE ${vivos} GROUP BY LOWER(estado)`, params);
+    const porMetodo = await pool.query(`SELECT COALESCE(NULLIF(metodo_pago,''),'—') AS metodo, COUNT(*) AS cantidad, COALESCE(SUM(${COBR}),0) AS total FROM pedidos WHERE ${vivos} GROUP BY COALESCE(NULLIF(metodo_pago,''),'—') ORDER BY total DESC`, params);
+    let porSeccion={rows:[]};
+    if(!(seccion_id && seccion_id!=='all')){
+      porSeccion = await pool.query(`SELECT s.nombre AS seccion, COALESCE(SUM(${COBR}),0) AS total FROM pedidos p JOIN secciones s ON s.id=p.seccion_id WHERE p.tenant_id=$1 AND p.archivado=false AND p.tipo='pedido' AND p.estado NOT IN ('cancelado')${dateWhere.replace(/created_at/g,'p.created_at')}${testWhere.replace('is_test','p.is_test')} GROUP BY s.nombre ORDER BY total DESC LIMIT 10`, params);
+    }
+    const secP = secWhere.replace('seccion_id','p.seccion_id');
+    const dateP = dateWhere.replace(/created_at/g,'p.created_at');
+    const testP = testWhere.replace('is_test','p.is_test');
+    const cobrRel = `p.estado NOT IN ('cancelado') AND p.estado_pago IN ('pagado','senado')`;
+    const topCat = await pool.query(`SELECT COALESCE(NULLIF(pi.categoria,''),'Sin categoría') AS categoria, SUM(pi.cantidad) AS cantidad, COALESCE(SUM(pi.precio_unitario*pi.cantidad),0) AS total FROM pedido_items pi JOIN pedidos p ON pi.pedido_id=p.id WHERE p.tenant_id=$1 AND p.archivado=false AND p.tipo='pedido' AND ${cobrRel}${secP}${dateP}${testP} GROUP BY COALESCE(NULLIF(pi.categoria,''),'Sin categoría') ORDER BY total DESC LIMIT 8`, params);
+    const topProd = await pool.query(`SELECT COALESCE(NULLIF(pi.nombre_producto,''),'—') AS nombre, SUM(pi.cantidad) AS cantidad, COALESCE(SUM(pi.precio_unitario*pi.cantidad),0) AS total FROM pedido_items pi JOIN pedidos p ON pi.pedido_id=p.id WHERE p.tenant_id=$1 AND p.archivado=false AND p.tipo='pedido' AND ${cobrRel}${secP}${dateP}${testP} GROUP BY COALESCE(NULLIF(pi.nombre_producto,''),'—') ORDER BY cantidad DESC LIMIT 10`, params);
+    const mesParams=[req.tenantId]; let secMes=''; if(seccion_id && seccion_id!=='all'){ mesParams.push(seccion_id); secMes=' AND seccion_id=$2'; }
+    const mesAct = await pool.query(`SELECT COALESCE(SUM(${COBR}),0) AS total FROM pedidos WHERE tenant_id=$1 AND archivado=false AND tipo='pedido' AND estado NOT IN ('cancelado')${secMes}${testWhere} AND created_at >= date_trunc('month', CURRENT_DATE)`, mesParams);
+    const mesAnt = await pool.query(`SELECT COALESCE(SUM(${COBR}),0) AS total FROM pedidos WHERE tenant_id=$1 AND archivado=false AND tipo='pedido' AND estado NOT IN ('cancelado')${secMes}${testWhere} AND created_at >= date_trunc('month', CURRENT_DATE - INTERVAL '1 month') AND created_at < date_trunc('month', CURRENT_DATE)`, mesParams);
+    const abandonados = await pool.query('SELECT COUNT(*) FROM carritos_abandonados WHERE recuperado=false AND tenant_id=$1', [req.tenantId]).catch(()=>({rows:[{count:0}]}));
+
+    const estadoObj={}; porEstado.rows.forEach(r=>{ estadoObj[r.estado]=parseInt(r.cantidad); });
+    res.json({
+      total_pedidos: parseInt(totalPedidos.rows[0].count),
+      total_ventas: parseFloat(ventas.rows[0].total),
+      pedidos_pagados: parseInt(ventas.rows[0].pagados),
+      total_a_cobrar: parseFloat(aCobrar.rows[0].total),
+      pedidos_a_cobrar: parseInt(aCobrar.rows[0].cant),
+      ticket_promedio: parseInt(ventas.rows[0].pagados)>0 ? parseFloat(ventas.rows[0].total)/parseInt(ventas.rows[0].pagados) : 0,
+      total_productos: parseInt(totalProductos.rows[0].count),
+      total_usuarios: parseInt(totalUsuarios.rows[0].count),
+      ventas_por_dia: ventasPorDia.rows,
+      pedidos_por_estado: estadoObj,
+      ventas_por_metodo: porMetodo.rows,
+      ventas_por_seccion: porSeccion.rows,
+      top_categorias: topCat.rows,
+      top_productos: topProd.rows,
+      ventas_mes_actual: parseFloat(mesAct.rows[0].total),
+      ventas_mes_anterior: parseFloat(mesAnt.rows[0].total),
+      carritos_abandonados: parseInt(abandonados.rows[0].count)
+    });
   }catch(e){ res.status(500).json({error:e.message}); }
 });
 
