@@ -340,6 +340,8 @@ async function migrate(){
     `ALTER TABLE pedido_pagos ADD COLUMN IF NOT EXISTS cuenta_como NUMERIC(12,2) DEFAULT 0`,
     `UPDATE pedido_pagos SET recibido=monto, cuenta_como=monto WHERE recibido=0 AND cuenta_como=0 AND monto>0`,
     `UPDATE pedidos SET estado_pago='impago' WHERE estado_pago='pendiente' OR estado_pago IS NULL OR estado_pago=''`,
+    `ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS moneda VARCHAR(10) DEFAULT 'ARS'`,
+    `UPDATE pedidos SET moneda='USDT' WHERE (moneda IS NULL OR moneda='ARS') AND EXISTS(SELECT 1 FROM pedido_items pi LEFT JOIN productos pr ON pr.id=pi.producto_id LEFT JOIN variantes v ON v.id=pi.variante_id WHERE pi.pedido_id=pedidos.id AND COALESCE(v.moneda, pr.moneda,'ARS')='USDT')`,
     `CREATE TABLE IF NOT EXISTS ordenes_compra (id SERIAL PRIMARY KEY, proveedor VARCHAR(200), seccion_id INT, estado VARCHAR(20) DEFAULT 'pendiente', total NUMERIC(12,2) DEFAULT 0, notas TEXT, recibida BOOLEAN DEFAULT false, created_at TIMESTAMP DEFAULT NOW())`,
     `CREATE TABLE IF NOT EXISTS orden_compra_items (id SERIAL PRIMARY KEY, orden_id INT REFERENCES ordenes_compra(id) ON DELETE CASCADE, producto_id INT, nombre_producto VARCHAR(300), cantidad INT DEFAULT 1, costo_unitario NUMERIC(12,2) DEFAULT 0)`,
     `ALTER TABLE secciones ADD COLUMN IF NOT EXISTS permitir_sin_stock BOOLEAN DEFAULT false`,
@@ -2121,6 +2123,8 @@ app.post('/api/pedidos', auth(), async (req,res)=>{
       }
       }
     }
+    // Etiquetar moneda del pedido según sus ítems (separa ventas ARS/USDT en reportes)
+    await client.query(`UPDATE pedidos SET moneda = CASE WHEN EXISTS(SELECT 1 FROM pedido_items pi LEFT JOIN productos pr ON pr.id=pi.producto_id LEFT JOIN variantes v ON v.id=pi.variante_id WHERE pi.pedido_id=$1 AND COALESCE(v.moneda, pr.moneda,'ARS')='USDT') THEN 'USDT' ELSE 'ARS' END WHERE id=$1`, [rows[0].id]).catch(()=>{});
     if(cupon_codigo) await client.query("UPDATE cupones SET usos_actuales = usos_actuales + 1 WHERE codigo=$1 AND tenant_id=$2", [cupon_codigo, req.tenantId]).catch(()=>{});
     // Cuenta corriente automática: SOLO si el pedido se marca como "debe" (fiado). Impago normal no genera deuda de cuenta corriente.
     const ep=String(req.body.estado_pago||'impago');
@@ -2198,6 +2202,7 @@ app.post('/api/pedidos/multi', auth(), async (req,res)=>{
         }
         }
       }
+      await client.query(`UPDATE pedidos SET moneda = CASE WHEN EXISTS(SELECT 1 FROM pedido_items pi LEFT JOIN productos pr ON pr.id=pi.producto_id LEFT JOIN variantes v ON v.id=pi.variante_id WHERE pi.pedido_id=$1 AND COALESCE(v.moneda, pr.moneda,'ARS')='USDT') THEN 'USDT' ELSE 'ARS' END WHERE id=$1`, [rows[0].id]).catch(()=>{});
       creados.push(rows[0]);
     }
     if(creados[0]?.cupon_codigo) await client.query("UPDATE cupones SET usos_actuales = usos_actuales + 1 WHERE codigo=$1 AND tenant_id=$2", [creados[0].cupon_codigo, req.tenantId]).catch(()=>{});
@@ -2384,64 +2389,46 @@ app.get('/api/caja', authPerm('stats'), async (req,res)=>{
     if(desde){ params.push(desde); cond.push(`pp.created_at >= $${params.length}`); }
     if(hasta){ params.push(hasta); cond.push(`pp.created_at <= $${params.length}`); }
     const where=`WHERE ${cond.join(' AND ')}`;
-    const {rows:porMetodo}=await pool.query(
-      `SELECT COALESCE(NULLIF(pp.metodo,''),'sin método') as metodo,
-              COALESCE(SUM(pp.recibido),0) as recibido,
-              COALESCE(SUM(pp.cuenta_como),0) as saldado
-       FROM pedido_pagos pp ${where}
-       GROUP BY pp.metodo ORDER BY recibido DESC`, params);
-    const {rows:aj}=await pool.query(
-      `SELECT COALESCE(SUM(CASE WHEN pp.ajuste_monto<0 THEN -pp.ajuste_monto ELSE 0 END),0) as descuentos,
-              COALESCE(SUM(CASE WHEN pp.ajuste_monto>0 THEN pp.ajuste_monto ELSE 0 END),0) as recargos,
-              COALESCE(SUM(pp.recibido),0) as total_recibido,
-              COALESCE(SUM(pp.cuenta_como),0) as total_saldado
-       FROM pedido_pagos pp ${where}`, params);
-    res.json({ porMetodo, ...aj[0] });
+    const J = `FROM pedido_pagos pp LEFT JOIN pedidos p ON p.id=pp.pedido_id ${where}`;
+    const {rows:porMetodo}=await pool.query(`SELECT COALESCE(NULLIF(pp.metodo,''),'sin método') as metodo, COALESCE(SUM(pp.recibido),0) as recibido, COALESCE(SUM(pp.cuenta_como),0) as saldado ${J} AND COALESCE(p.moneda,'ARS')='ARS' GROUP BY pp.metodo ORDER BY recibido DESC`, params);
+    const {rows:aj}=await pool.query(`SELECT COALESCE(SUM(CASE WHEN pp.ajuste_monto<0 THEN -pp.ajuste_monto ELSE 0 END),0) as descuentos, COALESCE(SUM(CASE WHEN pp.ajuste_monto>0 THEN pp.ajuste_monto ELSE 0 END),0) as recargos, COALESCE(SUM(pp.recibido),0) as total_recibido, COALESCE(SUM(pp.cuenta_como),0) as total_saldado ${J} AND COALESCE(p.moneda,'ARS')='ARS'`, params);
+    const {rows:porMetodoU}=await pool.query(`SELECT COALESCE(NULLIF(pp.metodo,''),'sin método') as metodo, COALESCE(SUM(pp.recibido),0) as recibido, COALESCE(SUM(pp.cuenta_como),0) as saldado ${J} AND p.moneda='USDT' GROUP BY pp.metodo ORDER BY recibido DESC`, params);
+    const {rows:ajU}=await pool.query(`SELECT COALESCE(SUM(pp.recibido),0) as total_recibido, COALESCE(SUM(pp.cuenta_como),0) as total_saldado ${J} AND p.moneda='USDT'`, params);
+    res.json({ porMetodo, ...aj[0], usdt: { porMetodo: porMetodoU, total_recibido: Number(ajU[0].total_recibido), total_saldado: Number(ajU[0].total_saldado) } });
   }catch(e){ res.status(500).json({error:e.message}); }
 });
+
 app.get('/api/reportes', authPerm('stats'), async (req,res)=>{
   try{
     const {desde, hasta, seccion_id}=req.query;
-    const cond=["p.tenant_id=$1", "p.tipo='pedido'", "LOWER(p.estado) NOT IN ('cancelado','anulado','rechazado')"]; const params=[req.tenantId]; let pi=2;
+    const cond=["p.tenant_id=$1", "p.tipo='pedido'", "LOWER(p.estado) NOT IN ('cancelado','anulado','rechazado')", "p.estado_pago IN ('pagado','senado')"]; const params=[req.tenantId]; let pi=2;
     if(desde){ cond.push(`p.created_at >= $${pi}`); params.push(desde); pi++; }
     if(hasta){ cond.push(`p.created_at <= $${pi}`); params.push(hasta+' 23:59:59'); pi++; }
     if(seccion_id && seccion_id!=='all'){ cond.push(`p.seccion_id = $${pi}`); params.push(seccion_id); pi++; }
-    const where='WHERE '+cond.join(' AND ');
+    const where='WHERE '+cond.join(' AND ')+" AND p.moneda='ARS'";
+    const whereU='WHERE '+cond.join(' AND ')+" AND p.moneda='USDT'";
 
-    // Más vendidos (por cantidad)
-    const masVendidos=await pool.query(`SELECT pi.producto_id, pi.nombre_producto, SUM(pi.cantidad)::int as unidades, SUM(pi.cantidad*pi.precio_unitario)::numeric as facturado
-      FROM pedido_items pi JOIN pedidos p ON pi.pedido_id=p.id ${where} GROUP BY pi.producto_id, pi.nombre_producto ORDER BY unidades DESC LIMIT 20`, params);
-
-    // Ventas por sección (con ganancias por tienda)
-    const porSeccion=await pool.query(`SELECT s.id as seccion_id, s.nombre as seccion, COUNT(DISTINCT p.id)::int as pedidos, COALESCE(SUM(p.total),0)::numeric as total
-      FROM pedidos p LEFT JOIN secciones s ON p.seccion_id=s.id ${where} GROUP BY s.id, s.nombre ORDER BY total DESC`, params);
-
-    // Ganancia por sección (facturado - costo por tienda)
-    const gananciaPorSeccion=await pool.query(`SELECT p.seccion_id,
-      COALESCE(SUM(pi.cantidad*pi.precio_unitario),0)::numeric as facturado,
-      COALESCE(SUM(pi.cantidad*COALESCE(NULLIF(pr.precio_original,0),0)),0)::numeric as costo
-      FROM pedido_items pi JOIN pedidos p ON pi.pedido_id=p.id LEFT JOIN productos pr ON pi.producto_id=pr.id ${where} GROUP BY p.seccion_id`, params);
+    const masVendidos=await pool.query(`SELECT pi.producto_id, pi.nombre_producto, SUM(pi.cantidad)::int as unidades, SUM(pi.cantidad*pi.precio_unitario)::numeric as facturado FROM pedido_items pi JOIN pedidos p ON pi.pedido_id=p.id ${where} GROUP BY pi.producto_id, pi.nombre_producto ORDER BY unidades DESC LIMIT 20`, params);
+    const porSeccion=await pool.query(`SELECT s.id as seccion_id, s.nombre as seccion, COUNT(DISTINCT p.id)::int as pedidos, COALESCE(SUM(p.total),0)::numeric as total FROM pedidos p LEFT JOIN secciones s ON p.seccion_id=s.id ${where} GROUP BY s.id, s.nombre ORDER BY total DESC`, params);
+    const gananciaPorSeccion=await pool.query(`SELECT p.seccion_id, COALESCE(SUM(pi.cantidad*pi.precio_unitario),0)::numeric as facturado, COALESCE(SUM(pi.cantidad*COALESCE(NULLIF(pr.precio_original,0),0)),0)::numeric as costo FROM pedido_items pi JOIN pedidos p ON pi.pedido_id=p.id LEFT JOIN productos pr ON pi.producto_id=pr.id ${where} GROUP BY p.seccion_id`, params);
     const gxs={}; gananciaPorSeccion.rows.forEach(r=>{ gxs[r.seccion_id]={ facturado:Number(r.facturado), costo:Number(r.costo), ganancia:Number(r.facturado)-Number(r.costo) }; });
     const porSeccionConGanancia = porSeccion.rows.map(s=>({ ...s, facturado: gxs[s.seccion_id]?.facturado||0, costo: gxs[s.seccion_id]?.costo||0, ganancia: gxs[s.seccion_id]?.ganancia||0 }));
-
-    // Ventas por mes
-    const porMes=await pool.query(`SELECT TO_CHAR(DATE_TRUNC('month', p.created_at),'YYYY-MM') as mes, COUNT(*)::int as pedidos, COALESCE(SUM(p.total),0)::numeric as total
-      FROM pedidos p ${where} GROUP BY mes ORDER BY mes DESC LIMIT 12`, params);
-
-    // Ganancias (facturado - costo, usando precio_original del producto)
-    const ganancias=await pool.query(`SELECT COALESCE(SUM(pi.cantidad*pi.precio_unitario),0)::numeric as facturado,
-      COALESCE(SUM(pi.cantidad*COALESCE(NULLIF(pr.precio_original,0), 0)),0)::numeric as costo
-      FROM pedido_items pi JOIN pedidos p ON pi.pedido_id=p.id LEFT JOIN productos pr ON pi.producto_id=pr.id ${where}`, params);
-
+    const porMes=await pool.query(`SELECT TO_CHAR(DATE_TRUNC('month', p.created_at),'YYYY-MM') as mes, COUNT(*)::int as pedidos, COALESCE(SUM(p.total),0)::numeric as total FROM pedidos p ${where} GROUP BY mes ORDER BY mes DESC LIMIT 12`, params);
+    const ganancias=await pool.query(`SELECT COALESCE(SUM(pi.cantidad*pi.precio_unitario),0)::numeric as facturado, COALESCE(SUM(pi.cantidad*COALESCE(NULLIF(pr.precio_original,0), 0)),0)::numeric as costo FROM pedido_items pi JOIN pedidos p ON pi.pedido_id=p.id LEFT JOIN productos pr ON pi.producto_id=pr.id ${where}`, params);
     const g=ganancias.rows[0]||{facturado:0,costo:0};
+    const gU=await pool.query(`SELECT COALESCE(SUM(pi.cantidad*pi.precio_unitario),0)::numeric as facturado, COALESCE(SUM(pi.cantidad*COALESCE(NULLIF(pr.precio_original,0),0)),0)::numeric as costo, COALESCE(SUM(pi.cantidad),0)::int as unidades FROM pedido_items pi JOIN pedidos p ON pi.pedido_id=p.id LEFT JOIN productos pr ON pi.producto_id=pr.id ${whereU}`, params);
+    const pedU=await pool.query(`SELECT COUNT(*)::int as pedidos FROM pedidos p ${whereU}`, params);
+    const gu=gU.rows[0]||{facturado:0,costo:0,unidades:0};
     res.json({
       masVendidos: masVendidos.rows,
       porSeccion: porSeccionConGanancia,
       porMes: porMes.rows,
-      ganancias: { facturado: Number(g.facturado), costo: Number(g.costo), ganancia: Number(g.facturado)-Number(g.costo) }
+      ganancias: { facturado: Number(g.facturado), costo: Number(g.costo), ganancia: Number(g.facturado)-Number(g.costo) },
+      usdt: { facturado: Number(gu.facturado), costo: Number(gu.costo), ganancia: Number(gu.facturado)-Number(gu.costo), unidades: Number(gu.unidades), pedidos: Number(pedU.rows[0].pedidos) }
     });
   }catch(e){ res.status(500).json({error:e.message}); }
 });
+
 app.get('/api/stats', authPerm('stats'), async (req,res)=>{
   try{
     const {seccion_id,desde,hasta,is_test}=req.query;
@@ -2451,11 +2438,11 @@ app.get('/api/stats', authPerm('stats'), async (req,res)=>{
     if(desde){ params.push(desde); dateWhere+=` AND created_at >= $${params.length}`; }
     if(hasta){ params.push(hasta); dateWhere+=` AND created_at <= $${params.length}`; }
     let testWhere=''; if(is_test==='false') testWhere=' AND is_test=false';
-    // Base: pedidos reales (no presupuestos), no archivados
-    const base = `tenant_id=$1 AND archivado=false AND tipo='pedido'${secWhere}${dateWhere}${testWhere}`;
-    const vivos = `${base} AND estado NOT IN ('cancelado')`;
     // COBRADO = pagado→total, señado→sena (lo efectivamente cobrado), impago→0
     const COBR = `CASE WHEN estado_pago='pagado' THEN total WHEN estado_pago='senado' THEN COALESCE(sena,0) ELSE 0 END`;
+    // Base ARS: pedidos reales (no presupuestos), no archivados, moneda pesos
+    const base = `tenant_id=$1 AND archivado=false AND tipo='pedido' AND moneda='ARS'${secWhere}${dateWhere}${testWhere}`;
+    const vivos = `${base} AND estado NOT IN ('cancelado')`;
 
     const totalPedidos = await pool.query(`SELECT COUNT(*) FROM pedidos WHERE ${vivos}`, params);
     const ventas = await pool.query(`SELECT COALESCE(SUM(${COBR}),0) AS total, COUNT(*) FILTER (WHERE estado_pago='pagado') AS pagados FROM pedidos WHERE ${vivos}`, params);
@@ -2467,20 +2454,25 @@ app.get('/api/stats', authPerm('stats'), async (req,res)=>{
     const porMetodo = await pool.query(`SELECT COALESCE(NULLIF(metodo_pago,''),'—') AS metodo, COUNT(*) AS cantidad, COALESCE(SUM(${COBR}),0) AS total FROM pedidos WHERE ${vivos} GROUP BY COALESCE(NULLIF(metodo_pago,''),'—') ORDER BY total DESC`, params);
     let porSeccion={rows:[]};
     if(!(seccion_id && seccion_id!=='all')){
-      porSeccion = await pool.query(`SELECT s.nombre AS seccion, COALESCE(SUM(${COBR}),0) AS total FROM pedidos p JOIN secciones s ON s.id=p.seccion_id WHERE p.tenant_id=$1 AND p.archivado=false AND p.tipo='pedido' AND p.estado NOT IN ('cancelado')${dateWhere.replace(/created_at/g,'p.created_at')}${testWhere.replace('is_test','p.is_test')} GROUP BY s.nombre ORDER BY total DESC LIMIT 10`, params);
+      porSeccion = await pool.query(`SELECT s.nombre AS seccion, COALESCE(SUM(${COBR}),0) AS total FROM pedidos p JOIN secciones s ON s.id=p.seccion_id WHERE p.tenant_id=$1 AND p.archivado=false AND p.tipo='pedido' AND p.moneda='ARS' AND p.estado NOT IN ('cancelado')${dateWhere.replace(/created_at/g,'p.created_at')}${testWhere.replace('is_test','p.is_test')} GROUP BY s.nombre ORDER BY total DESC LIMIT 10`, params);
     }
     const secP = secWhere.replace('seccion_id','p.seccion_id');
     const dateP = dateWhere.replace(/created_at/g,'p.created_at');
     const testP = testWhere.replace('is_test','p.is_test');
-    const cobrRel = `p.estado NOT IN ('cancelado') AND p.estado_pago IN ('pagado','senado')`;
+    const cobrRel = `p.moneda='ARS' AND p.estado NOT IN ('cancelado') AND p.estado_pago IN ('pagado','senado')`;
     const topCat = await pool.query(`SELECT COALESCE(NULLIF(pi.categoria,''),'Sin categoría') AS categoria, SUM(pi.cantidad) AS cantidad, COALESCE(SUM(pi.precio_unitario*pi.cantidad),0) AS total FROM pedido_items pi JOIN pedidos p ON pi.pedido_id=p.id WHERE p.tenant_id=$1 AND p.archivado=false AND p.tipo='pedido' AND ${cobrRel}${secP}${dateP}${testP} GROUP BY COALESCE(NULLIF(pi.categoria,''),'Sin categoría') ORDER BY total DESC LIMIT 8`, params);
     const topProd = await pool.query(`SELECT COALESCE(NULLIF(pi.nombre_producto,''),'—') AS nombre, SUM(pi.cantidad) AS cantidad, COALESCE(SUM(pi.precio_unitario*pi.cantidad),0) AS total FROM pedido_items pi JOIN pedidos p ON pi.pedido_id=p.id WHERE p.tenant_id=$1 AND p.archivado=false AND p.tipo='pedido' AND ${cobrRel}${secP}${dateP}${testP} GROUP BY COALESCE(NULLIF(pi.nombre_producto,''),'—') ORDER BY cantidad DESC LIMIT 10`, params);
     const mesParams=[req.tenantId]; let secMes=''; if(seccion_id && seccion_id!=='all'){ mesParams.push(seccion_id); secMes=' AND seccion_id=$2'; }
-    const mesAct = await pool.query(`SELECT COALESCE(SUM(${COBR}),0) AS total FROM pedidos WHERE tenant_id=$1 AND archivado=false AND tipo='pedido' AND estado NOT IN ('cancelado')${secMes}${testWhere} AND created_at >= date_trunc('month', CURRENT_DATE)`, mesParams);
-    const mesAnt = await pool.query(`SELECT COALESCE(SUM(${COBR}),0) AS total FROM pedidos WHERE tenant_id=$1 AND archivado=false AND tipo='pedido' AND estado NOT IN ('cancelado')${secMes}${testWhere} AND created_at >= date_trunc('month', CURRENT_DATE - INTERVAL '1 month') AND created_at < date_trunc('month', CURRENT_DATE)`, mesParams);
+    const mesAct = await pool.query(`SELECT COALESCE(SUM(${COBR}),0) AS total FROM pedidos WHERE tenant_id=$1 AND archivado=false AND tipo='pedido' AND moneda='ARS' AND estado NOT IN ('cancelado')${secMes}${testWhere} AND created_at >= date_trunc('month', CURRENT_DATE)`, mesParams);
+    const mesAnt = await pool.query(`SELECT COALESCE(SUM(${COBR}),0) AS total FROM pedidos WHERE tenant_id=$1 AND archivado=false AND tipo='pedido' AND moneda='ARS' AND estado NOT IN ('cancelado')${secMes}${testWhere} AND created_at >= date_trunc('month', CURRENT_DATE - INTERVAL '1 month') AND created_at < date_trunc('month', CURRENT_DATE)`, mesParams);
     const abandonados = await pool.query('SELECT COUNT(*) FROM carritos_abandonados WHERE recuperado=false AND tenant_id=$1', [req.tenantId]).catch(()=>({rows:[{count:0}]}));
 
+    // ── APARTADO USDT (mismo criterio: solo cobrado + seña) ──
+    const baseU = `tenant_id=$1 AND archivado=false AND tipo='pedido' AND moneda='USDT'${secWhere}${dateWhere}${testWhere} AND estado NOT IN ('cancelado')`;
+    const ventasU = await pool.query(`SELECT COALESCE(SUM(${COBR}),0) AS total, COUNT(*) FILTER (WHERE estado_pago='pagado') AS pagados, COUNT(*) AS pedidos, COALESCE(SUM(total - ${COBR}),0) AS a_cobrar FROM pedidos WHERE ${baseU}`, params);
+
     const estadoObj={}; porEstado.rows.forEach(r=>{ estadoObj[r.estado]=parseInt(r.cantidad); });
+    const u=ventasU.rows[0]||{};
     res.json({
       total_pedidos: parseInt(totalPedidos.rows[0].count),
       total_ventas: parseFloat(ventas.rows[0].total),
@@ -2498,7 +2490,8 @@ app.get('/api/stats', authPerm('stats'), async (req,res)=>{
       top_productos: topProd.rows,
       ventas_mes_actual: parseFloat(mesAct.rows[0].total),
       ventas_mes_anterior: parseFloat(mesAnt.rows[0].total),
-      carritos_abandonados: parseInt(abandonados.rows[0].count)
+      carritos_abandonados: parseInt(abandonados.rows[0].count),
+      usdt: { total_ventas: parseFloat(u.total||0), pedidos: parseInt(u.pedidos||0), pedidos_pagados: parseInt(u.pagados||0), total_a_cobrar: parseFloat(u.a_cobrar||0) }
     });
   }catch(e){ res.status(500).json({error:e.message}); }
 });
