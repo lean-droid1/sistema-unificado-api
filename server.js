@@ -341,6 +341,8 @@ async function migrate(){
     `UPDATE pedido_pagos SET recibido=monto, cuenta_como=monto WHERE recibido=0 AND cuenta_como=0 AND monto>0`,
     `UPDATE pedidos SET estado_pago='impago' WHERE estado_pago='pendiente' OR estado_pago IS NULL OR estado_pago=''`,
     `ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS moneda VARCHAR(10) DEFAULT 'ARS'`,
+    `ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS codigo_seguimiento VARCHAR(120) DEFAULT ''`,
+    `DELETE FROM carritos_abandonados c USING carritos_abandonados c2 WHERE c.recuperado=false AND c2.recuperado=false AND c.tenant_id=c2.tenant_id AND c.usuario_id=c2.usuario_id AND c.usuario_id IS NOT NULL AND (c.created_at < c2.created_at OR (c.created_at=c2.created_at AND c.id<c2.id))`,
     `UPDATE pedidos SET moneda='USDT' WHERE (moneda IS NULL OR moneda='ARS') AND EXISTS(SELECT 1 FROM pedido_items pi LEFT JOIN productos pr ON pr.id=pi.producto_id LEFT JOIN variantes v ON v.id=pi.variante_id WHERE pi.pedido_id=pedidos.id AND COALESCE(v.moneda, pr.moneda,'ARS')='USDT')`,
     `CREATE TABLE IF NOT EXISTS ordenes_compra (id SERIAL PRIMARY KEY, proveedor VARCHAR(200), seccion_id INT, estado VARCHAR(20) DEFAULT 'pendiente', total NUMERIC(12,2) DEFAULT 0, notas TEXT, recibida BOOLEAN DEFAULT false, created_at TIMESTAMP DEFAULT NOW())`,
     `CREATE TABLE IF NOT EXISTS orden_compra_items (id SERIAL PRIMARY KEY, orden_id INT REFERENCES ordenes_compra(id) ON DELETE CASCADE, producto_id INT, nombre_producto VARCHAR(300), cantidad INT DEFAULT 1, costo_unitario NUMERIC(12,2) DEFAULT 0)`,
@@ -2271,7 +2273,7 @@ app.put('/api/pedidos/:id', authPerm('pedidos'), async (req,res)=>{  try{
     const oldTipo=String((oldPedRows[0]||{}).tipo||'');
     const oldEstadoPago=String((oldPedRows[0]||{}).estado_pago||'');
     const pedUsuarioId=(oldPedRows[0]||{}).usuario_id;
-    const fields=['estado','tipo','metodo_pago','notas','total','subtotal','descuento','datos_envio','usuario_id','notificar_wa','is_test','costo_envio','metodo_envio','cp_destino','estado_pago','sena'];
+    const fields=['estado','tipo','metodo_pago','notas','total','subtotal','descuento','datos_envio','usuario_id','notificar_wa','is_test','costo_envio','metodo_envio','cp_destino','estado_pago','sena','codigo_seguimiento'];
     for(const f of fields){ if(p[f]!==undefined){ sets.push(`${f}=$${pi++}`); params.push(p[f]); } }
     sets.push(`updated_at=NOW()`);
     if(sets.length<=1) return res.json({ok:true});
@@ -2646,7 +2648,27 @@ app.delete('/api/notificaciones-stock/:id', authPerm('productos'), async (req,re
 });
 
 // CARRITOS ABANDONADOS
-app.post('/api/carritos-abandonados', async (req,res)=>{ try{ const {usuario_id,email,telefono,items,total,seccion_id}=req.body; const {rows}=await pool.query('INSERT INTO carritos_abandonados (usuario_id,email,telefono,items,total,seccion_id,tenant_id) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *', [usuario_id||null,email||'',telefono||'',JSON.stringify(items||[]),total||0,seccion_id||null, req.tenantId]); res.json(rows[0]); }catch(e){ res.status(500).json({error:e.message}); } });
+app.post('/api/carritos-abandonados', async (req,res)=>{
+  try{
+    const {usuario_id,email,telefono,items,total,seccion_id}=req.body;
+    const its=JSON.stringify(items||[]);
+    // Upsert: si el mismo cliente ya tiene un carrito activo, ACTUALIZARLO (no crear otro) → evita el spam.
+    let existing=null;
+    if(usuario_id){
+      const r=await pool.query('SELECT id FROM carritos_abandonados WHERE tenant_id=$1 AND recuperado=false AND usuario_id=$2 ORDER BY created_at DESC LIMIT 1',[req.tenantId,usuario_id]);
+      existing=r.rows[0];
+    } else if((telefono&&String(telefono).trim())||(email&&String(email).trim())){
+      const r=await pool.query("SELECT id FROM carritos_abandonados WHERE tenant_id=$1 AND recuperado=false AND usuario_id IS NULL AND ((NULLIF($2,'') IS NOT NULL AND telefono=$2) OR (NULLIF($3,'') IS NOT NULL AND email=$3)) ORDER BY created_at DESC LIMIT 1",[req.tenantId,telefono||'',email||'']);
+      existing=r.rows[0];
+    }
+    if(existing){
+      const {rows}=await pool.query('UPDATE carritos_abandonados SET items=$1,total=$2,seccion_id=$3,email=$4,telefono=$5,created_at=NOW() WHERE id=$6 AND tenant_id=$7 RETURNING *',[its,total||0,seccion_id||null,email||'',telefono||'',existing.id,req.tenantId]);
+      return res.json(rows[0]);
+    }
+    const {rows}=await pool.query('INSERT INTO carritos_abandonados (usuario_id,email,telefono,items,total,seccion_id,tenant_id) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *', [usuario_id||null,email||'',telefono||'',its,total||0,seccion_id||null, req.tenantId]);
+    res.json(rows[0]);
+  }catch(e){ res.status(500).json({error:e.message}); }
+});
 app.get('/api/carritos-abandonados', authPerm('stats'), async (req,res)=>{ try{ const {rows}=await pool.query("SELECT c.*, u.nombre as usuario_nombre, COALESCE(NULLIF(c.telefono,''), u.telefono) as telefono, COALESCE(NULLIF(c.email,''), u.email) as email, s.nombre as seccion_nombre FROM carritos_abandonados c LEFT JOIN usuarios u ON c.usuario_id=u.id LEFT JOIN secciones s ON c.seccion_id=s.id WHERE c.recuperado=false AND c.tenant_id=$1 ORDER BY c.created_at DESC LIMIT 100", [req.tenantId]); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
 app.post('/api/carritos-abandonados/:id/recuperar', authPerm('stats'), async (req,res)=>{ try{ await pool.query('UPDATE carritos_abandonados SET recuperado=true WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 app.delete('/api/carritos-abandonados/:id', authPerm('stats'), async (req,res)=>{ try{ await pool.query('DELETE FROM carritos_abandonados WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
