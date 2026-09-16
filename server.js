@@ -2648,6 +2648,30 @@ app.delete('/api/notificaciones-stock/:id', authPerm('productos'), async (req,re
 });
 
 // CARRITOS ABANDONADOS
+// GET /api/sitemap → sitemap.xml dinámico (home + todos los productos visibles). El rewrite de Vercel /sitemap.xml apunta acá.
+app.get('/api/sitemap', async (req,res)=>{
+  try{
+    const t = req.tenantId || 1;
+    const { rows:tr } = await pool.query('SELECT dominio_propio FROM tenants WHERE id=$1',[t]).catch(()=>({rows:[]}));
+    let dom = ((tr[0] && tr[0].dominio_propio) || '').trim().replace(/^https?:\/\//,'').replace(/\/+$/,'');
+    const base = 'https://' + (dom || 'lean-droidgremio.com');
+    const slugify = (x)=> String(x||'').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g,'').replace(/[^a-z0-9]+/g,'-').replace(/(^-|-$)/g,'') || 'producto';
+    const esc = (u)=> String(u).replace(/&/g,'&amp;').replace(/</g,'&lt;');
+    const { rows } = await pool.query("SELECT id, nombre, modelo, created_at FROM productos WHERE tenant_id=$1 AND visible=true ORDER BY id DESC LIMIT 5000",[t]);
+    let xml='<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n';
+    xml+=`<url><loc>${base}/</loc><changefreq>daily</changefreq><priority>1.0</priority></url>\n`;
+    for(const p of rows){
+      const loc = `${base}/producto/${slugify(p.nombre||p.modelo)}-${p.id}`;
+      let lm=''; try{ if(p.created_at) lm=new Date(p.created_at).toISOString().slice(0,10); }catch(_){}
+      xml+=`<url><loc>${esc(loc)}</loc>${lm?`<lastmod>${lm}</lastmod>`:''}<changefreq>weekly</changefreq><priority>0.8</priority></url>\n`;
+    }
+    xml+='</urlset>';
+    res.set('Content-Type','application/xml; charset=utf-8');
+    res.set('Cache-Control','public, max-age=3600');
+    res.send(xml);
+  }catch(e){ res.status(500).set('Content-Type','application/xml').send('<?xml version="1.0"?><error>'+String(e.message)+'</error>'); }
+});
+
 app.post('/api/carritos-abandonados', async (req,res)=>{
   try{
     const {usuario_id,email,telefono,items,total,seccion_id}=req.body;
