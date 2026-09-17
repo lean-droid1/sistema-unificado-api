@@ -452,6 +452,11 @@ async function migrate(){
     `ALTER TABLE productos ADD COLUMN IF NOT EXISTS alto NUMERIC(8,2) DEFAULT 0`,
     `ALTER TABLE productos ADD COLUMN IF NOT EXISTS ancho NUMERIC(8,2) DEFAULT 0`,
     `ALTER TABLE productos ADD COLUMN IF NOT EXISTS largo NUMERIC(8,2) DEFAULT 0`,
+    // Forzar tipo decimal en columnas viejas creadas como entero (permite peso en gramos, ej 0.05 kg)
+    `ALTER TABLE productos ALTER COLUMN peso TYPE NUMERIC(8,2) USING peso::numeric`,
+    `ALTER TABLE productos ALTER COLUMN alto TYPE NUMERIC(8,2) USING alto::numeric`,
+    `ALTER TABLE productos ALTER COLUMN ancho TYPE NUMERIC(8,2) USING ancho::numeric`,
+    `ALTER TABLE productos ALTER COLUMN largo TYPE NUMERIC(8,2) USING largo::numeric`,
     `ALTER TABLE productos ADD COLUMN IF NOT EXISTS descripcion TEXT DEFAULT ''`,
     `ALTER TABLE productos ADD COLUMN IF NOT EXISTS sku VARCHAR(100) DEFAULT ''`,
     `ALTER TABLE productos ADD COLUMN IF NOT EXISTS codigo_barras VARCHAR(60) DEFAULT ''`,
