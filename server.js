@@ -457,6 +457,8 @@ async function migrate(){
     `ALTER TABLE productos ALTER COLUMN alto TYPE NUMERIC(8,2) USING alto::numeric`,
     `ALTER TABLE productos ALTER COLUMN ancho TYPE NUMERIC(8,2) USING ancho::numeric`,
     `ALTER TABLE productos ALTER COLUMN largo TYPE NUMERIC(8,2) USING largo::numeric`,
+    // One-time: limpiar envío gratis que el bot había copiado del proveedor en productos RXZ (se ejecuta una sola vez)
+    `DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM configuracion WHERE clave='_reset_eg_rxz_v1') THEN UPDATE productos SET envio_gratis=false WHERE sku LIKE 'RXZ-%'; INSERT INTO configuracion (tenant_id,clave,valor) VALUES (1,'_reset_eg_rxz_v1','1') ON CONFLICT (tenant_id,clave) DO NOTHING; END IF; END $$;`,
     `ALTER TABLE productos ADD COLUMN IF NOT EXISTS descripcion TEXT DEFAULT ''`,
     `ALTER TABLE productos ADD COLUMN IF NOT EXISTS sku VARCHAR(100) DEFAULT ''`,
     `ALTER TABLE productos ADD COLUMN IF NOT EXISTS codigo_barras VARCHAR(60) DEFAULT ''`,
@@ -1649,8 +1651,8 @@ app.post('/api/bot/sync', botAuth, async (req, res) => {
           // Existe → actualiza SOLO precio/stock/oferta/envío gratis. NO pisa nombre/imagen/categoría (por si Leandro las editó a mano).
           prodId = rows[0].id;
           await pool.query(
-            `UPDATE productos SET precio_base=$1, precio_oferta=$2, stock=$3, envio_gratis=$4 WHERE id=$5 AND tenant_id=$6`,
-            [precioBase, precioOferta, stock, envioGratis, prodId, t]);
+            `UPDATE productos SET precio_base=$1, precio_oferta=$2, stock=$3 WHERE id=$4 AND tenant_id=$5`,
+            [precioBase, precioOferta, stock, prodId, t]);
           actualizados++;
         } else {
           // Nuevo → inserta completo en la sección destino.
@@ -1659,7 +1661,7 @@ app.post('/api/bot/sync', botAuth, async (req, res) => {
           const { rows: ins } = await pool.query(
             `INSERT INTO productos (tenant_id,seccion_id,categoria,modelo,nombre,descripcion,precio_base,precio_oferta,stock,imagen,sku,envio_gratis,peso,alto,ancho,largo,visible)
              VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,true) RETURNING id`,
-            [t, secId, categoria, nombre, nombre, descripcion, precioBase, precioOferta, stock, imagenRe, skuT, envioGratis, peso, alto, ancho, largo]);
+            [t, secId, categoria, nombre, nombre, descripcion, precioBase, precioOferta, stock, imagenRe, skuT, false, peso, alto, ancho, largo]);
           prodId = ins[0].id;
           // Galería completa: todas las imágenes del proveedor (también re-hosteadas)
           const galeria = Array.isArray(p.imagenes) && p.imagenes.length ? p.imagenes : (imagen ? [imagen] : []);
