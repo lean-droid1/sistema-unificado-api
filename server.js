@@ -1727,13 +1727,28 @@ app.post('/api/bot/limpiar-deposito', botAuth, async (req, res) => {
     const { rows: cnt } = await pool.query('SELECT COUNT(*)::int as n FROM productos WHERE seccion_id=$1 AND tenant_id=$2', [secId, t]);
     const total = cnt[0]?.n || 0;
 
-    // Borrar imágenes y variantes primero (por si no hay ON DELETE CASCADE), después productos
-    await pool.query('DELETE FROM producto_imagenes WHERE tenant_id=$1 AND producto_id IN (SELECT id FROM productos WHERE seccion_id=$2 AND tenant_id=$1)', [t, secId]).catch(()=>{});
-    await pool.query('DELETE FROM variantes WHERE tenant_id=$1 AND producto_id IN (SELECT id FROM productos WHERE seccion_id=$2 AND tenant_id=$1)', [t, secId]).catch(()=>{});
-    await pool.query('DELETE FROM favoritos WHERE producto_id IN (SELECT id FROM productos WHERE seccion_id=$1 AND tenant_id=$2)', [secId, t]).catch(()=>{});
-    const r = await pool.query('DELETE FROM productos WHERE seccion_id=$1 AND tenant_id=$2', [secId, t]);
+    // IDs de la sección DEPOSITO
+    const { rows: idsRows } = await pool.query('SELECT id FROM productos WHERE seccion_id=$1 AND tenant_id=$2', [secId, t]);
+    const allIds = idsRows.map(x => x.id);
 
-    res.json({ ok: true, seccion_id: secId, borrados: r.rowCount, total_previo: total });
+    // Excluir los productos que ya están en pedidos (FK: no se pueden borrar, se conservan por historial)
+    let usados = new Set();
+    if (allIds.length) {
+      const { rows: usadosRows } = await pool.query('SELECT DISTINCT producto_id FROM pedido_items WHERE producto_id = ANY($1::int[])', [allIds]);
+      usados = new Set(usadosRows.map(x => x.producto_id));
+    }
+    const borrables = allIds.filter(id => !usados.has(id));
+
+    let borrados = 0;
+    if (borrables.length) {
+      await pool.query('DELETE FROM producto_imagenes WHERE producto_id = ANY($1::int[])', [borrables]).catch(()=>{});
+      await pool.query('DELETE FROM variantes WHERE producto_id = ANY($1::int[])', [borrables]).catch(()=>{});
+      await pool.query('DELETE FROM favoritos WHERE producto_id = ANY($1::int[])', [borrables]).catch(()=>{});
+      const r = await pool.query('DELETE FROM productos WHERE id = ANY($1::int[])', [borrables]);
+      borrados = r.rowCount;
+    }
+
+    res.json({ ok: true, seccion_id: secId, borrados, total_previo: total, conservados_en_pedidos: usados.size });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
