@@ -1752,6 +1752,46 @@ app.post('/api/bot/limpiar-deposito', botAuth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// POST /api/bot/deduplicar — elimina productos duplicados por SKU (deja el de menor id).
+// Reengancha pedidos y ordenes de compra al que queda (no rompe historial ni FK).
+app.post('/api/bot/deduplicar', botAuth, async (req, res) => {
+  const t = req.botTenantId;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    // Grupos de SKU con mas de una fila
+    const { rows: grupos } = await client.query(
+      `SELECT sku, MIN(id) AS keep_id, COUNT(*)::int AS n
+         FROM productos
+        WHERE tenant_id=$1 AND sku IS NOT NULL AND sku<>''
+        GROUP BY sku HAVING COUNT(*) > 1`, [t]);
+    let borrados = 0, grupos_afectados = 0;
+    for (const g of grupos) {
+      const { rows: dups } = await client.query(
+        'SELECT id FROM productos WHERE tenant_id=$1 AND sku=$2 AND id<>$3', [t, g.sku, g.keep_id]);
+      const dupIds = dups.map(d => d.id);
+      if (!dupIds.length) continue;
+      grupos_afectados++;
+      // Reenganchar historial de pedidos/compras al producto que se conserva
+      await client.query('UPDATE pedido_items SET producto_id=$1 WHERE producto_id = ANY($2::int[])', [g.keep_id, dupIds]).catch(()=>{});
+      await client.query('UPDATE orden_compra_items SET producto_id=$1 WHERE producto_id = ANY($2::int[])', [g.keep_id, dupIds]).catch(()=>{});
+      // Tablas sin ON DELETE CASCADE: limpiar del duplicado
+      await client.query('DELETE FROM precios_fijos WHERE producto_id = ANY($1::int[])', [dupIds]).catch(()=>{});
+      await client.query('DELETE FROM historial_precios WHERE producto_id = ANY($1::int[])', [dupIds]).catch(()=>{});
+      // Borrar duplicados (imagenes/variantes/favoritos/etc. caen por ON DELETE CASCADE)
+      const r = await client.query('DELETE FROM productos WHERE id = ANY($1::int[]) AND tenant_id=$2', [dupIds, t]);
+      borrados += r.rowCount;
+    }
+    await client.query('COMMIT');
+    res.json({ ok: true, grupos_afectados, borrados });
+  } catch (e) {
+    await client.query('ROLLBACK').catch(()=>{});
+    res.status(500).json({ error: e.message });
+  } finally {
+    client.release();
+  }
+});
+
 // POST /api/bot/fotos-por-nombre — matchea fotos por nombre y las agrega SOLO a productos sin imagen
 // Body: { fotos: [ { nombre, imagenes: [url, ...] } ], modo: 'reportar' | 'aplicar' }
 app.post('/api/bot/fotos-por-nombre', botAuth, async (req, res) => {
