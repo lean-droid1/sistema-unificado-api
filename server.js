@@ -510,6 +510,7 @@ async function migrate(){
     `ALTER TABLE listas_precio ADD COLUMN IF NOT EXISTS modo VARCHAR(20) DEFAULT 'porcentaje'`,
     // popups
     `ALTER TABLE popups ADD COLUMN IF NOT EXISTS secciones_ids TEXT DEFAULT ''`,
+    `ALTER TABLE popups ADD COLUMN IF NOT EXISTS imagenes JSONB DEFAULT '[]'::jsonb`,
     // menu_items
     `ALTER TABLE menu_items ADD COLUMN IF NOT EXISTS seccion_id INT`,
     `ALTER TABLE menu_items ADD COLUMN IF NOT EXISTS orden INT DEFAULT 0`,
@@ -2033,7 +2034,7 @@ async function syncImagenPrincipal(productoId, tenantId){
   }catch(e){ console.log('sync img principal warn', e.message.slice(0,80)); }
 }
 app.get('/api/producto-imagenes/:producto_id', async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM producto_imagenes WHERE producto_id=$1 AND tenant_id=$2 ORDER BY orden', [req.params.producto_id, req.tenantId]); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
-app.post('/api/producto-imagenes', authPerm('productos'), async (req,res)=>{ try{ const {producto_id,url,orden}=req.body; const {rows}=await pool.query('INSERT INTO producto_imagenes (tenant_id,producto_id,url,orden) VALUES ($4,$1,$2,$3) RETURNING *', [producto_id,url,orden||0, req.tenantId]); await syncImagenPrincipal(producto_id, req.tenantId); res.json(rows[0]); }catch(e){ res.status(500).json({error:e.message}); } });
+app.post('/api/producto-imagenes', authPerm('productos'), async (req,res)=>{ try{ const {producto_id,url,orden}=req.body; if(!url||!String(url).trim()) return res.status(400).json({error:'Falta la URL de la imagen'}); const {rows:pp}=await pool.query('SELECT 1 FROM productos WHERE id=$1 AND tenant_id=$2', [producto_id, req.tenantId]); if(!pp[0]) return res.status(404).json({error:'Producto no encontrado'}); const {rows}=await pool.query('INSERT INTO producto_imagenes (tenant_id,producto_id,url,orden) VALUES ($4,$1,$2,$3) RETURNING *', [producto_id,url,orden||0, req.tenantId]); await syncImagenPrincipal(producto_id, req.tenantId); res.json(rows[0]); }catch(e){ res.status(500).json({error:e.message}); } });
 app.delete('/api/producto-imagenes/:id', authPerm('productos'), async (req,res)=>{ try{ const {rows:pv}=await pool.query('SELECT producto_id FROM producto_imagenes WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); await pool.query('DELETE FROM producto_imagenes WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); if(pv[0]) await syncImagenPrincipal(pv[0].producto_id, req.tenantId); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 app.put('/api/producto-imagenes/reorder', authPerm('productos'), async (req,res)=>{ try{ const {items}=req.body; for(const it of items){ await pool.query('UPDATE producto_imagenes SET orden=$1 WHERE id=$2 AND tenant_id=$3', [it.orden,it.id, req.tenantId]); } if(items&&items[0]){ const {rows:pv}=await pool.query('SELECT producto_id FROM producto_imagenes WHERE id=$1 AND tenant_id=$2', [items[0].id, req.tenantId]); if(pv[0]) await syncImagenPrincipal(pv[0].producto_id, req.tenantId); } res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 app.get('/api/variantes/:producto_id', async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM variantes WHERE producto_id=$1 AND tenant_id=$2 ORDER BY id', [req.params.producto_id, req.tenantId]); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
@@ -2738,8 +2739,14 @@ app.delete('/api/promociones/:id', authPerm('config'), async (req,res)=>{ try{ a
 // POPUPS, REDES, MENU, DESIGN, METODOS PAGO, PAGINAS, BADGES, ENVIO CONFIG
 app.get('/api/popups', async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM popups WHERE activo=true AND tenant_id=$1 ORDER BY created_at DESC', [req.tenantId]); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
 app.get('/api/popups/all', authPerm('config'), async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM popups WHERE tenant_id=$1 ORDER BY created_at DESC', [req.tenantId]); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
-app.post('/api/popups', authPerm('config'), async (req,res)=>{ try{ const p=req.body; const {rows}=await pool.query('INSERT INTO popups (titulo,imagen,url_destino,secciones_ids,activo,tenant_id) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *', [p.titulo||'',p.imagen||'',p.url_destino||'',p.secciones_ids||'',p.activo!==false, req.tenantId]); res.json(rows[0]); }catch(e){ res.status(500).json({error:e.message}); } });
-app.put('/api/popups/:id', authPerm('config'), async (req,res)=>{ try{ const p=req.body; await pool.query('UPDATE popups SET titulo=$1,imagen=$2,url_destino=$3,secciones_ids=$4,activo=$5 WHERE id=$6 AND tenant_id=$7', [p.titulo,p.imagen,p.url_destino,p.secciones_ids||'',p.activo!==false,req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+// Pop-ups: varias imágenes (carrusel). 'imagen' queda como la primera, por compatibilidad.
+const popupImagenes = (p) => {
+  const arr = (Array.isArray(p.imagenes) ? p.imagenes : []).map(u => String(u || '').trim()).filter(u => /^(https?:\/\/|\/)/i.test(u)).slice(0, 10);
+  if (!arr.length && p.imagen) arr.push(String(p.imagen).trim());
+  return arr;
+};
+app.post('/api/popups', authPerm('config'), async (req,res)=>{ try{ const p=req.body||{}; const imgs=popupImagenes(p); const {rows}=await pool.query('INSERT INTO popups (titulo,imagen,imagenes,url_destino,secciones_ids,activo,tenant_id) VALUES ($1,$2,$3::jsonb,$4,$5,$6,$7) RETURNING *', [p.titulo||'',imgs[0]||'',JSON.stringify(imgs),p.url_destino||'',p.secciones_ids||'',p.activo!==false, req.tenantId]); res.json(rows[0]); }catch(e){ res.status(500).json({error:e.message}); } });
+app.put('/api/popups/:id', authPerm('config'), async (req,res)=>{ try{ const p=req.body||{}; const imgs=popupImagenes(p); await pool.query('UPDATE popups SET titulo=$1,imagen=$2,imagenes=$3::jsonb,url_destino=$4,secciones_ids=$5,activo=$6 WHERE id=$7 AND tenant_id=$8', [p.titulo||'',imgs[0]||'',JSON.stringify(imgs),p.url_destino||'',p.secciones_ids||'',p.activo!==false,req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 app.delete('/api/popups/:id', authPerm('config'), async (req,res)=>{ try{ await pool.query('DELETE FROM popups WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 
 app.get('/api/redes-sociales', async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM redes_sociales WHERE tenant_id=$1 ORDER BY orden', [req.tenantId]); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
