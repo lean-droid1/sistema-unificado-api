@@ -1777,6 +1777,7 @@ app.post('/api/bot/sync', botAuth, async (req, res) => {
         const precioOferta = Number(p.precio_oferta) || 0;
         const stock = parseInt(p.stock) || 0;
         const envioGratis = !!p.envio_gratis;
+        const costo = Math.max(0, Number(p.costo) || 0); // lo que cobra el proveedor → precio de costo (ganancia del dashboard)
 
         const { rows } = await pool.query('SELECT id FROM productos WHERE sku=$1 AND tenant_id=$2 LIMIT 1', [skuT, t]);
         let prodId;
@@ -1784,17 +1785,17 @@ app.post('/api/bot/sync', botAuth, async (req, res) => {
           // Existe → actualiza SOLO precio/stock/oferta/envío gratis. NO pisa nombre/imagen/categoría (por si Leandro las editó a mano).
           prodId = rows[0].id;
           await pool.query(
-            `UPDATE productos SET precio_base=$1, precio_oferta=$2, stock=$3 WHERE id=$4 AND tenant_id=$5`,
-            [precioBase, precioOferta, stock, prodId, t]);
+            `UPDATE productos SET precio_base=$1, precio_oferta=$2, stock=$3, precio_original=CASE WHEN $6>0 THEN $6 ELSE precio_original END WHERE id=$4 AND tenant_id=$5`,
+            [precioBase, precioOferta, stock, prodId, t, costo]);
           actualizados++;
         } else {
           // Nuevo → inserta completo en la sección destino.
           // Re-hostear la imagen principal en Cloudinary (independiza de rxz/hotlink).
           const imagenRe = await rehostBot(imagen);
           const { rows: ins } = await pool.query(
-            `INSERT INTO productos (tenant_id,seccion_id,categoria,modelo,nombre,descripcion,precio_base,precio_oferta,stock,imagen,sku,envio_gratis,peso,alto,ancho,largo,visible,pendiente_aprobacion)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18) RETURNING id`,
-            [t, secId, categoria, nombre, nombre, descripcion, precioBase, precioOferta, stock, imagenRe, skuT, false, peso, alto, ancho, largo, !ocultarNuevos, ocultarNuevos]);
+            `INSERT INTO productos (tenant_id,seccion_id,categoria,modelo,nombre,descripcion,precio_base,precio_oferta,stock,imagen,sku,envio_gratis,peso,alto,ancho,largo,visible,pendiente_aprobacion,precio_original)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19) RETURNING id`,
+            [t, secId, categoria, nombre, nombre, descripcion, precioBase, precioOferta, stock, imagenRe, skuT, false, peso, alto, ancho, largo, !ocultarNuevos, ocultarNuevos, costo]);
           prodId = ins[0].id;
           if (nuevos.length < 300) nuevos.push({ id: prodId, sku: skuT, nombre, precio: precioOferta > 0 ? precioOferta : precioBase, imagen: imagenRe, categoria });
           // Galería completa: todas las imágenes del proveedor (también re-hosteadas)
@@ -2728,14 +2729,19 @@ app.get('/api/reportes', authPerm('stats'), requiereFeature('reportes'), async (
   }catch(e){ res.status(500).json({error:e.message}); }
 });
 
+// Fechas del dashboard en hora de Argentina (la base guarda en la zona del servidor, que en Railway es UTC):
+// sin esto, un pedido de las 22 h caía en el día siguiente y "hoy" quedaba en 0 desde las 21 h.
+const TZ_TIENDA = `'${(process.env.TZ_TIENDA || 'America/Argentina/Buenos_Aires').replace(/'/g, '')}'`;
+const fLocal = (c) => `(${c} AT TIME ZONE current_setting('TimeZone') AT TIME ZONE ${TZ_TIENDA})`;
+const HOY_LOCAL = `(now() AT TIME ZONE ${TZ_TIENDA})::date`;
 app.get('/api/stats', authPerm('stats'), async (req,res)=>{
   try{
     const {seccion_id,desde,hasta,is_test}=req.query;
     const params=[req.tenantId];
     let secWhere=''; if(seccion_id && seccion_id!=='all'){ params.push(seccion_id); secWhere=` AND seccion_id=$${params.length}`; }
     let dateWhere='';
-    if(desde){ params.push(desde); dateWhere+=` AND created_at >= $${params.length}`; }
-    if(hasta){ params.push(hasta); dateWhere+=` AND created_at <= $${params.length}`; }
+    if(desde){ params.push(desde); dateWhere+=` AND ${fLocal('created_at')} >= $${params.length}`; }
+    if(hasta){ params.push(hasta); dateWhere+=` AND ${fLocal('created_at')} <= $${params.length}`; }
     let testWhere=''; if(is_test==='false') testWhere=' AND is_test=false';
     // COBRADO = pagado→total, señado→sena (lo efectivamente cobrado), impago→0
     const COBR = `CASE WHEN estado_pago='pagado' THEN total WHEN estado_pago='senado' THEN COALESCE(sena,0) ELSE 0 END`;
@@ -2748,12 +2754,12 @@ app.get('/api/stats', authPerm('stats'), async (req,res)=>{
     const aCobrar = await pool.query(`SELECT COALESCE(SUM(total - ${COBR}),0) AS total, COUNT(*) FILTER (WHERE estado_pago<>'pagado') AS cant FROM pedidos WHERE ${vivos}`, params);
     const totalProductos = await pool.query(`SELECT COUNT(*) FROM productos WHERE tenant_id=$1${seccion_id && seccion_id!=='all' ? ' AND seccion_id=$2' : ''}`, seccion_id && seccion_id!=='all' ? [req.tenantId, seccion_id] : [req.tenantId]);
     const totalUsuarios = await pool.query('SELECT COUNT(*) FROM usuarios WHERE rol <> $1 AND tenant_id=$2', ['admin', req.tenantId]);
-    const ventasPorDia = await pool.query(`SELECT DATE(created_at) AS fecha, COUNT(*) FILTER (WHERE estado_pago<>'impago') AS cantidad, COALESCE(SUM(${COBR}),0) AS total FROM pedidos WHERE ${vivos} GROUP BY DATE(created_at) ORDER BY fecha DESC LIMIT 30`, params);
+    const ventasPorDia = await pool.query(`SELECT to_char(${fLocal('created_at')}::date,'YYYY-MM-DD') AS fecha, COUNT(*)::int AS pedidos, COUNT(*) FILTER (WHERE estado_pago<>'impago') AS cantidad, COALESCE(SUM(${COBR}),0) AS total, COALESCE(SUM(total),0) AS vendido FROM pedidos WHERE ${vivos} GROUP BY 1 ORDER BY 1 DESC LIMIT 60`, params);
     const porEstado = await pool.query(`SELECT LOWER(estado) AS estado, COUNT(*) AS cantidad FROM pedidos WHERE ${vivos} GROUP BY LOWER(estado)`, params);
     const porMetodo = await pool.query(`SELECT COALESCE(NULLIF(metodo_pago,''),'—') AS metodo, COUNT(*) AS cantidad, COALESCE(SUM(${COBR}),0) AS total FROM pedidos WHERE ${vivos} GROUP BY COALESCE(NULLIF(metodo_pago,''),'—') ORDER BY total DESC`, params);
     let porSeccion={rows:[]};
     if(!(seccion_id && seccion_id!=='all')){
-      porSeccion = await pool.query(`SELECT s.nombre AS seccion, COALESCE(SUM(${COBR}),0) AS total FROM pedidos p JOIN secciones s ON s.id=p.seccion_id WHERE p.tenant_id=$1 AND p.archivado=false AND p.tipo='pedido' AND p.moneda='ARS' AND p.estado NOT IN ('cancelado')${dateWhere.replace(/created_at/g,'p.created_at')}${testWhere.replace('is_test','p.is_test')} GROUP BY s.nombre ORDER BY total DESC LIMIT 10`, params);
+      porSeccion = await pool.query(`SELECT s.id AS seccion_id, s.nombre AS seccion, COUNT(*)::int AS cantidad, COALESCE(SUM(${COBR}),0) AS total FROM pedidos p JOIN secciones s ON s.id=p.seccion_id WHERE p.tenant_id=$1 AND p.archivado=false AND p.tipo='pedido' AND p.moneda='ARS' AND p.estado NOT IN ('cancelado')${dateWhere.replace(/created_at/g,'p.created_at')}${testWhere.replace('is_test','p.is_test')} GROUP BY s.id, s.nombre ORDER BY total DESC LIMIT 10`, params);
     }
     const secP = secWhere.replace('seccion_id','p.seccion_id');
     const dateP = dateWhere.replace(/created_at/g,'p.created_at');
@@ -2762,9 +2768,24 @@ app.get('/api/stats', authPerm('stats'), async (req,res)=>{
     const topCat = await pool.query(`SELECT COALESCE(NULLIF(pi.categoria,''),'Sin categoría') AS categoria, SUM(pi.cantidad) AS cantidad, COALESCE(SUM(pi.precio_unitario*pi.cantidad),0) AS total FROM pedido_items pi JOIN pedidos p ON pi.pedido_id=p.id WHERE p.tenant_id=$1 AND p.archivado=false AND p.tipo='pedido' AND ${cobrRel}${secP}${dateP}${testP} GROUP BY COALESCE(NULLIF(pi.categoria,''),'Sin categoría') ORDER BY total DESC LIMIT 8`, params);
     const topProd = await pool.query(`SELECT COALESCE(NULLIF(pi.nombre_producto,''),'—') AS nombre, SUM(pi.cantidad) AS cantidad, COALESCE(SUM(pi.precio_unitario*pi.cantidad),0) AS total FROM pedido_items pi JOIN pedidos p ON pi.pedido_id=p.id WHERE p.tenant_id=$1 AND p.archivado=false AND p.tipo='pedido' AND ${cobrRel}${secP}${dateP}${testP} GROUP BY COALESCE(NULLIF(pi.nombre_producto,''),'—') ORDER BY cantidad DESC LIMIT 10`, params);
     const mesParams=[req.tenantId]; let secMes=''; if(seccion_id && seccion_id!=='all'){ mesParams.push(seccion_id); secMes=' AND seccion_id=$2'; }
-    const mesAct = await pool.query(`SELECT COALESCE(SUM(${COBR}),0) AS total FROM pedidos WHERE tenant_id=$1 AND archivado=false AND tipo='pedido' AND moneda='ARS' AND estado NOT IN ('cancelado')${secMes}${testWhere} AND created_at >= date_trunc('month', CURRENT_DATE)`, mesParams);
-    const mesAnt = await pool.query(`SELECT COALESCE(SUM(${COBR}),0) AS total FROM pedidos WHERE tenant_id=$1 AND archivado=false AND tipo='pedido' AND moneda='ARS' AND estado NOT IN ('cancelado')${secMes}${testWhere} AND created_at >= date_trunc('month', CURRENT_DATE - INTERVAL '1 month') AND created_at < date_trunc('month', CURRENT_DATE)`, mesParams);
+    const mesAct = await pool.query(`SELECT COALESCE(SUM(${COBR}),0) AS total FROM pedidos WHERE tenant_id=$1 AND archivado=false AND tipo='pedido' AND moneda='ARS' AND estado NOT IN ('cancelado')${secMes}${testWhere} AND ${fLocal('created_at')} >= date_trunc('month', ${HOY_LOCAL})`, mesParams);
+    const mesAnt = await pool.query(`SELECT COALESCE(SUM(${COBR}),0) AS total FROM pedidos WHERE tenant_id=$1 AND archivado=false AND tipo='pedido' AND moneda='ARS' AND estado NOT IN ('cancelado')${secMes}${testWhere} AND ${fLocal('created_at')} >= date_trunc('month', ${HOY_LOCAL} - INTERVAL '1 month') AND ${fLocal('created_at')} < LEAST(date_trunc('month', ${HOY_LOCAL}), date_trunc('month', ${HOY_LOCAL} - INTERVAL '1 month') + ((${HOY_LOCAL} - date_trunc('month', ${HOY_LOCAL})::date) + 1) * INTERVAL '1 day')`, mesParams); // mismo tramo del mes pasado (del 1 al día de hoy)
     const abandonados = await pool.query('SELECT COUNT(*) FROM carritos_abandonados WHERE recuperado=false AND tenant_id=$1', [req.tenantId]).catch(()=>({rows:[{count:0}]}));
+    // Hoy (no depende del filtro de fechas)
+    const hoyQ = await pool.query(`SELECT COUNT(*)::int AS pedidos, COALESCE(SUM(total),0) AS total, COALESCE(SUM(${COBR}),0) AS cobrado FROM pedidos WHERE tenant_id=$1 AND archivado=false AND tipo='pedido' AND moneda='ARS' AND estado NOT IN ('cancelado')${secMes}${testWhere} AND ${fLocal('created_at')}::date = ${HOY_LOCAL}`, mesParams);
+    // Ganancia estimada: lo cobrado de cada producto menos su precio de costo (solo productos con costo cargado)
+    const ganQ = await pool.query(`SELECT COALESCE(SUM(pi.cantidad*pi.precio_unitario),0) AS facturado,
+        COALESCE(SUM(pi.cantidad*pi.precio_unitario) FILTER (WHERE COALESCE(pr.precio_original,0)>0),0) AS facturado_con_costo,
+        COALESCE(SUM(pi.cantidad*pr.precio_original) FILTER (WHERE COALESCE(pr.precio_original,0)>0),0) AS costo
+      FROM pedido_items pi JOIN pedidos p ON pi.pedido_id=p.id LEFT JOIN productos pr ON pr.id=pi.producto_id AND pr.tenant_id=p.tenant_id
+      WHERE p.tenant_id=$1 AND p.archivado=false AND p.tipo='pedido' AND ${cobrRel}${secP}${dateP}${testP}`, params);
+    // Clientes nuevos: en el rango elegido, o en los últimos 30 días
+    const cliParams=[req.tenantId]; let cliWhere='';
+    if(desde||hasta){ if(desde){ cliParams.push(desde); cliWhere+=` AND ${fLocal('created_at')} >= $${cliParams.length}`; } if(hasta){ cliParams.push(hasta); cliWhere+=` AND ${fLocal('created_at')} <= $${cliParams.length}`; } }
+    else cliWhere=` AND ${fLocal('created_at')} >= ${HOY_LOCAL} - INTERVAL '30 days'`;
+    const cliNuevos = await pool.query(`SELECT COUNT(*)::int AS n FROM usuarios WHERE tenant_id=$1 AND rol='cliente'${cliWhere}`, cliParams).catch(()=>({rows:[{n:0}]}));
+    const pendAprob = await pool.query(`SELECT COUNT(*)::int AS n FROM usuarios WHERE tenant_id=$1 AND rol='cliente' AND aprobado=false AND activo<>false`, [req.tenantId]).catch(()=>({rows:[{n:0}]}));
+    const sinStock = await pool.query(`SELECT COUNT(*)::int AS n FROM productos WHERE tenant_id=$1 AND visible=true AND stock<=0 AND COALESCE(permitir_sin_stock,false)=false AND COALESCE(es_digital,false)=false${seccion_id && seccion_id!=='all' ? ' AND seccion_id=$2' : ''}`, seccion_id && seccion_id!=='all' ? [req.tenantId, seccion_id] : [req.tenantId]).catch(()=>({rows:[{n:0}]}));
 
     // ── APARTADO USDT (mismo criterio: solo cobrado + seña) ──
     const baseU = `tenant_id=$1 AND archivado=false AND tipo='pedido' AND moneda='USDT'${secWhere}${dateWhere}${testWhere} AND estado NOT IN ('cancelado')`;
@@ -2790,8 +2811,76 @@ app.get('/api/stats', authPerm('stats'), async (req,res)=>{
       ventas_mes_actual: parseFloat(mesAct.rows[0].total),
       ventas_mes_anterior: parseFloat(mesAnt.rows[0].total),
       carritos_abandonados: parseInt(abandonados.rows[0].count),
+      hoy: { pedidos: hoyQ.rows[0].pedidos, total: parseFloat(hoyQ.rows[0].total), cobrado: parseFloat(hoyQ.rows[0].cobrado) },
+      ganancia: (()=>{ const g=ganQ.rows[0]||{}; const f=parseFloat(g.facturado||0), fc=parseFloat(g.facturado_con_costo||0), c=parseFloat(g.costo||0); return { ganancia: fc-c, facturado: f, facturado_con_costo: fc, costo: c, cobertura_pct: f>0 ? Math.round(fc/f*100) : 0, margen_pct: fc>0 ? Math.round((fc-c)/fc*100) : 0 }; })(),
+      clientes_nuevos: cliNuevos.rows[0].n,
+      clientes_por_aprobar: pendAprob.rows[0].n,
+      productos_sin_stock: sinStock.rows[0].n,
       usdt: { total_ventas: parseFloat(u.total||0), pedidos: parseInt(u.pedidos||0), pedidos_pagados: parseInt(u.pagados||0), total_a_cobrar: parseFloat(u.a_cobrar||0) }
     });
+  }catch(e){ res.status(500).json({error:e.message}); }
+});
+
+// GET /api/stats/detalle?tipo=…&valor=… — lo que hay detrás de cada número del dashboard (mismos filtros que /api/stats).
+// tipo: pedidos | a_cobrar | cobrados | pagados | hoy | estado | metodo | seccion | dia | producto  → lista de pedidos
+//       categoria | ganancia → lista de productos;  clientes_nuevos → lista de clientes
+app.get('/api/stats/detalle', authPerm('stats'), async (req,res)=>{
+  try{
+    const {seccion_id,desde,hasta,is_test,tipo}=req.query;
+    const valor=String(req.query.valor||'');
+    const params=[req.tenantId];
+    let w=`p.tenant_id=$1 AND p.archivado=false AND p.tipo='pedido' AND p.moneda='ARS' AND p.estado NOT IN ('cancelado')`;
+    if(seccion_id && seccion_id!=='all'){ params.push(seccion_id); w+=` AND p.seccion_id=$${params.length}`; }
+    const rango=(campo)=>{ let x=''; if(desde){ params.push(desde); x+=` AND ${fLocal(campo)} >= $${params.length}`; } if(hasta){ params.push(hasta); x+=` AND ${fLocal(campo)} <= $${params.length}`; } return x; };
+    if(tipo!=='hoy') w+=rango('p.created_at');
+    if(is_test==='false') w+=' AND p.is_test=false';
+    const COBR=`CASE WHEN p.estado_pago='pagado' THEN p.total WHEN p.estado_pago='senado' THEN COALESCE(p.sena,0) ELSE 0 END`;
+    const cobrRel=` AND p.estado_pago IN ('pagado','senado')`;
+
+    if(tipo==='categoria' || tipo==='ganancia'){
+      let extra=cobrRel;
+      if(tipo==='categoria'){ params.push(valor); extra+=` AND COALESCE(NULLIF(pi.categoria,''),'Sin categoría')=$${params.length}`; }
+      const {rows}=await pool.query(`SELECT COALESCE(NULLIF(pi.nombre_producto,''),'—') AS nombre, MAX(pi.producto_id) AS producto_id, SUM(pi.cantidad)::int AS cantidad,
+          COALESCE(SUM(pi.cantidad*pi.precio_unitario),0) AS total,
+          CASE WHEN BOOL_AND(COALESCE(pr.precio_original,0)>0) THEN COALESCE(SUM(pi.cantidad*pr.precio_original),0) ELSE NULL END AS costo
+        FROM pedido_items pi JOIN pedidos p ON pi.pedido_id=p.id LEFT JOIN productos pr ON pr.id=pi.producto_id AND pr.tenant_id=p.tenant_id
+        WHERE ${w}${extra} GROUP BY COALESCE(NULLIF(pi.nombre_producto,''),'—') ORDER BY total DESC LIMIT 300`, params);
+      const filas=rows.map(r=>({ ...r, total: parseFloat(r.total), costo: r.costo===null ? null : parseFloat(r.costo), ganancia: r.costo===null ? null : parseFloat(r.total)-parseFloat(r.costo) }));
+      if(tipo==='ganancia') filas.sort((a,b)=> (a.ganancia===null) - (b.ganancia===null) || (b.ganancia||0)-(a.ganancia||0) || b.total-a.total);
+      return res.json({ modo:'productos', filas, resumen:{ cantidad: filas.length, unidades: filas.reduce((a,r)=>a+r.cantidad,0), total: filas.reduce((a,r)=>a+r.total,0), ganancia: filas.reduce((a,r)=>a+(r.ganancia||0),0), sin_costo: filas.filter(r=>r.costo===null).length } });
+    }
+    if(tipo==='clientes_nuevos'){
+      const cp=[req.tenantId]; let cw='';
+      if(desde||hasta){ if(desde){ cp.push(desde); cw+=` AND ${fLocal('u.created_at')} >= $${cp.length}`; } if(hasta){ cp.push(hasta); cw+=` AND ${fLocal('u.created_at')} <= $${cp.length}`; } } else cw=` AND ${fLocal('u.created_at')} >= ${HOY_LOCAL} - INTERVAL '30 days'`;
+      const {rows}=await pool.query(`SELECT u.id, u.nombre, u.usuario, u.telefono, u.email, u.created_at, u.aprobado,
+          (SELECT COUNT(*)::int FROM pedidos p WHERE p.usuario_id=u.id AND p.tenant_id=u.tenant_id AND p.tipo='pedido' AND p.estado<>'cancelado') AS compras
+        FROM usuarios u WHERE u.tenant_id=$1 AND u.rol='cliente'${cw} ORDER BY u.created_at DESC LIMIT 300`, cp);
+      return res.json({ modo:'clientes', filas: rows, resumen:{ cantidad: rows.length, compraron: rows.filter(r=>r.compras>0).length } });
+    }
+
+    let extra='';
+    switch(tipo){
+      case 'pedidos': break;
+      case 'a_cobrar': extra=` AND COALESCE(p.estado_pago,'impago')<>'pagado'`; break;
+      case 'cobrados': extra=` AND (${COBR})>0`; break;
+      case 'pagados': extra=` AND p.estado_pago='pagado'`; break;
+      case 'hoy': extra=` AND ${fLocal('p.created_at')}::date = ${HOY_LOCAL}`; break;
+      case 'estado': params.push(valor.toLowerCase()); extra=` AND LOWER(p.estado)=$${params.length}`; break;
+      case 'metodo': params.push(valor); extra=` AND COALESCE(NULLIF(p.metodo_pago,''),'—')=$${params.length}`; break;
+      case 'seccion': params.push(parseInt(valor)||0); extra=` AND p.seccion_id=$${params.length}`; break;
+      case 'dia': if(!/^\d{4}-\d{2}-\d{2}$/.test(valor)) return res.status(400).json({error:'Fecha inválida'}); params.push(valor); extra=` AND ${fLocal('p.created_at')}::date=$${params.length}::date`; break;
+      case 'producto': params.push(valor); extra=`${cobrRel} AND EXISTS (SELECT 1 FROM pedido_items pi WHERE pi.pedido_id=p.id AND COALESCE(NULLIF(pi.nombre_producto,''),'—')=$${params.length})`; break;
+      default: return res.status(400).json({error:'Tipo de detalle desconocido'});
+    }
+    const cantProd = tipo==='producto' ? `, (SELECT COALESCE(SUM(pi.cantidad),0)::int FROM pedido_items pi WHERE pi.pedido_id=p.id AND COALESCE(NULLIF(pi.nombre_producto,''),'—')=$${params.length}) AS cantidad_producto` : '';
+    const {rows}=await pool.query(`SELECT p.id, p.tipo, p.created_at, p.estado, COALESCE(NULLIF(p.estado_pago,''),'impago') AS estado_pago, p.total, p.metodo_pago, p.is_test,
+        (${COBR}) AS cobrado, p.total-(${COBR}) AS saldo, p.seccion_id, s.nombre AS seccion_nombre, s.color AS seccion_color,
+        u.nombre AS usuario_nombre, u.telefono AS usuario_telefono, u.nombre_fantasia${cantProd}
+      FROM pedidos p LEFT JOIN usuarios u ON u.id=p.usuario_id LEFT JOIN secciones s ON s.id=p.seccion_id
+      WHERE ${w}${extra} ORDER BY p.created_at DESC LIMIT 300`, params);
+    const {rows:tot}=await pool.query(`SELECT COUNT(*)::int AS cantidad, COALESCE(SUM(p.total),0) AS total, COALESCE(SUM(${COBR}),0) AS cobrado, COALESCE(SUM(p.total-(${COBR})),0) AS saldo FROM pedidos p WHERE ${w}${extra}`, params);
+    const t=tot[0]||{};
+    res.json({ modo:'pedidos', filas: rows, resumen:{ cantidad: t.cantidad||0, total: parseFloat(t.total||0), cobrado: parseFloat(t.cobrado||0), saldo: parseFloat(t.saldo||0) } });
   }catch(e){ res.status(500).json({error:e.message}); }
 });
 
