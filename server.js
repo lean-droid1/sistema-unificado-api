@@ -1283,6 +1283,14 @@ app.post('/api/productos/rehost-imagenes', authPerm('productos'), async (req,res
   const t = req.tenantId;
   try{
     if(!useCloudinary) return res.status(503).json({error:'Cloudinary no configurado'});
+    if(process.env.REHOST_RXZ !== '1'){
+      // Cloudflare de rxz bloquea a Cloudinary/Railway: estas fotos las sube el bot con su proxy.
+      const { rows:rest } = await pool.query(
+        `SELECT COUNT(DISTINCT p.id)::int AS n FROM productos p
+         LEFT JOIN producto_imagenes pi ON pi.producto_id=p.id AND pi.tenant_id=p.tenant_id
+         WHERE p.tenant_id=$1 AND (p.imagen ILIKE '%rxzweb%' OR pi.url ILIKE '%rxzweb%')`, [t]);
+      return res.json({ ok:true, migradas:0, fallidas:0, restantes:(rest[0]&&rest[0].n)||0, via_bot:true });
+    }
     const limit = Math.min(Math.max(parseInt(req.body && req.body.limit)||15, 1), 40);
     const { rows } = await pool.query(
       `SELECT DISTINCT p.id FROM productos p
@@ -1640,6 +1648,62 @@ const botAuth = (req, res, next) => {
   req.botTenantId = parseInt(process.env.BOT_TENANT_ID || '1', 10);
   next();
 };
+// rxzweb está detrás de Cloudflare: ni Railway ni Cloudinary pueden bajar esas fotos (solo pierde tiempo).
+// Las deja como vienen y el bot las sube después por /api/bot/foto (las baja con su proxy residencial).
+const rehostBot = (u) => (/rxzweb\.com/i.test(String(u || '')) && process.env.REHOST_RXZ !== '1') ? String(u || '') : rehostImagen(u);
+const uploadBot = multer({ storage: multer.memoryStorage(), limits: { fileSize: 12 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => cb(null, /^image\//i.test(file.mimetype || '')) });
+
+// GET /api/bot/fotos-externas — URLs (distintas) de fotos que siguen apuntando al proveedor.
+app.get('/api/bot/fotos-externas', botAuth, async (req, res) => {
+  const t = req.botTenantId;
+  try {
+    const patron = '%rxzweb%';
+    const { rows } = await pool.query(
+      `SELECT url, COUNT(*)::int AS usos FROM (
+         SELECT imagen AS url FROM productos WHERE tenant_id=$1 AND imagen ILIKE $2
+         UNION ALL
+         SELECT url FROM producto_imagenes WHERE tenant_id=$1 AND url ILIKE $2
+       ) x GROUP BY url ORDER BY url`, [t, patron]);
+    const { rows: np } = await pool.query(
+      `SELECT COUNT(DISTINCT p.id)::int AS n FROM productos p
+       LEFT JOIN producto_imagenes pi ON pi.producto_id=p.id AND pi.tenant_id=p.tenant_id
+       WHERE p.tenant_id=$1 AND (p.imagen ILIKE $2 OR pi.url ILIKE $2)`, [t, patron]);
+    res.json({ ok: true, total: rows.length, productos: (np[0] && np[0].n) || 0, urls: rows.map(r => r.url) });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// POST /api/bot/foto — el bot manda una foto que bajó del proveedor (multipart: imagen + origen).
+// Se sube a Cloudinary y se reemplaza la URL de origen en TODOS los productos/galerías que la usen.
+// También acepta JSON { origen, nueva } (nueva = URL de Cloudinary ya subida) para solo reemplazar.
+app.post('/api/bot/foto', botAuth, (req, res, next) => uploadBot.single('imagen')(req, res, (err) => {
+  if (err) return res.status(400).json({ error: err.code === 'LIMIT_FILE_SIZE' ? 'Imagen demasiado grande (máx. 12 MB)' : err.message });
+  next();
+}), async (req, res) => {
+  const t = req.botTenantId;
+  try {
+    const origen = String((req.body && req.body.origen) || '').trim();
+    if (!/^https?:\/\//i.test(origen)) return res.status(400).json({ error: 'origen inválido' });
+    let nueva = String((req.body && req.body.nueva) || '').trim();
+    if (req.file) {
+      if (!useCloudinary) return res.status(503).json({ error: 'Cloudinary no configurado' });
+      // public_id fijo por URL de origen: si se reintenta, pisa la misma foto (no duplica en Cloudinary).
+      const publicId = 'rxz_' + crypto.createHash('sha1').update(origen).digest('hex').slice(0, 24);
+      const r = await new Promise((resolve, reject) => {
+        const s = cloudinary.uploader.upload_stream({
+          folder: 'productos/rxz', public_id: publicId, overwrite: true, resource_type: 'image',
+          transformation: [{ width: 1600, height: 1600, crop: 'limit', quality: 'auto' }],
+        }, (e, out) => e ? reject(e) : resolve(out));
+        s.end(req.file.buffer);
+      });
+      nueva = r.secure_url;
+    }
+    if (!nueva || !esCloudinaria(nueva)) return res.status(400).json({ error: 'Falta la imagen' });
+    const a = await pool.query('UPDATE productos SET imagen=$1 WHERE tenant_id=$2 AND imagen=$3', [nueva, t, origen]);
+    const b = await pool.query('UPDATE producto_imagenes SET url=$1 WHERE tenant_id=$2 AND url=$3', [nueva, t, origen]);
+    res.json({ ok: true, url: nueva, reemplazos: a.rowCount + b.rowCount });
+  } catch (e) { res.status(500).json({ error: String(e.message || e).slice(0, 200) }); }
+});
 
 // POST /api/bot/sync — recibe un lote de productos del proveedor y hace upsert por SKU.
 // Body: { productos: [ { sku, nombre, precio_base, precio_oferta, stock, imagen, categoria, envio_gratis, variantes:[{nombre,valor,stock,precio}] } ], seccion_id? }
@@ -1696,7 +1760,7 @@ app.post('/api/bot/sync', botAuth, async (req, res) => {
         } else {
           // Nuevo → inserta completo en la sección destino.
           // Re-hostear la imagen principal en Cloudinary (independiza de rxz/hotlink).
-          const imagenRe = await rehostImagen(imagen);
+          const imagenRe = await rehostBot(imagen);
           const { rows: ins } = await pool.query(
             `INSERT INTO productos (tenant_id,seccion_id,categoria,modelo,nombre,descripcion,precio_base,precio_oferta,stock,imagen,sku,envio_gratis,peso,alto,ancho,largo,visible)
              VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,true) RETURNING id`,
@@ -1705,7 +1769,7 @@ app.post('/api/bot/sync', botAuth, async (req, res) => {
           // Galería completa: todas las imágenes del proveedor (también re-hosteadas)
           const galeria = Array.isArray(p.imagenes) && p.imagenes.length ? p.imagenes : (imagen ? [imagen] : []);
           for (let gi = 0; gi < galeria.length; gi++) {
-            const urlRe = await rehostImagen(galeria[gi]);
+            const urlRe = await rehostBot(galeria[gi]);
             await pool.query('INSERT INTO producto_imagenes (tenant_id,producto_id,url,orden) VALUES ($1,$2,$3,$4) ON CONFLICT DO NOTHING', [t, prodId, urlRe, gi]).catch(()=>{});
           }
           insertados++;
