@@ -50,9 +50,15 @@ const rateLimit = require('express-rate-limit');
 app.use('/api/auth', rateLimit({ windowMs: 15 * 60 * 1000, max: 30 }));
 // Límite estricto para login/registro (anti fuerza bruta): 10 intentos cada 15 min por IP
 const authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 10, message: { error: 'Demasiados intentos. Esperá unos minutos e intentá de nuevo.' }, standardHeaders: true, legacyHeaders: false });
-app.use('/api/login', authLimiter);
-app.use('/api/register', authLimiter);
-app.use('/api/', rateLimit({ windowMs: 1 * 60 * 1000, max: 300 }));
+// Login: el límite es por conexión + usuario. Con datos móviles muchos clientes comparten la misma dirección IP
+// y antes 10 intentos fallidos de cualquiera bloqueaban el ingreso de todos los demás.
+const loginLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 10, standardHeaders: true, legacyHeaders: false,
+  message: { error: 'Demasiados intentos con este usuario. Esperá unos minutos e intentá de nuevo.' },
+  keyGenerator: (req) => `${req.ip}|${String((req.body && req.body.usuario) || '').toLowerCase().trim()}` });
+app.use('/api/login', loginLimiter);
+app.use('/api/register', rateLimit({ windowMs: 15 * 60 * 1000, max: 30, message: { error: 'Demasiados registros desde esta conexión. Probá más tarde.' }, standardHeaders: true, legacyHeaders: false }));
+// Límite general por conexión: holgado porque una sola página hace ~20 pedidos y muchos clientes pueden compartir IP
+app.use('/api/', rateLimit({ windowMs: 1 * 60 * 1000, max: 1500, standardHeaders: true, legacyHeaders: false, message: { error: 'Demasiados pedidos seguidos. Esperá unos segundos.' } }));
 app.use('/api/', (req,res,next)=>resolveTenant(req,res,next));
 app.set('trust proxy', 1);
 
