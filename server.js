@@ -2121,7 +2121,21 @@ app.get('/api/usuarios/:id/historial', authPerm('usuarios'), async (req,res)=>{
   }catch(e){ res.status(500).json({error:e.message}); }
 });
 app.get('/api/usuarios', authPerm('usuarios'), async (req,res)=>{
-  try{ const {q}=req.query; let query='SELECT * FROM usuarios WHERE tenant_id=$1 ORDER BY created_at DESC'; const params=[req.tenantId]; if(q){ query="SELECT * FROM usuarios WHERE tenant_id=$1 AND (nombre ILIKE $2 OR usuario ILIKE $2 OR nombre_fantasia ILIKE $2 OR email ILIKE $2 OR telefono ILIKE $2) ORDER BY created_at DESC"; params.push(`%${q}%`); } const {rows}=await pool.query(query, params); res.json(rows.map(u=>({...u,password:undefined}))); }catch(e){ res.status(500).json({error:e.message}); }
+  try{
+    const {q}=req.query; const params=[req.tenantId]; let filtro='';
+    if(q){ filtro=" AND (u.nombre ILIKE $2 OR u.usuario ILIKE $2 OR u.nombre_fantasia ILIKE $2 OR u.email ILIKE $2 OR u.telefono ILIKE $2)"; params.push(`%${q}%`); }
+    // Resumen de compras de cada cliente (solo pedidos reales, sin presupuestos, cancelados ni pruebas)
+    const {rows}=await pool.query(`SELECT u.*, COALESCE(c.compras,0)::int AS compras, COALESCE(c.total_gastado,0)::float AS total_gastado, COALESCE(c.total_pagado,0)::float AS total_pagado, c.ultima_compra
+      FROM usuarios u
+      LEFT JOIN (
+        SELECT usuario_id, COUNT(*) AS compras, SUM(total) AS total_gastado,
+               SUM(CASE WHEN estado_pago='pagado' THEN total ELSE 0 END) AS total_pagado, MAX(created_at) AS ultima_compra
+        FROM pedidos WHERE tenant_id=$1 AND tipo='pedido' AND COALESCE(is_test,false)=false AND LOWER(COALESCE(estado,''))<>'cancelado'
+        GROUP BY usuario_id
+      ) c ON c.usuario_id=u.id
+      WHERE u.tenant_id=$1${filtro} ORDER BY u.created_at DESC`, params);
+    res.json(rows.map(u=>({...u, password:undefined, reset_codigo:undefined, reset_expira:undefined})));
+  }catch(e){ res.status(500).json({error:e.message}); }
 });
 app.get('/api/usuarios/pendientes/count', authPerm('usuarios'), async (req,res)=>{ try{ const {rows}=await pool.query("SELECT COUNT(*) FROM usuarios WHERE aprobado=false AND activo=false AND tenant_id=$1", [req.tenantId]); res.json({count:parseInt(rows[0].count)}); }catch{ res.json({count:0}); } });
 app.put('/api/usuarios/:id', authPerm('usuarios'), async (req,res)=>{
@@ -2415,7 +2429,9 @@ app.put('/api/pedidos/:id', authPerm('pedidos'), async (req,res)=>{  try{
 
     // ── CUENTA CORRIENTE automática al cambiar estado de pago ──
     const nuevoEstadoPago = (p.estado_pago!==undefined) ? String(p.estado_pago) : oldEstadoPago;
-    if(pedUsuarioId && nuevoEstadoPago !== oldEstadoPago){
+    // (antes esto solo corría si el pedido tenía cliente asignado, y usaba una conexión inexistente:
+    //  marcar "pagado" no registraba el cobro en la caja y marcar "debe" daba error)
+    if(nuevoEstadoPago !== oldEstadoPago){
       // ── HISTORIAL: registrar quién cambió el estado y cuándo ──
       try {
         const labels = { impago:'Impago', senado:'Señado', pagado:'Pagado', debe:'Debe', pendiente:'Impago' };
@@ -2431,9 +2447,9 @@ app.put('/api/pedidos/:id', authPerm('pedidos'), async (req,res)=>{  try{
       // ── AUTO-PAGO: si pasa a "pagado", registrar un pago por el total (si no hay pagos ya) ──
       if(nuevoEstadoPago==='pagado'){
         try {
-          const {rows:pagosYa}=await pool.query('SELECT COALESCE(SUM(cuenta_como),0) as saldado FROM pedido_pagos WHERE pedido_id=$1', [req.params.id]);
+          const {rows:pagosYa}=await pool.query('SELECT COALESCE(SUM(cuenta_como),0) as saldado FROM pedido_pagos WHERE pedido_id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]);
           const yaSaldado=Number(pagosYa[0]?.saldado||0);
-          const {rows:itPed}=await client.query('SELECT precio_unitario, cantidad FROM pedido_items WHERE pedido_id=$1',[req.params.id]);
+          const {rows:itPed}=await pool.query('SELECT precio_unitario, cantidad FROM pedido_items WHERE pedido_id=$1 AND tenant_id=$2',[req.params.id, req.tenantId]);
           const totItems=itPed.reduce((a,it)=>a+Number(it.precio_unitario||0)*Number(it.cantidad||1),0);
           const totalPed=totItems>0 ? (totItems - Number((oldPedRows[0]||{}).descuento||0) + Number((oldPedRows[0]||{}).costo_envio||0)) : ((p.total!==undefined)?Number(p.total):Number((oldPedRows[0]||{}).total||0));
           let falta=totalPed-yaSaldado;
@@ -2441,25 +2457,26 @@ app.put('/api/pedidos/:id', authPerm('pedidos'), async (req,res)=>{  try{
           if(falta>0.01 && totalPed>0){
             await pool.query(
               'INSERT INTO pedido_pagos (tenant_id,pedido_id,metodo,monto,recibido,cuenta_como,ajuste_pct,ajuste_monto,nota) VALUES ($1,$2,$3,$4,$5,$6,0,0,$7)',
-              [req.tenantId, req.params.id, (p.metodo_pago||'efectivo'), falta, falta, falta, 'Marcado como pagado']
-            ).catch(()=>{});
+              [req.tenantId, req.params.id, (p.metodo_pago||(oldPedRows[0]||{}).metodo_pago||'Efectivo'), falta, falta, falta, 'Marcado como pagado']
+            ).catch(e=>console.log('[auto-pago]', e.message));
+            await pool.query('UPDATE pedidos SET sena=0 WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]).catch(()=>{});
           }
-        } catch(e){}
+        } catch(e){ console.log('[auto-pago]', e.message); }
       }
-      if(nuevoEstadoPago==='debe' && oldEstadoPago!=='debe'){
+      if(pedUsuarioId && nuevoEstadoPago==='debe' && oldEstadoPago!=='debe'){
         // Pasó a "debe" (fiado): registrar cargo si no existe ya para este pedido
-        const {rows:ya}=await pool.query("SELECT id FROM cuenta_corriente WHERE pedido_id=$1 AND tipo='cargo'", [req.params.id]);
+        const {rows:ya}=await pool.query("SELECT id FROM cuenta_corriente WHERE pedido_id=$1 AND tipo='cargo' AND tenant_id=$2", [req.params.id, req.tenantId]);
         if(!ya.length){
-          const {rows:itPed}=await client.query('SELECT precio_unitario, cantidad FROM pedido_items WHERE pedido_id=$1',[req.params.id]);
+          const {rows:itPed}=await pool.query('SELECT precio_unitario, cantidad FROM pedido_items WHERE pedido_id=$1 AND tenant_id=$2',[req.params.id, req.tenantId]);
           const totItems=itPed.reduce((a,it)=>a+Number(it.precio_unitario||0)*Number(it.cantidad||1),0);
           const totalPed=totItems>0 ? (totItems - Number((oldPedRows[0]||{}).descuento||0) + Number((oldPedRows[0]||{}).costo_envio||0)) : ((p.total!==undefined)?Number(p.total):Number((oldPedRows[0]||{}).total||0));
           const senaPed=(p.sena!==undefined)?Number(p.sena):Number((oldPedRows[0]||{}).sena||0);
           const deuda=totalPed-senaPed;
-          if(deuda>0) await pool.query('INSERT INTO cuenta_corriente (usuario_id,tipo,monto,concepto,pedido_id) VALUES ($1,$2,$3,$4,$5)', [pedUsuarioId,'cargo',deuda,`Pedido #${String(req.params.id).padStart(4,'0')}`,req.params.id]).catch(()=>{});
+          if(deuda>0) await pool.query('INSERT INTO cuenta_corriente (tenant_id,usuario_id,tipo,monto,concepto,pedido_id) VALUES ($6,$1,$2,$3,$4,$5)', [pedUsuarioId,'cargo',deuda,`Pedido #${String(req.params.id).padStart(4,'0')}`,req.params.id, req.tenantId]).catch(()=>{});
         }
       } else if(oldEstadoPago==='debe' && nuevoEstadoPago!=='debe'){
         // Salió de "debe" (se pagó): quitar el cargo automático de este pedido
-        await pool.query("DELETE FROM cuenta_corriente WHERE pedido_id=$1 AND tipo='cargo'", [req.params.id]).catch(()=>{});
+        await pool.query("DELETE FROM cuenta_corriente WHERE pedido_id=$1 AND tipo='cargo' AND tenant_id=$2", [req.params.id, req.tenantId]).catch(()=>{});
       }
     }
     if(p.items){
