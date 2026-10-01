@@ -11,6 +11,9 @@ const crypto = require('crypto');
 const { v4: uuidv4 } = require('uuid');
 
 const app = express();
+// Un error suelto en una ruta no debe tirar todo el servidor (mientras se reinicia, la web queda cargando en blanco)
+process.on('unhandledRejection', (e) => { console.error('[error no manejado]', e && e.message ? e.message : e); });
+process.on('uncaughtException', (e) => { console.error('[excepción no capturada]', e && e.message ? e.message : e); });
 
 // === SECURITY ===
 const helmet = require('helmet');
@@ -1482,7 +1485,7 @@ app.post('/api/productos/:id/duplicar', authPerm('productos'), async (req,res)=>
   try{
     const t=req.tenantId;
     const {rows:orig}=await client.query('SELECT * FROM productos WHERE id=$1 AND tenant_id=$2', [req.params.id, t]);
-    if(!orig[0]){ client.release(); return res.status(404).json({error:'No encontrado'}); }
+    if(!orig[0]){ return res.status(404).json({error:'No encontrado'}); } // el finally libera la conexión (antes se liberaba dos veces y podía tirar el servidor)
     const p=orig[0];
     await client.query('BEGIN');
     const {rows}=await client.query(`INSERT INTO productos (tenant_id,seccion_id,categoria,modelo,nombre,precio_base,precio_original,stock,stock_minimo,imagen,notas,compatibilidad,descripcion,sku,tipo,moneda,precio_oferta,envio_gratis,visible,peso,alto,ancho,largo,permitir_sin_stock,es_digital,marca,usa_variantes) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27) RETURNING *`,
