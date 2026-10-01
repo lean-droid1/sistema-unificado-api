@@ -1209,7 +1209,7 @@ app.post('/api/secciones', authPerm('config'), async (req,res)=>{
 // Productos con stock bajo el mínimo (para alertas en dashboard)
 app.get('/api/stock-bajo', authPerm('productos'), async (req,res)=>{
   try{
-    const {rows}=await pool.query(`SELECT p.id, p.nombre, p.modelo, p.categoria, p.stock, p.stock_minimo, s.nombre as seccion_nombre
+    const {rows}=await pool.query(`SELECT p.id, p.nombre, p.modelo, p.imagen, p.categoria, p.stock, p.stock_minimo, s.nombre as seccion_nombre
       FROM productos p LEFT JOIN secciones s ON p.seccion_id=s.id
       WHERE p.tenant_id=$1 AND p.stock_minimo>0 AND p.stock<=p.stock_minimo AND p.permitir_sin_stock=false AND p.es_digital=false
       ORDER BY p.stock ASC LIMIT 100`, [req.tenantId]);
@@ -2215,7 +2215,7 @@ app.get('/api/ordenes-compra/:id', authPerm('pedidos'), requiereFeature('ordenes
   try{
     const {rows:o}=await pool.query('SELECT o.*, s.nombre as seccion_nombre FROM ordenes_compra o LEFT JOIN secciones s ON o.seccion_id=s.id WHERE o.id=$1 AND o.tenant_id=$2', [req.params.id, req.tenantId]);
     if(!o[0]) return res.status(404).json({error:'No encontrada'});
-    const {rows:items}=await pool.query('SELECT * FROM orden_compra_items WHERE orden_id=$1', [req.params.id]);
+    const {rows:items}=await pool.query("SELECT oi.*, COALESCE(pr.imagen,'') AS imagen FROM orden_compra_items oi LEFT JOIN productos pr ON pr.id=oi.producto_id AND pr.tenant_id=$2 WHERE oi.orden_id=$1 ORDER BY oi.id", [req.params.id, req.tenantId]);
     res.json({ ...o[0], items });
   }catch(e){ res.status(500).json({error:e.message}); }
 });
@@ -2371,7 +2371,7 @@ app.get('/api/pedidos', auth(), async (req,res)=>{
     res.json(rows);
   }catch(e){ res.status(500).json({error:e.message}); }
 });
-app.get('/api/pedidos/:id', auth(), async (req,res)=>{ try{ const {rows}=await pool.query('SELECT p.*, u.nombre as usuario_nombre, u.telefono as usuario_telefono, u.email as usuario_email, u.nombre_fantasia, u.direccion as usuario_direccion, s.nombre as seccion_nombre, s.color as seccion_color FROM pedidos p LEFT JOIN usuarios u ON p.usuario_id=u.id LEFT JOIN secciones s ON p.seccion_id=s.id WHERE p.id=$1 AND p.tenant_id=$2', [req.params.id, req.tenantId]); if(!rows[0]) return res.status(404).json({error:'No encontrado'}); if(Number(rows[0].usuario_id)!==Number(req.user.id) && !(await esStaffPedidos(req))) return res.status(404).json({error:'No encontrado'}); const {rows:items}=await pool.query('SELECT * FROM pedido_items WHERE pedido_id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); const {rows:pagos}=await pool.query('SELECT * FROM pedido_pagos WHERE pedido_id=$1 AND tenant_id=$2 ORDER BY created_at', [req.params.id, req.tenantId]); res.json({...rows[0], items, pagos}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.get('/api/pedidos/:id', auth(), async (req,res)=>{ try{ const {rows}=await pool.query('SELECT p.*, u.nombre as usuario_nombre, u.telefono as usuario_telefono, u.email as usuario_email, u.nombre_fantasia, u.direccion as usuario_direccion, s.nombre as seccion_nombre, s.color as seccion_color FROM pedidos p LEFT JOIN usuarios u ON p.usuario_id=u.id LEFT JOIN secciones s ON p.seccion_id=s.id WHERE p.id=$1 AND p.tenant_id=$2', [req.params.id, req.tenantId]); if(!rows[0]) return res.status(404).json({error:'No encontrado'}); if(Number(rows[0].usuario_id)!==Number(req.user.id) && !(await esStaffPedidos(req))) return res.status(404).json({error:'No encontrado'}); const {rows:items}=await pool.query("SELECT pi.*, COALESCE(NULLIF(pi.imagen,''), pr.imagen, '') AS imagen, pr.sku AS producto_sku FROM pedido_items pi LEFT JOIN productos pr ON pr.id=pi.producto_id AND pr.tenant_id=pi.tenant_id WHERE pi.pedido_id=$1 AND pi.tenant_id=$2 ORDER BY pi.id", [req.params.id, req.tenantId]); const {rows:pagos}=await pool.query('SELECT * FROM pedido_pagos WHERE pedido_id=$1 AND tenant_id=$2 ORDER BY created_at', [req.params.id, req.tenantId]); res.json({...rows[0], items, pagos}); }catch(e){ res.status(500).json({error:e.message}); } });
 
 // ═══ PEDIDOS ═══
 // Helpers compartidos: stock (siempre filtrado por tienda) e inserción de ítems.
@@ -2400,7 +2400,7 @@ async function insertarItems(client, tenantId, pedidoId, items, descontarStock){
   for(const item of items){
     const pid=parseInt(item.producto_id,10)||null;
     const cant=Number(item.cantidad)||1;
-    await client.query('INSERT INTO pedido_items (tenant_id,pedido_id,producto_id,categoria,modelo,nombre_producto,cantidad,precio_unitario,precio_base,variante_id,variante_combinacion) VALUES ($9,$1,$2,$3,$4,$5,$6,$7,$8,$10,$11)',
+    await client.query("INSERT INTO pedido_items (tenant_id,pedido_id,producto_id,categoria,modelo,nombre_producto,cantidad,precio_unitario,precio_base,variante_id,variante_combinacion,imagen) VALUES ($9,$1,$2,$3,$4,$5,$6,$7,$8,$10,$11,COALESCE((SELECT imagen FROM productos WHERE id=$2 AND tenant_id=$9),''))",
       [pedidoId, pid, TXT(item.categoria,200), TXT(item.modelo,200), TXT(item.nombre_producto,300), cant, Number(item.precio_unitario)||0, Number(item.precio_base)||0, tenantId, item.variante_id||null, TXT(item.variante_label||item.variante_combinacion,500)]);
     if(!descontarStock || !pid) continue;
     if(item.variante_id){
@@ -2673,9 +2673,10 @@ app.put('/api/pedidos/:id', authPerm('pedidos'), async (req,res)=>{  try{
     }
     if(p.items){
       // Capturar productos afectados (viejos + nuevos) para recalcular preventa
-      const {rows:viejos}=await pool.query('SELECT DISTINCT producto_id FROM pedido_items WHERE pedido_id=$1', [req.params.id]);
-      await pool.query('DELETE FROM pedido_items WHERE pedido_id=$1', [req.params.id]);
-      for(const item of p.items){ await pool.query('INSERT INTO pedido_items (pedido_id,producto_id,categoria,modelo,nombre_producto,cantidad,precio_unitario,precio_base,variante_id,variante_combinacion) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)', [req.params.id, item.producto_id||item.id, item.categoria||'', item.modelo||'', item.nombre_producto||`${item.categoria} - ${item.modelo}`, item.cantidad||item.qty||1, item.precio_unitario||0, item.precio_base||0, item.variante_id||null, item.variante_label||item.variante_combinacion||'']); }
+      const {rows:viejos}=await pool.query('SELECT DISTINCT producto_id FROM pedido_items WHERE pedido_id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]);
+      await pool.query('DELETE FROM pedido_items WHERE pedido_id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]);
+      // tenant_id explícito (antes quedaba en 1 por defecto y en otras tiendas el pedido editado se quedaba sin productos) + foto del producto
+      for(const item of p.items){ await pool.query("INSERT INTO pedido_items (tenant_id,pedido_id,producto_id,categoria,modelo,nombre_producto,cantidad,precio_unitario,precio_base,variante_id,variante_combinacion,imagen) VALUES ($11,$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,COALESCE((SELECT imagen FROM productos WHERE id=$2 AND tenant_id=$11),''))", [req.params.id, item.producto_id||item.id||null, item.categoria||'', item.modelo||'', item.nombre_producto||`${item.categoria} - ${item.modelo}`, item.cantidad||item.qty||1, item.precio_unitario||0, item.precio_base||0, item.variante_id||null, item.variante_label||item.variante_combinacion||'', req.tenantId]); }
       // Recalcular reservado de preventa para todos los productos tocados
       const afectados=new Set([...viejos.map(v=>v.producto_id), ...p.items.map(it=>it.producto_id||it.id)].filter(Boolean));
       for(const pid of afectados) await recalcReservado(pid);
@@ -2884,7 +2885,7 @@ app.get('/api/stats/detalle', authPerm('stats'), async (req,res)=>{
     if(tipo==='categoria' || tipo==='ganancia'){
       let extra=cobrRel;
       if(tipo==='categoria'){ params.push(valor); extra+=` AND COALESCE(NULLIF(pi.categoria,''),'Sin categoría')=$${params.length}`; }
-      const {rows}=await pool.query(`SELECT COALESCE(NULLIF(pi.nombre_producto,''),'—') AS nombre, MAX(pi.producto_id) AS producto_id, SUM(pi.cantidad)::int AS cantidad,
+      const {rows}=await pool.query(`SELECT COALESCE(NULLIF(pi.nombre_producto,''),'—') AS nombre, MAX(pi.producto_id) AS producto_id, MAX(COALESCE(NULLIF(pi.imagen,''), pr.imagen)) AS imagen, SUM(pi.cantidad)::int AS cantidad,
           COALESCE(SUM(pi.cantidad*pi.precio_unitario),0) AS total,
           CASE WHEN BOOL_AND(COALESCE(pr.precio_original,0)>0) THEN COALESCE(SUM(pi.cantidad*pr.precio_original),0) ELSE NULL END AS costo
         FROM pedido_items pi JOIN pedidos p ON pi.pedido_id=p.id LEFT JOIN productos pr ON pr.id=pi.producto_id AND pr.tenant_id=p.tenant_id
