@@ -1,6 +1,6 @@
 {
   "name": "sistema-unificado-api-v4",
-  "version": "4.4.0",
+  "version": "4.5.0",
   "scripts": {
     "start": "node server.js",
     "init": "node init-db.js"

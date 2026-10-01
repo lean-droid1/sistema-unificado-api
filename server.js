@@ -66,9 +66,25 @@ async function recalcReservado(productoId){
 }
 const SECRET = process.env.JWT_SECRET;
 if (!SECRET) {
-  console.error('❌ JWT_SECRET no configurado - usando fallback solo para dev');
+  // En producción NO se arranca sin clave propia: con la de ejemplo cualquiera podría fabricar sesiones de admin.
+  if (process.env.NODE_ENV === 'production') { console.error('JWT_SECRET no configurado. Cargalo en las variables de Railway.'); process.exit(1); }
+  console.error('JWT_SECRET no configurado - usando clave de desarrollo (solo local)');
 }
-const JWT_SECRET = SECRET || 'dev-only-secret-cambiar-en-prod-2026';
+const JWT_SECRET = SECRET || crypto.randomBytes(32).toString('hex');
+const { createCheckout, CheckoutError } = require('./checkout');
+const checkout = createCheckout(pool);
+
+// Datos de usuario que nunca deben salir hacia el navegador
+const sanitizeUser = (u) => { if (!u) return u; const { password, reset_codigo, reset_expira, notas_admin, ...rest } = u; return rest; };
+// ¿Es personal de la tienda (admin, o subadmin con permiso de pedidos)? Siempre leído de la base, no del token.
+async function esStaffPedidos(req){
+  if(!req.user) return false;
+  const {rows}=await pool.query('SELECT rol, permisos, activo FROM usuarios WHERE id=$1 AND tenant_id=$2', [req.user.id, req.tenantId]).catch(()=>({rows:[]}));
+  const u=rows[0]; if(!u || !u.activo) return false;
+  return u.rol==='admin' || (u.rol==='subadmin' && String(u.permisos||'').split(',').includes('pedidos'));
+}
+// El token pertenece a la tienda de este request (evita usar una sesión de la tienda A en la tienda B)
+const tokenDeEstaTienda = (d, req) => Number(d.tenant_id || 1) === Number(req.tenantId);
 
 // Cloudinary - obligatorio
 const useCloudinary = !!(process.env.CLOUDINARY_CLOUD_NAME && process.env.CLOUDINARY_API_KEY && process.env.CLOUDINARY_API_SECRET);
@@ -92,6 +108,7 @@ const auth = (role) => async (req,res,next)=>{
     const revoked = await pool.query('SELECT 1 FROM tokens_revocados WHERE token_hash=$1', [hashToken(t)]).catch(()=>({rows:[]}));
     if(revoked.rows.length) return res.status(401).json({error:'Sesión cerrada'});
     const d = jwt.verify(t, JWT_SECRET);
+    if(!tokenDeEstaTienda(d, req)) return res.status(401).json({error:'Tu sesión es de otra tienda. Iniciá sesión de nuevo.'});
     if(role){
       const {rows} = await pool.query('SELECT rol, activo FROM usuarios WHERE id=$1 AND tenant_id=$2', [d.id, req.tenantId]).catch(()=>({rows:[]}));
       if(!rows[0] || !rows[0].activo) return res.status(401).json({error:'Cuenta desactivada'});
@@ -130,7 +147,7 @@ const requiereFeature = (feature) => async (req,res,next)=>{
     next();
   }catch{ next(); } // ante error, no bloquear (fail-open, para no romper por un bug)
 };
-const optionalAuth = (req,res,next)=>{ try{ const t=req.headers.authorization?.split(' ')[1]; if(t) req.user=jwt.verify(t,JWT_SECRET);}catch{} next(); };
+const optionalAuth = (req,res,next)=>{ try{ const t=req.headers.authorization?.split(' ')[1]; if(t){ const d=jwt.verify(t,JWT_SECRET); if(tokenDeEstaTienda(d, req)) req.user=d; } }catch{} next(); };
 
 // Middleware DUEÑO de la plataforma: solo el owner (Leandro) puede administrar tenants. NO filtra por tenant.
 const authOwner = async (req,res,next)=>{
@@ -223,7 +240,8 @@ const PLAN_FEATURES = {
 const tenantDataCache = new Map();
 async function getTenantData(tenantId){
   const key=String(tenantId);
-  if(tenantDataCache.has(key)) return tenantDataCache.get(key);
+  const hit=tenantDataCache.get(key);
+  if(hit && Date.now()-hit._ts < 5*60*1000) return hit; // se refresca cada 5 min (antes no vencía nunca: una prueba gratis vencida seguía activa)
   const {rows}=await pool.query('SELECT plan, estado, features, fecha_fin_trial FROM tenants WHERE id=$1', [tenantId]).catch(()=>({rows:[]}));
   const t=rows[0]||{plan:'full', estado:'activo', features:null};
   const base=PLAN_FEATURES[t.plan]||PLAN_FEATURES.full;
@@ -237,7 +255,7 @@ async function getTenantData(tenantId){
     if(estado==='trial' && diasRestantes<0) estado='vencido';
   }
   if(Number(tenantId)===1) estado='activo';
-  const data={plan:t.plan||'full', estado, features, dias_restantes:diasRestantes};
+  const data={plan:t.plan||'full', estado, features, dias_restantes:diasRestantes, _ts:Date.now()};
   tenantDataCache.set(key, data);
   return data;
 }
@@ -587,7 +605,7 @@ async function migrate(){
       const adminPass=process.env.ADMIN_PASSWORD||'Admin1234';
       const hash=await bcrypt.hash(adminPass,12);
       await pool.query("INSERT INTO usuarios (tenant_id,nombre,usuario,password,rol,aprobado,activo) VALUES (1,'Administrador','admin',$1,'admin',true,true) ON CONFLICT (tenant_id,usuario) DO NOTHING", [hash]);
-      console.log('✅ Admin creado -> usuario: admin  password: '+adminPass+'  (cambialo en Mi Cuenta)');
+      console.log('Admin inicial creado -> usuario: admin (contraseña: la de ADMIN_PASSWORD). Cambiala en Mi Cuenta.');
     }
   }catch(e){ console.log('seed admin warn', e.message); }
   // Numeración de pedidos: continuar la correlatividad histórica (arrancar en 6000).
@@ -600,15 +618,15 @@ async function migrate(){
 
 // === UTILS ===
 const validatePassword = (pw)=>{
-  if(!pw || pw.length<8) return 'Min 8 caracteres';
-  if(!/[A-Z]/.test(pw)) return 'Una mayuscula requerida';
-  if(!/[0-9]/.test(pw)) return 'Un numero requerido';
+  if(!pw || String(pw).length<8) return 'La contraseña necesita al menos 8 caracteres';
+  if(!/[A-Z]/.test(pw)) return 'La contraseña necesita al menos una mayúscula';
+  if(!/[0-9]/.test(pw)) return 'La contraseña necesita al menos un número';
   return null;
 };
 let dolarBlueCache={valor:null, ts:0};
 
 // === HEALTH ===
-app.get('/api/health', (req,res)=>res.json({ok:true, v:'4.4.0', cloudinary: !!process.env.CLOUDINARY_CLOUD_NAME}));
+app.get('/api/health', (req,res)=>res.json({ok:true, v:'4.5.0', cloudinary: !!process.env.CLOUDINARY_CLOUD_NAME}));
 
 // ═══════════ PANEL DUEÑO: administración de tenants (solo owner) ═══════════
 // Listar todos los tenants con métricas básicas
@@ -698,7 +716,7 @@ app.post('/api/registro-tienda', authLimiter, async (req,res)=>{
   try{
     const {nombre_tienda, slug, nombre, usuario, password, email, telefono}=req.body;
     if(!nombre_tienda || !slug || !usuario || !password) return res.status(400).json({error:'Faltan datos obligatorios'});
-    if(String(password).length<6) return res.status(400).json({error:'La contraseña debe tener al menos 6 caracteres'});
+    const pwErr=validatePassword(String(password)); if(pwErr) return res.status(400).json({error:'Contraseña: '+pwErr});
     const slugClean=String(slug).toLowerCase().trim().replace(/[^a-z0-9-]/g,'');
     if(!slugClean || slugClean.length<3) return res.status(400).json({error:'La dirección web debe tener al menos 3 letras (solo letras, números y guiones)'});
     const admUser=String(usuario).toLowerCase().trim();
@@ -881,9 +899,9 @@ app.get('/api/dolar-blue', async (req,res)=>{
     if(dolarBlueCache.valor && Date.now()-dolarBlueCache.ts<15*60*1000) return res.json({venta:dolarBlueCache.valor});
     const r = await fetch('https://dolarapi.com/v1/dolares/blue');
     if(r.ok){ const d=await r.json(); dolarBlueCache={valor:d.venta, ts:Date.now()}; return res.json({venta:d.venta}); }
-    const {rows}=await pool.query("SELECT valor FROM configuracion WHERE clave='dolar_blue'");
+    const {rows}=await pool.query("SELECT valor FROM configuracion WHERE clave='dolar_blue' AND tenant_id=$1", [req.tenantId]);
     res.json({venta: rows[0]?.valor?Number(rows[0].valor):null});
-  }catch(e){ const {rows}=await pool.query("SELECT valor FROM configuracion WHERE clave='dolar_blue'").catch(()=>({rows:[]})); res.json({venta: rows[0]?.valor?Number(rows[0].valor):null}); }
+  }catch(e){ const {rows}=await pool.query("SELECT valor FROM configuracion WHERE clave='dolar_blue' AND tenant_id=$1", [req.tenantId]).catch(()=>({rows:[]})); res.json({venta: rows[0]?.valor?Number(rows[0].valor):null}); }
 });
 
 // Maintenance
@@ -1029,7 +1047,7 @@ app.post('/api/login', async (req,res)=>{
     }
     delete loginAttempts[key];
     const token=jwt.sign({id:rows[0].id, rol:rows[0].rol, usuario:rows[0].usuario, tenant_id:rows[0].tenant_id||1, es_owner:rows[0].es_owner||false}, JWT_SECRET, {expiresIn:'7d'});
-    res.json({token, user:{...rows[0], password:undefined}});
+    res.json({token, user:sanitizeUser(rows[0])});
   }catch(e){ res.status(500).json({error:e.message}); }
 });
 app.post('/api/logout', auth(), async (req,res)=>{
@@ -1040,34 +1058,38 @@ app.post('/api/refresh-token', auth(), async (req,res)=>{
 });
 app.put('/api/me/otp', auth(), async (req,res)=>{ try{ const {activo}=req.body; await pool.query('UPDATE usuarios SET otp_activo=$1 WHERE id=$2 AND tenant_id=$3', [activo, req.user.id, req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 
-// Password reset mejorado
-app.post('/api/forgot-password', async (req,res)=>{
+// Recuperar contraseña: el código va SOLO por email. La respuesta es siempre la misma
+// (no confirma si el usuario existe ni devuelve el código: antes cualquiera podía tomar la cuenta del admin).
+app.post('/api/forgot-password', authLimiter, async (req,res)=>{
+  const generica={ok:true, mensaje:'Si los datos coinciden con una cuenta con email, te enviamos un código. Revisá tu correo (y el spam).'};
   try{
-    const {usuario, email} = req.body;
-    if(!usuario && !email) return res.status(400).json({error:'Usuario o email requerido'});
-    const {rows} = await pool.query('SELECT * FROM usuarios WHERE (LOWER(usuario)=LOWER($1) OR LOWER(email)=LOWER($1)) AND tenant_id=$2 LIMIT 1', [usuario||email, req.tenantId]);
-    if(!rows[0]) return res.status(404).json({error:'Usuario no encontrado'});
-    const codigo = 'KICKS-'+crypto.randomBytes(3).toString('hex').toUpperCase(); // ej KICKS-A3F9B2
-    await pool.query('UPDATE usuarios SET reset_codigo=$1, reset_expira=NOW()+INTERVAL \'24 hours\' WHERE id=$2', [codigo, rows[0].id]);
-    // Enviar por mail si hay resend
-    if(resend && rows[0].email){
-      await resend.emails.send({from:process.env.RESEND_FROM||'noreply@resend.dev', to:rows[0].email, subject:'Recuperar contraseña', html:`<h2>Tu código: ${codigo}</h2><p>Expira en 24hs. Usalo para entrar y luego cambiala en Mi Cuenta.</p>`}).catch(()=>{});
-    }
-    res.json({ok:true, codigo, telefono: rows[0].telefono, mensaje:'Código generado. Si tenés email configurado te llega por mail, sino usalo directo.'});
-  }catch(e){ res.status(500).json({error:e.message}); }
+    const dato=String(req.body.usuario||req.body.email||'').trim();
+    if(!dato) return res.status(400).json({error:'Escribí tu usuario o email'});
+    const {rows}=await pool.query("SELECT id, email, nombre FROM usuarios WHERE (LOWER(usuario)=LOWER($1) OR LOWER(email)=LOWER($1)) AND tenant_id=$2 AND activo=true LIMIT 1", [dato, req.tenantId]);
+    const u=rows[0];
+    if(!u || !u.email || !resend) return res.json(generica);
+    const codigo=crypto.randomBytes(5).toString('hex').toUpperCase(); // 10 caracteres, imposible de adivinar
+    await pool.query("UPDATE usuarios SET reset_codigo=$1, reset_expira=NOW()+INTERVAL '1 hour' WHERE id=$2 AND tenant_id=$3", [codigo, u.id, req.tenantId]);
+    const {tienda}=await _tiendaInfo(req.tenantId);
+    await _sendMail(u.email, `Código para recuperar tu contraseña — ${tienda}`,
+      `<div style="font-family:system-ui,sans-serif;max-width:480px;margin:0 auto"><h2>Recuperar contraseña</h2><p>Hola ${String(u.nombre||'').replace(/[<>&]/g,'')}, tu código es:</p><p style="font-size:26px;font-weight:800;letter-spacing:3px">${codigo}</p><p style="color:#666">Vence en 1 hora. Si no lo pediste, ignorá este mail.</p></div>`,
+      { fromName: tienda });
+    res.json(generica);
+  }catch(e){ console.log('[forgot] ', e.message); res.json(generica); }
 });
-app.post('/api/reset-password', async (req,res)=>{
+app.post('/api/reset-password', authLimiter, async (req,res)=>{
   try{
-    const {codigo, nueva_password} = req.body;
+    const codigo=String(req.body.codigo||'').trim().toUpperCase();
+    const {nueva_password}=req.body;
     if(!codigo||!nueva_password) return res.status(400).json({error:'Código y nueva contraseña requeridos'});
     const pwError=validatePassword(nueva_password);
     if(pwError) return res.status(400).json({error:pwError});
-    const {rows}=await pool.query('SELECT * FROM usuarios WHERE reset_codigo=$1 AND reset_expira>NOW() AND tenant_id=$2', [codigo, req.tenantId]);
-    if(!rows[0]) return res.status(400).json({error:'Código inválido o expirado'});
+    const {rows}=await pool.query("SELECT id FROM usuarios WHERE reset_codigo<>'' AND UPPER(reset_codigo)=$1 AND reset_expira>NOW() AND tenant_id=$2", [codigo, req.tenantId]);
+    if(!rows[0]) return res.status(400).json({error:'Código inválido o vencido. Pedí uno nuevo.'});
     const hash=await bcrypt.hash(nueva_password,12);
-    await pool.query('UPDATE usuarios SET password=$1, reset_codigo=\'\', reset_expira=NULL WHERE id=$2', [hash, rows[0].id]);
+    await pool.query("UPDATE usuarios SET password=$1, reset_codigo='', reset_expira=NULL WHERE id=$2 AND tenant_id=$3", [hash, rows[0].id, req.tenantId]);
     res.json({ok:true});
-  }catch(e){ res.status(500).json({error:e.message}); }
+  }catch(e){ res.status(500).json({error:'No se pudo cambiar la contraseña'}); }
 });
 
 app.post('/api/register', async (req,res)=>{
@@ -1086,7 +1108,7 @@ app.post('/api/register', async (req,res)=>{
     res.json(rows[0]);
   }catch(e){ res.status(400).json({error:e.message.includes('duplicate')?'Usuario ya existe':e.message}); }
 });
-app.get('/api/me', auth(), async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM usuarios WHERE id=$1 AND tenant_id=$2', [req.user.id, req.tenantId]); res.json({...rows[0], password:undefined}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.get('/api/me', auth(), async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM usuarios WHERE id=$1 AND tenant_id=$2', [req.user.id, req.tenantId]); res.json(sanitizeUser(rows[0])); }catch(e){ res.status(500).json({error:e.message}); } });
 // Crear cliente rápido desde el panel (venta de mostrador). Genera usuario auto si no se pasa.
 app.post('/api/usuarios/rapido', authPerm('usuarios'), async (req,res)=>{
   try{
@@ -1105,11 +1127,18 @@ app.post('/api/usuarios/rapido', authPerm('usuarios'), async (req,res)=>{
 });
 app.put('/api/me', auth(), async (req,res)=>{
   try{
-    const {nombre,telefono,email,direccion,nombre_fantasia,password}=req.body;
-    if(password){ const hash=await bcrypt.hash(password,10); await pool.query('UPDATE usuarios SET nombre=$1,telefono=$2,email=$3,direccion=$4,nombre_fantasia=$5,password=$6 WHERE id=$7 AND tenant_id=$8', [nombre,telefono,email,direccion,nombre_fantasia||'',hash,req.user.id, req.tenantId]); }
+    const {nombre,telefono,email,direccion,nombre_fantasia,password,password_actual}=req.body;
+    if(password){
+      // Cambiar la contraseña exige la actual y una nueva segura
+      const pwError=validatePassword(password); if(pwError) return res.status(400).json({error:pwError});
+      const {rows:cur}=await pool.query('SELECT password FROM usuarios WHERE id=$1 AND tenant_id=$2', [req.user.id, req.tenantId]);
+      if(!cur[0] || !password_actual || !(await bcrypt.compare(String(password_actual), cur[0].password))) return res.status(400).json({error:'La contraseña actual no es correcta'});
+      const hash=await bcrypt.hash(password,12);
+      await pool.query('UPDATE usuarios SET nombre=$1,telefono=$2,email=$3,direccion=$4,nombre_fantasia=$5,password=$6 WHERE id=$7 AND tenant_id=$8', [nombre,telefono,email,direccion,nombre_fantasia||'',hash,req.user.id, req.tenantId]);
+    }
     else{ await pool.query('UPDATE usuarios SET nombre=$1,telefono=$2,email=$3,direccion=$4,nombre_fantasia=$5 WHERE id=$6 AND tenant_id=$7', [nombre,telefono,email,direccion,nombre_fantasia||'',req.user.id, req.tenantId]); }
     const {rows}=await pool.query('SELECT * FROM usuarios WHERE id=$1 AND tenant_id=$2', [req.user.id, req.tenantId]);
-    res.json({...rows[0], password:undefined});
+    res.json(sanitizeUser(rows[0]));
   }catch(e){ res.status(500).json({error:e.message}); }
 });
 
@@ -2000,7 +2029,7 @@ app.post('/api/precios/ajustar', authPerm('productos'), async (req,res)=>{
   }catch(e){ res.status(500).json({error:e.message}); }
 });
 app.post('/api/precios/reset', authPerm('productos'), async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM historial_precios ORDER BY created_at DESC'); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
-app.get('/api/historial-precios', authPerm('productos'), async (req,res)=>{ try{ const {rows}=await pool.query('SELECT h.*, p.nombre, p.modelo, p.categoria FROM historial_precios h LEFT JOIN productos p ON h.producto_id=p.id ORDER BY h.created_at DESC LIMIT 200'); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
+app.get('/api/historial-precios', authPerm('productos'), async (req,res)=>{ try{ const {rows}=await pool.query('SELECT h.*, p.nombre, p.modelo, p.categoria FROM historial_precios h LEFT JOIN productos p ON h.producto_id=p.id AND p.tenant_id=h.tenant_id WHERE h.tenant_id=$1 ORDER BY h.created_at DESC LIMIT 200', [req.tenantId]); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
 
 // ── ÓRDENES DE COMPRA (compras a proveedores) ──
 app.get('/api/ordenes-compra', authPerm('pedidos'), async (req,res)=>{
@@ -2047,7 +2076,8 @@ app.delete('/api/ordenes-compra/:id', authPerm('pedidos'), async (req,res)=>{
   try{ await pool.query('DELETE FROM ordenes_compra WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); res.json({ok:true}); }
   catch(e){ res.status(500).json({error:e.message}); }
 });
-app.get('/api/precios-fijos', authPerm('productos'), async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM precios_fijos WHERE tenant_id=$1', [req.tenantId]); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
+// Precios fijos por lista: el personal ve todos; cada cliente solo los de SU lista (para que la tienda le muestre su precio real)
+app.get('/api/precios-fijos', optionalAuth, async (req,res)=>{ try{ if(!req.user) return res.json([]); const {rows:u}=await pool.query('SELECT rol, permisos, lista_precio_id FROM usuarios WHERE id=$1 AND tenant_id=$2', [req.user.id, req.tenantId]); const me=u[0]; if(!me) return res.json([]); const staff=me.rol==='admin' || (me.rol==='subadmin' && String(me.permisos||'').split(',').includes('productos')); if(staff){ const {rows}=await pool.query('SELECT * FROM precios_fijos WHERE tenant_id=$1', [req.tenantId]); return res.json(rows); } if(!me.lista_precio_id) return res.json([]); const {rows}=await pool.query('SELECT producto_id, lista_precio_id, precio_fijo FROM precios_fijos WHERE tenant_id=$1 AND lista_precio_id=$2', [req.tenantId, me.lista_precio_id]); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
 app.post('/api/precios-fijos', authPerm('productos'), async (req,res)=>{ try{ const {producto_id,lista_precio_id,precio_fijo}=req.body; await pool.query('INSERT INTO precios_fijos (tenant_id,producto_id,lista_precio_id,precio_fijo) VALUES ($4,$1,$2,$3) ON CONFLICT (producto_id,lista_precio_id) DO UPDATE SET precio_fijo=$3', [producto_id,lista_precio_id,precio_fijo, req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 
 // USUARIOS
@@ -2130,152 +2160,176 @@ app.get('/api/pedidos', auth(), async (req,res)=>{
     res.json(rows);
   }catch(e){ res.status(500).json({error:e.message}); }
 });
-app.get('/api/pedidos/:id', auth(), async (req,res)=>{ try{ const {rows}=await pool.query('SELECT p.*, u.nombre as usuario_nombre, u.telefono as usuario_telefono, u.email as usuario_email, u.nombre_fantasia, u.direccion as usuario_direccion, s.nombre as seccion_nombre, s.color as seccion_color FROM pedidos p LEFT JOIN usuarios u ON p.usuario_id=u.id LEFT JOIN secciones s ON p.seccion_id=s.id WHERE p.id=$1 AND p.tenant_id=$2', [req.params.id, req.tenantId]); if(!rows[0]) return res.status(404).json({error:'No encontrado'}); const {rows:items}=await pool.query('SELECT * FROM pedido_items WHERE pedido_id=$1', [req.params.id]); const {rows:pagos}=await pool.query('SELECT * FROM pedido_pagos WHERE pedido_id=$1 ORDER BY created_at', [req.params.id]); res.json({...rows[0], items, pagos}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.get('/api/pedidos/:id', auth(), async (req,res)=>{ try{ const {rows}=await pool.query('SELECT p.*, u.nombre as usuario_nombre, u.telefono as usuario_telefono, u.email as usuario_email, u.nombre_fantasia, u.direccion as usuario_direccion, s.nombre as seccion_nombre, s.color as seccion_color FROM pedidos p LEFT JOIN usuarios u ON p.usuario_id=u.id LEFT JOIN secciones s ON p.seccion_id=s.id WHERE p.id=$1 AND p.tenant_id=$2', [req.params.id, req.tenantId]); if(!rows[0]) return res.status(404).json({error:'No encontrado'}); if(Number(rows[0].usuario_id)!==Number(req.user.id) && !(await esStaffPedidos(req))) return res.status(404).json({error:'No encontrado'}); const {rows:items}=await pool.query('SELECT * FROM pedido_items WHERE pedido_id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); const {rows:pagos}=await pool.query('SELECT * FROM pedido_pagos WHERE pedido_id=$1 AND tenant_id=$2 ORDER BY created_at', [req.params.id, req.tenantId]); res.json({...rows[0], items, pagos}); }catch(e){ res.status(500).json({error:e.message}); } });
 
-// Pedido simple + pedido multi-tienda con transaccion
+// ═══ PEDIDOS ═══
+// Helpers compartidos: stock (siempre filtrado por tienda) e inserción de ítems.
+const TXT = (v, max) => String(v == null ? '' : v).slice(0, max);
+async function validarStockItems(client, tenantId, items){
+  for(const item of items){
+    const pid=parseInt(item.producto_id,10); if(!pid) continue;
+    const {rows:prod}=await client.query('SELECT stock, permitir_sin_stock, es_digital, seccion_id, es_preventa, preventa_cupo, preventa_reservado FROM productos WHERE id=$1 AND tenant_id=$2', [pid, tenantId]);
+    if(!prod[0]) continue;
+    const cant=Number(item.cantidad)||1;
+    if(item.variante_id){
+      // Variantes: las digitales/licencias suelen tener stock 0 y no deben frenar la venta
+      continue;
+    }
+    if(item._preventa || prod[0].es_preventa){
+      const cupo=Number(prod[0].preventa_cupo)||0, reservado=Number(prod[0].preventa_reservado)||0;
+      if(cupo>0 && reservado+cant>cupo) throw new CheckoutError(`Preventa agotada: ${item.nombre_producto||''} (quedan ${Math.max(0,cupo-reservado)} de ${cupo})`);
+      continue;
+    }
+    const {rows:sec}=await client.query('SELECT ignorar_stock, permitir_sin_stock FROM secciones WHERE id=$1 AND tenant_id=$2', [prod[0].seccion_id, tenantId]);
+    const puedeSinStock = prod[0].permitir_sin_stock || prod[0].es_digital || sec[0]?.permitir_sin_stock || sec[0]?.ignorar_stock;
+    if(!puedeSinStock && Number(prod[0].stock) < cant) throw new CheckoutError(`Sin stock suficiente: ${item.nombre_producto||''} (disponible: ${prod[0].stock})`);
+  }
+}
+async function insertarItems(client, tenantId, pedidoId, items, descontarStock){
+  for(const item of items){
+    const pid=parseInt(item.producto_id,10)||null;
+    const cant=Number(item.cantidad)||1;
+    await client.query('INSERT INTO pedido_items (tenant_id,pedido_id,producto_id,categoria,modelo,nombre_producto,cantidad,precio_unitario,precio_base,variante_id,variante_combinacion) VALUES ($9,$1,$2,$3,$4,$5,$6,$7,$8,$10,$11)',
+      [pedidoId, pid, TXT(item.categoria,200), TXT(item.modelo,200), TXT(item.nombre_producto,300), cant, Number(item.precio_unitario)||0, Number(item.precio_base)||0, tenantId, item.variante_id||null, TXT(item.variante_label||item.variante_combinacion,500)]);
+    if(!descontarStock || !pid) continue;
+    if(item.variante_id){
+      await client.query('UPDATE variantes SET stock = GREATEST(0, stock - $1) WHERE id=$2 AND tenant_id=$3', [cant, item.variante_id, tenantId]);
+      continue;
+    }
+    const {rows:pr}=await client.query('SELECT permitir_sin_stock, es_digital, es_preventa FROM productos WHERE id=$1 AND tenant_id=$2', [pid, tenantId]);
+    if(!pr[0]) continue;
+    if(pr[0].es_preventa || item._preventa){
+      await client.query('UPDATE productos SET preventa_reservado = COALESCE(preventa_reservado,0) + $1 WHERE id=$2 AND tenant_id=$3', [cant, pid, tenantId]);
+    } else if(!pr[0].permitir_sin_stock && !pr[0].es_digital){
+      await client.query('UPDATE productos SET stock = GREATEST(0, stock - $1) WHERE id=$2 AND tenant_id=$3 AND permitir_sin_stock=false AND es_digital=false', [cant, pid, tenantId]);
+    }
+  }
+}
+async function etiquetarMoneda(client, pedidoId){
+  await client.query(`UPDATE pedidos SET moneda = CASE WHEN EXISTS(SELECT 1 FROM pedido_items pi LEFT JOIN productos pr ON pr.id=pi.producto_id LEFT JOIN variantes v ON v.id=pi.variante_id WHERE pi.pedido_id=$1 AND COALESCE(v.moneda, pr.moneda,'ARS')='USDT') THEN 'USDT' ELSE 'ARS' END WHERE id=$1`, [pedidoId]).catch(()=>{});
+}
+// Lee {tipo, cp} de la entrega: del body nuevo o, si la web es vieja, del JSON datos_envio
+function leerEntrega(body, peds){
+  if(body && body.entrega && body.entrega.tipo) return { tipo: body.entrega.tipo, cp: body.entrega.cp || '' };
+  for(const p of (peds||[])){
+    try{ const de=typeof p.datos_envio==='string'?JSON.parse(p.datos_envio||'{}'):(p.datos_envio||{}); if(de && de.entrega && de.entrega.tipo) return { tipo: de.entrega.tipo, cp: de.entrega.cp || p.cp_destino || '' }; }catch{}
+  }
+  return { tipo:'envio', cp:(peds&&peds[0]&&peds[0].cp_destino)||'' };
+}
+function errorPedido(res, e){
+  if(e instanceof CheckoutError) return res.status(e.status||400).json({error:e.message});
+  console.log('[pedido] error:', e.message);
+  return res.status(500).json({error:'No pudimos crear el pedido. Probá de nuevo en un momento.'});
+}
+
+// Cotiza el carrito: precios, envío por tienda, cupón y totales. Es lo que muestra el carrito y el checkout.
+app.post('/api/carrito/cotizar', optionalAuth, async (req,res)=>{
+  try{
+    const cot=await checkout.cotizarCarrito(pool, req.tenantId, req.user?.id, req.body||{}, { cotizacion:true });
+    res.json(checkout.publico(cot));
+  }catch(e){
+    if(e instanceof CheckoutError) return res.status(e.status||400).json({error:e.message});
+    console.log('[cotizar] error:', e.message); res.status(500).json({error:'No pudimos calcular el carrito'});
+  }
+});
+
+// Pedido simple. Personal de la tienda (venta de mostrador, presupuestos para clientes): carga libre.
+// Cliente: solo puede guardar PRESUPUESTOS, con precios calculados por el servidor.
 app.post('/api/pedidos', auth(), async (req,res)=>{
   const client=await pool.connect();
   try{
-    const {seccion_id,items,tipo,metodo_pago,notas,cupon_codigo,subtotal,descuento,total,datos_envio,notificar_wa,costo_envio,metodo_envio,cp_destino,is_test,usuario_id}=req.body;
+    const staff=await esStaffPedidos(req);
+    const b=req.body||{};
     await client.query('BEGIN');
-    const esPresupuesto = tipo === 'presupuesto';
-    // Si es admin/subadmin y manda usuario_id (ej presupuesto para un cliente), usarlo; si no, el usuario logueado
-    const esAdmin = ['admin','subadmin'].includes(req.user.rol);
-    const pedidoUserId = (esAdmin && usuario_id !== undefined) ? usuario_id : req.user.id;
-    // Validar stock solo si NO es presupuesto
-    if (!esPresupuesto) {
-    for(const item of (items||[])){
-      const {rows:prod}=await client.query('SELECT stock, permitir_sin_stock, es_digital, seccion_id, es_preventa, preventa_cupo, preventa_reservado FROM productos WHERE id=$1', [item.producto_id]);
-      if(!prod[0]) continue;
-      // Preventa: validar contra cupo (si cupo>0). Cupo 0 = ilimitado
-      if(item._preventa || prod[0].es_preventa){
-        const cupo=Number(prod[0].preventa_cupo)||0;
-        const reservado=Number(prod[0].preventa_reservado)||0;
-        if(cupo>0 && (reservado + (item.cantidad||1)) > cupo){
-          await client.query('ROLLBACK');
-          return res.status(400).json({error:`Preventa agotada: ${item.nombre_producto||''} (quedan ${Math.max(0,cupo-reservado)} de ${cupo})`});
-        }
-        continue;
+    let pedido;
+    if(staff){
+      const items=Array.isArray(b.items)?b.items:[];
+      const esPresupuesto = b.tipo === 'presupuesto';
+      const pedidoUserId = (b.usuario_id !== undefined && b.usuario_id !== null && b.usuario_id !== '') ? b.usuario_id : req.user.id;
+      if(pedidoUserId!==req.user.id){
+        const {rows:uu}=await client.query('SELECT 1 FROM usuarios WHERE id=$1 AND tenant_id=$2', [pedidoUserId, req.tenantId]);
+        if(!uu[0]) throw new CheckoutError('El cliente elegido no existe');
       }
-      const sec=await client.query('SELECT ignorar_stock, permitir_sin_stock FROM secciones WHERE id=$1', [prod[0].seccion_id]).then(r=>r.rows[0]).catch(()=>null);
-      const puedeSinStock = prod[0].permitir_sin_stock || prod[0].es_digital || sec?.permitir_sin_stock || sec?.ignorar_stock;
-      if(!puedeSinStock && prod[0].stock < (item.cantidad||1)){
-        await client.query('ROLLBACK');
-        return res.status(400).json({error:`Sin stock: ${item.nombre_producto||''} stock:${prod[0].stock}`});
+      if(!esPresupuesto) await validarStockItems(client, req.tenantId, items);
+      const esReserva = items.some(it => it._preventa === true);
+      const {rows}=await client.query('INSERT INTO pedidos (tenant_id,usuario_id,seccion_id,tipo,metodo_pago,notas,cupon_codigo,subtotal,descuento,total,datos_envio,notificar_wa,costo_envio,metodo_envio,cp_destino,is_test,estado,estado_pago,sena,es_reserva) VALUES ($20,$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19) RETURNING *',
+        [pedidoUserId, b.seccion_id||null, b.tipo||'pedido', TXT(b.metodo_pago,100), TXT(b.notas,4000), TXT(b.cupon_codigo,50), Number(b.subtotal)||0, Number(b.descuento)||0, Number(b.total)||0, TXT(b.datos_envio,8000), b.notificar_wa!==false, Number(b.costo_envio)||0, TXT(b.metodo_envio,100), TXT(b.cp_destino,20), !!b.is_test, b.estado||'pendiente', b.estado_pago||'impago', Number(b.sena)||0, esReserva, req.tenantId]);
+      pedido=rows[0];
+      await insertarItems(client, req.tenantId, pedido.id, items, !esPresupuesto);
+      await etiquetarMoneda(client, pedido.id);
+      if(b.cupon_codigo) await client.query("UPDATE cupones SET usos_actuales = usos_actuales + 1 WHERE codigo=$1 AND tenant_id=$2", [b.cupon_codigo, req.tenantId]).catch(()=>{});
+      // Cuenta corriente automática: SOLO si el pedido se marca como "debe" (fiado)
+      const ep=String(b.estado_pago||'impago');
+      if(pedidoUserId && ep==='debe'){
+        const deuda = Number(b.total||0) - (Number(b.sena)||0);
+        if(deuda>0) await client.query('INSERT INTO cuenta_corriente (tenant_id,usuario_id,tipo,monto,concepto,pedido_id) VALUES ($6,$1,$2,$3,$4,$5)', [pedidoUserId, 'cargo', deuda, `Pedido #${String(pedido.id).padStart(4,'0')}`, pedido.id, req.tenantId]).catch(()=>{});
       }
-    }
-    }
-    const esReserva = (items||[]).some(it => it._preventa === true);
-    const {rows}=await client.query('INSERT INTO pedidos (tenant_id,usuario_id,seccion_id,tipo,metodo_pago,notas,cupon_codigo,subtotal,descuento,total,datos_envio,notificar_wa,costo_envio,metodo_envio,cp_destino,is_test,estado,estado_pago,sena,es_reserva) VALUES ($20,$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19) RETURNING *',
-      [pedidoUserId, seccion_id, tipo||'pedido', metodo_pago||'', notas||'', cupon_codigo||'', subtotal||0, descuento||0, total||0, datos_envio||'', notificar_wa!==false, costo_envio||0, metodo_envio||'', cp_destino||'', is_test||false, req.body.estado||'pendiente', req.body.estado_pago||'impago', req.body.sena||0, esReserva, req.tenantId]);
-    for(const item of (items||[])){
-      await client.query('INSERT INTO pedido_items (tenant_id,pedido_id,producto_id,categoria,modelo,nombre_producto,cantidad,precio_unitario,precio_base,variante_id,variante_combinacion) VALUES ($9,$1,$2,$3,$4,$5,$6,$7,$8,$10,$11)',
-        [rows[0].id, item.producto_id, item.categoria||'', item.modelo||'', item.nombre_producto||'', item.cantidad||1, item.precio_unitario||0, item.precio_base||0, req.tenantId, item.variante_id||null, item.variante_label||item.variante_combinacion||'']);
-      // Descontar stock solo si NO es presupuesto
-      if (!esPresupuesto) {
-      if(item.variante_id){
-        // Variante: descontar stock de la combinación elegida
-        await client.query('UPDATE variantes SET stock = GREATEST(0, stock - $1) WHERE id=$2 AND tenant_id=$3', [item.cantidad||1, item.variante_id, req.tenantId]);
-      } else {
-      const {rows:prod}=await client.query('SELECT permitir_sin_stock, es_digital, es_preventa FROM productos WHERE id=$1', [item.producto_id]);
-      if(prod[0] && (prod[0].es_preventa || item._preventa)){
-        // Preventa: aumentar reservado, NO tocar stock físico
-        await client.query('UPDATE productos SET preventa_reservado = COALESCE(preventa_reservado,0) + $1 WHERE id=$2', [item.cantidad||1, item.producto_id]);
-      } else if(prod[0] && !prod[0].permitir_sin_stock && !prod[0].es_digital){
-        await client.query('UPDATE productos SET stock = GREATEST(0, stock - $1) WHERE id=$2 AND permitir_sin_stock=false AND es_digital=false', [item.cantidad||1, item.producto_id]);
-      }
-      }
-      }
-    }
-    // Etiquetar moneda del pedido según sus ítems (separa ventas ARS/USDT en reportes)
-    await client.query(`UPDATE pedidos SET moneda = CASE WHEN EXISTS(SELECT 1 FROM pedido_items pi LEFT JOIN productos pr ON pr.id=pi.producto_id LEFT JOIN variantes v ON v.id=pi.variante_id WHERE pi.pedido_id=$1 AND COALESCE(v.moneda, pr.moneda,'ARS')='USDT') THEN 'USDT' ELSE 'ARS' END WHERE id=$1`, [rows[0].id]).catch(()=>{});
-    if(cupon_codigo) await client.query("UPDATE cupones SET usos_actuales = usos_actuales + 1 WHERE codigo=$1 AND tenant_id=$2", [cupon_codigo, req.tenantId]).catch(()=>{});
-    // Cuenta corriente automática: SOLO si el pedido se marca como "debe" (fiado). Impago normal no genera deuda de cuenta corriente.
-    const ep=String(req.body.estado_pago||'impago');
-    const senaMonto=Number(req.body.sena)||0;
-    if(pedidoUserId && ep==='debe'){
-      const deuda = Number(total||0) - senaMonto;
-      if(deuda>0){
-        await client.query('INSERT INTO cuenta_corriente (tenant_id,usuario_id,tipo,monto,concepto,pedido_id) VALUES ($6,$1,$2,$3,$4,$5)',
-          [pedidoUserId, 'cargo', deuda, `Pedido #${String(rows[0].id).padStart(4,'0')}`, rows[0].id, req.tenantId]).catch(()=>{});
-      }
-    }
-    // Pagos iniciales (venta de mostrador con pagos mixtos)
-    if(Array.isArray(req.body.pagos) && req.body.pagos.length){
-      for(const pg of req.body.pagos){
-        const rec=Number(pg.recibido)||0, cta=Number(pg.cuenta_como)||0;
-        if(rec>0 || cta>0){
-          await client.query('INSERT INTO pedido_pagos (tenant_id,pedido_id,metodo,monto,recibido,cuenta_como,ajuste_pct,ajuste_monto,nota) VALUES ($9,$1,$2,$3,$4,$5,$6,$7,$8)',
-            [rows[0].id, pg.metodo||'', rec, rec, cta, Number(pg.ajuste_pct)||0, cta-rec, pg.nota||'', req.tenantId]);
+      // Pagos iniciales (venta de mostrador con pagos mixtos)
+      if(Array.isArray(b.pagos)){
+        for(const pg of b.pagos){
+          const rec=Number(pg.recibido)||0, cta=Number(pg.cuenta_como)||0;
+          if(rec>0 || cta>0) await client.query('INSERT INTO pedido_pagos (tenant_id,pedido_id,metodo,monto,recibido,cuenta_como,ajuste_pct,ajuste_monto,nota) VALUES ($9,$1,$2,$3,$4,$5,$6,$7,$8)', [pedido.id, TXT(pg.metodo,100), rec, rec, cta, Number(pg.ajuste_pct)||0, cta-rec, TXT(pg.nota,500), req.tenantId]);
         }
       }
+    } else {
+      // Cliente: presupuesto armado desde el carrito, precios del servidor, sin envío ni pagos
+      const cot=await checkout.cotizarCarrito(client, req.tenantId, req.user.id, { secciones:[{ seccion_id:b.seccion_id, items:b.items }], entrega:{ tipo:'retiro' } });
+      const s=cot.secciones[0];
+      if(!s) throw new CheckoutError('El presupuesto no tiene productos');
+      const soloUsdt = s.subtotal===0 && s.subtotal_usdt>0;
+      const {rows}=await client.query("INSERT INTO pedidos (tenant_id,usuario_id,seccion_id,tipo,metodo_pago,notas,subtotal,descuento,total,estado,estado_pago) VALUES ($1,$2,$3,'presupuesto',$4,$5,$6,0,$6,'pendiente','impago') RETURNING *",
+        [req.tenantId, req.user.id, s.seccion_id, TXT(b.metodo_pago,100), TXT(b.notas,4000), soloUsdt ? s.subtotal_usdt : s.subtotal]);
+      pedido=rows[0];
+      await insertarItems(client, req.tenantId, pedido.id, s._items, false);
+      await etiquetarMoneda(client, pedido.id);
     }
     await client.query('COMMIT');
-    res.json(rows[0]);
-  }catch(e){ await client.query('ROLLBACK').catch(()=>{}); res.status(500).json({error:e.message}); }
+    res.json(pedido);
+  }catch(e){ await client.query('ROLLBACK').catch(()=>{}); errorPedido(res, e); }
   finally{ client.release(); }
 });
 
-// Multi-tienda: crea N pedidos (uno por tienda)
+// Compra desde la tienda: crea un pedido por cada tienda (sección) del carrito.
+// Precios, cupón, envío y totales los calcula el servidor; lo que mande el navegador no cuenta.
 app.post('/api/pedidos/multi', auth(), async (req,res)=>{
   const client=await pool.connect();
   try{
-    const {pedidos, is_test} = req.body; // pedidos = [{seccion_id, items, subtotal, costo_envio, metodo_envio, cp_destino, ...}]
-    if(!Array.isArray(pedidos)||!pedidos.length) return res.status(400).json({error:'pedidos requerido'});
+    const b=req.body||{};
+    const peds=Array.isArray(b.pedidos)?b.pedidos:[];
+    if(!peds.length) return res.status(400).json({error:'El carrito está vacío'});
+    const staff=await esStaffPedidos(req);
+    const entrega=leerEntrega(b, peds);
+    const cuponCodigo = b.cupon !== undefined ? b.cupon : ((peds.find(p=>p.cupon_codigo)||{}).cupon_codigo || '');
     await client.query('BEGIN');
+    const cot=await checkout.cotizarCarrito(client, req.tenantId, req.user.id, {
+      entrega, cupon: cuponCodigo, metodo_pago: peds[0].metodo_pago,
+      secciones: peds.map(p=>({ seccion_id:p.seccion_id, items:p.items, envio_id:p.envio_id, metodo_envio:p.metodo_envio })),
+    });
+    if(!cot.secciones.length) throw new CheckoutError('El carrito está vacío');
+    if(cot.errores.length) throw new CheckoutError(cot.errores[0].mensaje);
+    if(cuponCodigo && cot.cupon && !cot.cupon.ok) throw new CheckoutError(cot.cupon.error || 'Cupón no válido');
     const creados=[];
-    for(const ped of pedidos){
-      const {seccion_id, items, subtotal, descuento, total, metodo_pago, notas, cupon_codigo, datos_envio, costo_envio, metodo_envio, cp_destino}=ped;
-      // Validar stock por seccion antes de crear (transaccional)
-      for(const item of (items||[])){
-        const {rows:prod}=await client.query('SELECT stock, permitir_sin_stock, es_digital, seccion_id, es_preventa, preventa_cupo, preventa_reservado FROM productos WHERE id=$1', [item.producto_id]);
-        if(!prod[0]) continue;
-        // Variante: el stock se descuenta más abajo, pero NUNCA bloquea la venta
-        // (las licencias/digitales tienen stock 0 y no deben frenar el pedido).
-        if(item.variante_id){ continue; }
-        // Preventa: validar contra cupo (si cupo>0). Cupo 0 = ilimitado
-        if(item._preventa || prod[0].es_preventa){
-          const cupo=Number(prod[0].preventa_cupo)||0;
-          const reservado=Number(prod[0].preventa_reservado)||0;
-          if(cupo>0 && (reservado + (item.cantidad||1)) > cupo){
-            await client.query('ROLLBACK');
-            return res.status(400).json({error:`Preventa agotada: ${item.nombre_producto||''} (quedan ${Math.max(0,cupo-reservado)} de ${cupo})`});
-          }
-          continue;
-        }
-        const sec=await client.query('SELECT ignorar_stock, permitir_sin_stock FROM secciones WHERE id=$1', [prod[0].seccion_id]).then(r=>r.rows[0]).catch(()=>null);
-        const puedeSinStock = prod[0].permitir_sin_stock || prod[0].es_digital || sec?.permitir_sin_stock || sec?.ignorar_stock;
-        if(!puedeSinStock && prod[0].stock < (item.cantidad||1)){
-          await client.query('ROLLBACK');
-          return res.status(400).json({error:`Sin stock: ${item.nombre_producto||''} (disponible: ${prod[0].stock})`});
-        }
-      }
-      const {rows}=await client.query('INSERT INTO pedidos (tenant_id,usuario_id,seccion_id,tipo,metodo_pago,notas,cupon_codigo,subtotal,descuento,total,datos_envio,costo_envio,metodo_envio,cp_destino,is_test,datos_facturacion,estado_pago) VALUES ($17,$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) RETURNING *',
-        [req.user.id, seccion_id, 'pedido', metodo_pago||'', notas||'', cupon_codigo||'', subtotal||0, descuento||0, total||0, datos_envio||'', costo_envio||0, metodo_envio||'', cp_destino||'', is_test||false, ped.datos_facturacion||'', ped.estado_pago||'impago', req.tenantId]);
-      for(const item of (items||[])){
-        await client.query('INSERT INTO pedido_items (tenant_id,pedido_id,producto_id,categoria,modelo,nombre_producto,cantidad,precio_unitario,precio_base,variante_id,variante_combinacion) VALUES ($9,$1,$2,$3,$4,$5,$6,$7,$8,$10,$11)',
-          [rows[0].id, item.producto_id, item.categoria||'', item.modelo||'', item.nombre_producto||'', item.cantidad||1, item.precio_unitario||0, item.precio_base||0, req.tenantId, item.variante_id||null, item.variante_label||item.variante_combinacion||'']);
-        if(item.variante_id){
-          await client.query('UPDATE variantes SET stock = GREATEST(0, stock - $1) WHERE id=$2 AND tenant_id=$3', [item.cantidad||1, item.variante_id, req.tenantId]);
-        } else {
-        const {rows:pr}=await client.query('SELECT permitir_sin_stock, es_digital, es_preventa FROM productos WHERE id=$1', [item.producto_id]);
-        if(pr[0] && (pr[0].es_preventa || item._preventa)){
-          await client.query('UPDATE productos SET preventa_reservado = COALESCE(preventa_reservado,0) + $1 WHERE id=$2', [item.cantidad||1, item.producto_id]);
-        } else if(pr[0] && !pr[0].permitir_sin_stock && !pr[0].es_digital){
-          await client.query('UPDATE productos SET stock = GREATEST(0, stock - $1) WHERE id=$2 AND permitir_sin_stock=false AND es_digital=false', [item.cantidad||1, item.producto_id]);
-        }
-        }
-      }
-      await client.query(`UPDATE pedidos SET moneda = CASE WHEN EXISTS(SELECT 1 FROM pedido_items pi LEFT JOIN productos pr ON pr.id=pi.producto_id LEFT JOIN variantes v ON v.id=pi.variante_id WHERE pi.pedido_id=$1 AND COALESCE(v.moneda, pr.moneda,'ARS')='USDT') THEN 'USDT' ELSE 'ARS' END WHERE id=$1`, [rows[0].id]).catch(()=>{});
-      creados.push(rows[0]);
+    for(const s of cot.secciones){
+      const ped=peds.find(p=>String(p.seccion_id)===String(s.seccion_id)) || peds[0];
+      await validarStockItems(client, req.tenantId, s._items);
+      const soloUsdt = s.subtotal===0 && s.subtotal_usdt>0;
+      let notas=TXT(ped.notas,4000);
+      if(s._items.some(i=>i._preventa)) notas=`${notas} [RESERVA/PREVENTA — requiere seña]`.trim();
+      if(!soloUsdt && s.subtotal_usdt>0) notas=`${notas} [Además: USDT ${s.subtotal_usdt} a pagar aparte]`.trim();
+      const metodoEnvio = entrega.tipo==='retiro' ? 'Retiro en el local' : (s.envio.elegido ? s.envio.elegido.nombre : (s.requiere_envio ? 'A coordinar' : ''));
+      const {rows}=await client.query('INSERT INTO pedidos (tenant_id,usuario_id,seccion_id,tipo,metodo_pago,notas,cupon_codigo,subtotal,descuento,total,datos_envio,costo_envio,metodo_envio,cp_destino,is_test,datos_facturacion,estado_pago,es_reserva) VALUES ($17,$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$18) RETURNING *',
+        [req.user.id, s.seccion_id, 'pedido', TXT(ped.metodo_pago,100), notas, s.cupon||'', soloUsdt ? s.subtotal_usdt : s.subtotal, s.descuento, soloUsdt ? s.subtotal_usdt : s.total, TXT(ped.datos_envio,8000), s.envio.costo, metodoEnvio, TXT(entrega.cp,20), staff ? !!b.is_test : false, TXT(ped.datos_facturacion,4000), 'impago', req.tenantId, s._items.some(i=>i._preventa)]);
+      await insertarItems(client, req.tenantId, rows[0].id, s._items, true);
+      await etiquetarMoneda(client, rows[0].id);
+      const {rows:fin}=await client.query('SELECT * FROM pedidos WHERE id=$1', [rows[0].id]);
+      creados.push(fin[0]);
     }
-    if(creados[0]?.cupon_codigo) await client.query("UPDATE cupones SET usos_actuales = usos_actuales + 1 WHERE codigo=$1 AND tenant_id=$2", [creados[0].cupon_codigo, req.tenantId]).catch(()=>{});
+    if(cot.cupon && cot.cupon.ok) await client.query("UPDATE cupones SET usos_actuales = usos_actuales + 1 WHERE UPPER(codigo)=UPPER($1) AND tenant_id=$2", [cot.cupon.codigo, req.tenantId]).catch(()=>{});
     await client.query('COMMIT');
-    // Notificar al admin por email (nueva venta online)
     notificarVentaAdmin(creados, req.user).catch(()=>{});
     emailCompraCliente(req.tenantId, creados, req.user).catch(()=>{});
-    res.json({ok:true, pedidos: creados});
-  }catch(e){ await client.query('ROLLBACK').catch(()=>{}); res.status(500).json({error:e.message}); }
+    res.json({ok:true, pedidos: creados, totales: cot.totales});
+  }catch(e){ await client.query('ROLLBACK').catch(()=>{}); errorPedido(res, e); }
   finally{ client.release(); }
 });
 
@@ -2295,7 +2349,10 @@ async function recalcularEstadoPago(pedidoId){
   return {estado, saldado, total, recibido:Number(pg[0].recibido)||0};
 }
 app.get('/api/pedidos/:id/pagos', auth(), async (req,res)=>{
-  try{ const {rows}=await pool.query('SELECT * FROM pedido_pagos WHERE pedido_id=$1 ORDER BY created_at',[req.params.id]); res.json(rows); }
+  try{
+    const {rows:ped}=await pool.query('SELECT usuario_id FROM pedidos WHERE id=$1 AND tenant_id=$2',[req.params.id, req.tenantId]);
+    if(!ped[0] || (Number(ped[0].usuario_id)!==Number(req.user.id) && !(await esStaffPedidos(req)))) return res.status(404).json({error:'No encontrado'});
+    const {rows}=await pool.query('SELECT * FROM pedido_pagos WHERE pedido_id=$1 AND tenant_id=$2 ORDER BY created_at',[req.params.id, req.tenantId]); res.json(rows); }
   catch(e){ res.status(500).json({error:e.message}); }
 });
 
@@ -2310,6 +2367,8 @@ app.post('/api/pedidos/:id/pagos', authPerm('pedidos'), async (req,res)=>{
     const rec=Number(recibido)||0, cta=Number(cuenta_como)||0;
     if(!(rec>0) && !(cta>0)) return res.status(400).json({error:'El monto debe ser mayor a 0'});
     const ajusteMonto=cta-rec;
+    const {rows:own}=await pool.query('SELECT 1 FROM pedidos WHERE id=$1 AND tenant_id=$2',[req.params.id, req.tenantId]);
+    if(!own[0]) return res.status(404).json({error:'No encontrado'});
     await pool.query('INSERT INTO pedido_pagos (tenant_id,pedido_id,metodo,monto,recibido,cuenta_como,ajuste_pct,ajuste_monto,nota) SELECT $9,$1,$2,$3,$4,$5,$6,$7,$8 WHERE EXISTS(SELECT 1 FROM pedidos WHERE id=$1 AND tenant_id=$9)',
       [req.params.id, metodo||'', rec, rec, cta, Number(ajuste_pct)||0, ajusteMonto, nota||'', req.tenantId]);
     const r=await recalcularEstadoPago(req.params.id);
@@ -2318,7 +2377,9 @@ app.post('/api/pedidos/:id/pagos', authPerm('pedidos'), async (req,res)=>{
 });
 app.delete('/api/pedidos/:id/pagos/:pagoId', authPerm('pedidos'), async (req,res)=>{
   try{
-    await pool.query('DELETE FROM pedido_pagos WHERE id=$1 AND pedido_id=$2',[req.params.pagoId, req.params.id]);
+    const {rows:own}=await pool.query('SELECT 1 FROM pedidos WHERE id=$1 AND tenant_id=$2',[req.params.id, req.tenantId]);
+    if(!own[0]) return res.status(404).json({error:'No encontrado'});
+    await pool.query('DELETE FROM pedido_pagos WHERE id=$1 AND pedido_id=$2 AND tenant_id=$3',[req.params.pagoId, req.params.id, req.tenantId]);
     const r=await recalcularEstadoPago(req.params.id);
     res.json({ok:true, ...r});
   }catch(e){ res.status(500).json({error:e.message}); }
@@ -2562,30 +2623,15 @@ app.get('/api/stats', authPerm('stats'), async (req,res)=>{
 
 // CUPONES, PROMOS, POPUPS, REDES, MENU, DESIGN, PAGOS, PAGINAS, BADGES, ENVIO, BUSQUEDA, SLIDER, FAVORITOS, STOCK, ANDREANI (se mantienen igual + fixes Andreani env)
 app.get('/api/cupones', authPerm('config'), async (req,res)=>{ try{ const {rows}=await pool.query('SELECT c.*, array_agg(cp.producto_id) FILTER (WHERE cp.producto_id IS NOT NULL) as productos_ids FROM cupones c LEFT JOIN cupon_productos cp ON c.id=cp.cupon_id WHERE c.tenant_id=$1 GROUP BY c.id ORDER BY c.created_at DESC', [req.tenantId]); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
-app.post('/api/cupones/validar', async (req,res)=>{
+app.post('/api/cupones/validar', optionalAuth, async (req,res)=>{
   try{
-    const {codigo,seccion_id,subtotal,metodo_pago,items,usuario_id}=req.body;
-    const {rows}=await pool.query('SELECT * FROM cupones WHERE codigo=$1 AND activo=true AND tenant_id=$2', [codigo, req.tenantId]);
-    if(!rows[0]) return res.status(404).json({error:'Cupón no válido'});
-    const c=rows[0];
-    if(c.uso_maximo>0 && c.usos_actuales>=c.uso_maximo) return res.status(400).json({error:'Cupón agotado'});
-    if(c.solo_primera_compra){
-      if(!usuario_id) return res.status(400).json({error:'Iniciá sesión para usar este cupón'});
-      const {rows:prev}=await pool.query("SELECT COUNT(*)::int as n FROM pedidos WHERE usuario_id=$1 AND tipo='pedido' AND tenant_id=$2", [usuario_id, req.tenantId]);
-      if(prev[0].n>0) return res.status(400).json({error:'Cupón solo para la primera compra'});
-    }
-    if(c.fecha_desde && new Date()<new Date(c.fecha_desde)) return res.status(400).json({error:'Aún no vigente'});
-    if(c.fecha_hasta && new Date()>new Date(c.fecha_hasta)) return res.status(400).json({error:'Vencido'});
-    if(c.secciones_ids){ const sids=c.secciones_ids.split(',').map(Number).filter(Boolean); if(sids.length && !sids.includes(Number(seccion_id))) return res.status(400).json({error:'No aplica a esta sección'}); }
-    if(c.monto_minimo>0 && subtotal<c.monto_minimo) return res.status(400).json({error:`Monto mínimo: $${c.monto_minimo}`});
-    if(c.metodo_pago && metodo_pago && c.metodo_pago!==metodo_pago) return res.status(400).json({error:`Solo válido con ${c.metodo_pago}`});
-    const {rows:cpRows}=await pool.query('SELECT producto_id FROM cupon_productos WHERE cupon_id=$1', [c.id]);
-    if(cpRows.length>0){ const pids=cpRows.map(r=>r.producto_id); const itemPids=(items||[]).map(i=>i.producto_id||i.id); if(!itemPids.some(p=>pids.includes(p))) return res.status(400).json({error:'No aplica a estos productos'}); }
-    let descuento=0;
-    if(c.tipo==='porcentaje') descuento=Math.round(subtotal*c.valor/100);
-    else if(c.tipo==='monto_fijo') descuento=c.valor;
-    res.json({descuento, tipo:c.tipo, valor:c.valor, codigo:c.codigo, cupon_id:c.id});
-  }catch(e){ res.status(500).json({error:e.message}); }
+    const {codigo,seccion_id,metodo_pago,items}=req.body;
+    const ctx=await checkout.contexto(pool, req.tenantId, req.user?.id);
+    const its=(await checkout.preciarItems(pool, ctx, items||[])).filter(i=>i.moneda==='ARS' && (!seccion_id || String(i.seccion_id)===String(seccion_id)));
+    const subtotal=its.reduce((s,i)=>s+i.precio_unitario*i.cantidad,0);
+    const r=await checkout.evaluarCupon(pool, ctx, codigo, { seccion_id, items:its, subtotal, metodo_pago });
+    res.json(r);
+  }catch(e){ if(e instanceof CheckoutError) return res.status(400).json({error:e.message}); res.status(500).json({error:'No se pudo validar el cupón'}); }
 });
 app.post('/api/cupones', authPerm('config'), async (req,res)=>{ try{ const c=req.body; const {rows}=await pool.query('INSERT INTO cupones (codigo,tipo,valor,secciones_ids,categoria,uso_maximo,monto_minimo,metodo_pago,activo,fecha_desde,fecha_hasta,solo_primera_compra,tenant_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *', [c.codigo,c.tipo||'porcentaje',c.valor||0,c.secciones_ids||'',c.categoria||'',c.uso_maximo||0,c.monto_minimo||0,c.metodo_pago||'',c.activo!==false,c.fecha_desde||null,c.fecha_hasta||null,c.solo_primera_compra||false, req.tenantId]); if(c.productos_ids){ for(const pid of c.productos_ids){ await pool.query('INSERT INTO cupon_productos (cupon_id,producto_id,tenant_id) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING', [rows[0].id,pid, req.tenantId]); } } res.json(rows[0]); }catch(e){ res.status(500).json({error:e.message}); } });
 app.put('/api/cupones/:id', authPerm('config'), async (req,res)=>{ try{ const c=req.body; await pool.query('UPDATE cupones SET codigo=$1,tipo=$2,valor=$3,secciones_ids=$4,categoria=$5,uso_maximo=$6,monto_minimo=$7,metodo_pago=$8,activo=$9,fecha_desde=$10,fecha_hasta=$11,solo_primera_compra=$12 WHERE id=$13 AND tenant_id=$14', [c.codigo,c.tipo,c.valor,c.secciones_ids||'',c.categoria||'',c.uso_maximo||0,c.monto_minimo||0,c.metodo_pago||'',c.activo!==false,c.fecha_desde||null,c.fecha_hasta||null,c.solo_primera_compra||false,req.params.id, req.tenantId]); await pool.query('DELETE FROM cupon_productos WHERE cupon_id=$1', [req.params.id]); if(c.productos_ids){ for(const pid of c.productos_ids){ await pool.query('INSERT INTO cupon_productos (cupon_id,producto_id,tenant_id) VALUES ($1,$2,$3)', [req.params.id,pid, req.tenantId]); } } res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
@@ -2624,7 +2670,7 @@ app.put('/api/metodos-pago/:id', authPerm('config'), async (req,res)=>{ try{ con
 app.delete('/api/metodos-pago/:id', authPerm('config'), async (req,res)=>{ try{ await pool.query('DELETE FROM metodos_pago WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 
 app.get('/api/paginas', async (req,res)=>{ try{ const {seccion_id}=req.query; let q='SELECT * FROM paginas_info WHERE visible=true AND tenant_id=$1'; const params=[req.tenantId]; if(seccion_id){ q+=' AND (seccion_id=$2 OR seccion_id IS NULL)'; params.push(seccion_id); } q+=' ORDER BY orden'; const {rows}=await pool.query(q, params); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
-app.get('/api/paginas/:id', async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM paginas_info WHERE id=$1', [req.params.id]); res.json(rows[0]); }catch(e){ res.status(500).json({error:e.message}); } });
+app.get('/api/paginas/:id', async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM paginas_info WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); if(!rows[0]) return res.status(404).json({error:'No encontrada'}); res.json(rows[0]); }catch(e){ res.status(500).json({error:e.message}); } });
 app.post('/api/paginas', authPerm('config'), async (req,res)=>{ try{ const p=req.body; const {rows}=await pool.query('INSERT INTO paginas_info (titulo,slug,contenido,seccion_id,visible,orden,tenant_id) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *', [p.titulo,p.slug,p.contenido||'',p.seccion_id||null,p.visible!==false,p.orden||0, req.tenantId]); res.json(rows[0]); }catch(e){ res.status(500).json({error:e.message}); } });
 app.put('/api/paginas/:id', authPerm('config'), async (req,res)=>{ try{ const p=req.body; await pool.query('UPDATE paginas_info SET titulo=$1,slug=$2,contenido=$3,seccion_id=$4,visible=$5,orden=$6 WHERE id=$7 AND tenant_id=$8', [p.titulo,p.slug,p.contenido||'',p.seccion_id||null,p.visible!==false,p.orden||0,req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 app.delete('/api/paginas/:id', authPerm('config'), async (req,res)=>{ try{ await pool.query('DELETE FROM paginas_info WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
@@ -2775,9 +2821,9 @@ app.post('/api/andreani/cotizar', async (req,res)=>{
     const token=await andreaniLogin(); if(!token) return res.status(503).json({error:'Andreani no configurado'});
     let origen=cp_origen || process.env.ANDREANI_CP_ORIGEN || '1888';
     if(seccion_id){
-      const {rows}=await pool.query('SELECT cp_origen FROM secciones WHERE id=$1', [seccion_id]).catch(()=>({rows:[]}));
+      const {rows}=await pool.query('SELECT cp_origen FROM secciones WHERE id=$1 AND tenant_id=$2', [seccion_id, req.tenantId]).catch(()=>({rows:[]}));
       if(rows[0]?.cp_origen) origen=rows[0].cp_origen;
-      const {rows:cfg}=await pool.query('SELECT cp_origen FROM config_envio WHERE seccion_id=$1', [seccion_id]).catch(()=>({rows:[]}));
+      const {rows:cfg}=await pool.query('SELECT cp_origen FROM config_envio WHERE seccion_id=$1 AND tenant_id=$2', [seccion_id, req.tenantId]).catch(()=>({rows:[]}));
       if(cfg[0]?.cp_origen) origen=cfg[0].cp_origen;
     }
     const cliente=process.env.ANDREANI_CLIENTE || process.env.ANDREANI_NRO_CLIENTE || '';
@@ -2790,10 +2836,10 @@ app.post('/api/andreani/cotizar', async (req,res)=>{
     res.json({origen, destino: cp_destino, tarifas: data, domicilio: data?.tarifas?.[0]||data, sucursal: data?.tarifas?.[1]||null, raw:data});
   }catch(e){ res.status(500).json({error:e.message}); }
 });
-app.get('/api/andreani/sucursales', async (req,res)=>{ try{ const {cp}=req.query; const token=await andreaniLogin(); if(!token) return res.status(503).json({error:'Andreani no configurado'}); const r=await fetch(`${ANDREANI_API}/v1/sucursales?codigoPostal=${cp}`, {headers:{'x-authorization-token':token}}); res.json(await r.json()); }catch(e){ res.status(500).json({error:e.message}); } });
-app.post('/api/andreani/orden', authPerm('config'), async (req,res)=>{ try{ const token=await andreaniLogin(); if(!token) return res.status(503).json({error:'Andreani no configurado'}); const r=await fetch(`${ANDREANI_API}/v1/ordenes-de-envio`, {method:'POST', headers:{'x-authorization-token':token, 'Content-Type':'application/json'}, body:JSON.stringify(req.body)}); res.json(await r.json()); }catch(e){ res.status(500).json({error:e.message}); } });
-app.get('/api/andreani/tracking/:envio', async (req,res)=>{ try{ const token=await andreaniLogin(); if(!token) return res.status(503).json({error:'Andreani no configurado'}); const r=await fetch(`${ANDREANI_API}/v1/envios/${req.params.envio}/trazas`, {headers:{'x-authorization-token':token}}); res.json(await r.json()); }catch(e){ res.status(500).json({error:e.message}); } });
-app.get('/api/andreani/etiqueta/:envio', async (req,res)=>{ try{ const token=await andreaniLogin(); if(!token) return res.status(503).json({error:'Andreani no configurado'}); const r=await fetch(`${ANDREANI_API}/v1/ordenes-de-envio/${req.params.envio}/etiquetas`, {headers:{'x-authorization-token':token, Accept:'application/pdf'}}); res.set('Content-Type','application/pdf'); const buffer=await r.arrayBuffer(); res.send(Buffer.from(buffer)); }catch(e){ res.status(500).json({error:e.message}); } });
+app.get('/api/andreani/sucursales', async (req,res)=>{ try{ const {cp}=req.query; const token=await andreaniLogin(); if(!token) return res.status(503).json({error:'Andreani no configurado'}); const r=await fetch(`${ANDREANI_API}/v1/sucursales?codigoPostal=${encodeURIComponent(String(cp||'').replace(/\D/g,'').slice(0,8))}`, {headers:{'x-authorization-token':token}}); res.json(await r.json()); }catch(e){ res.status(500).json({error:e.message}); } });
+app.post('/api/andreani/orden', authPerm('pedidos'), async (req,res)=>{ try{ const token=await andreaniLogin(); if(!token) return res.status(503).json({error:'Andreani no configurado'}); const r=await fetch(`${ANDREANI_API}/v1/ordenes-de-envio`, {method:'POST', headers:{'x-authorization-token':token, 'Content-Type':'application/json'}, body:JSON.stringify(req.body)}); res.json(await r.json()); }catch(e){ res.status(500).json({error:e.message}); } });
+app.get('/api/andreani/tracking/:envio', auth(), async (req,res)=>{ try{ const token=await andreaniLogin(); if(!token) return res.status(503).json({error:'Andreani no configurado'}); const r=await fetch(`${ANDREANI_API}/v1/envios/${encodeURIComponent(req.params.envio)}/trazas`, {headers:{'x-authorization-token':token}}); res.json(await r.json()); }catch(e){ res.status(500).json({error:e.message}); } });
+app.get('/api/andreani/etiqueta/:envio', authPerm('pedidos'), async (req,res)=>{ try{ const token=await andreaniLogin(); if(!token) return res.status(503).json({error:'Andreani no configurado'}); const r=await fetch(`${ANDREANI_API}/v1/ordenes-de-envio/${encodeURIComponent(req.params.envio)}/etiquetas`, {headers:{'x-authorization-token':token, Accept:'application/pdf'}}); res.set('Content-Type','application/pdf'); const buffer=await r.arrayBuffer(); res.send(Buffer.from(buffer)); }catch(e){ res.status(500).json({error:e.message}); } });
 
 // START
 const PORT=process.env.PORT||3000;
