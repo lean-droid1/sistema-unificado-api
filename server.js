@@ -246,7 +246,7 @@ const PLAN_FEATURES = {
     mayorista: true,
     listas_precio: true,
     cuenta_corriente: true,
-    dropshipping: true,
+    dropshipping: false,  // el bot del proveedor es solo de la tienda del dueño (tienda 1), no se vende en los planes
     catalogo_pdf: true,
     max_tiendas: 999,
     max_subadmins: 999,
@@ -504,6 +504,7 @@ async function migrate(){
     `ALTER TABLE productos ADD COLUMN IF NOT EXISTS stock_minimo INT DEFAULT 0`,
     `ALTER TABLE productos ADD COLUMN IF NOT EXISTS visible BOOLEAN DEFAULT true`,
     `ALTER TABLE productos ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW()`,
+    `ALTER TABLE productos ADD COLUMN IF NOT EXISTS pendiente_aprobacion BOOLEAN DEFAULT false`,
     // usuarios
     `ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS reset_codigo VARCHAR(20) DEFAULT ''`,
     `ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS reset_expira TIMESTAMP`,
@@ -1301,6 +1302,7 @@ app.post('/api/upload-base64', authPerm('config'), async (req,res)=>{
 app.post('/api/productos/rehost-imagenes', authPerm('productos'), async (req,res)=>{
   const t = req.tenantId;
   try{
+    if(Number(t)!==1) return res.status(403).json({error:'Disponible solo en la tienda del dueño'}); // el bot/proveedor es solo de la tienda propia
     if(!useCloudinary) return res.status(503).json({error:'Cloudinary no configurado'});
     if(process.env.REHOST_RXZ !== '1'){
       // Cloudflare de rxz bloquea a Cloudinary/Railway: estas fotos las sube el bot con su proxy.
@@ -1664,6 +1666,7 @@ const botAuth = (req, res, next) => {
   const key = req.headers['x-bot-key'] || '';
   if (!process.env.BOT_API_KEY) return res.status(503).json({ error: 'BOT_API_KEY no configurada en el servidor' });
   if (key !== process.env.BOT_API_KEY) return res.status(401).json({ error: 'X-Bot-Key inválida' });
+  // El bot es solo para la tienda del dueño (tienda 1). BOT_TENANT_ID existe solo para pruebas.
   req.botTenantId = parseInt(process.env.BOT_TENANT_ID || '1', 10);
   next();
 };
@@ -1717,6 +1720,12 @@ app.post('/api/bot/foto', botAuth, (req, res, next) => uploadBot.single('imagen'
       });
       nueva = r.secure_url;
     }
+    if (!req.file && !nueva && req.body && (req.body.remoto === true || req.body.remoto === 'true')) {
+      // El bot no pudo bajarla: probamos que Cloudinary la baje directo (a veces Cloudflare lo deja pasar)
+      const r = await rehostImagen(origen);
+      if (r === origen) return res.status(422).json({ error: 'Cloudinary tampoco pudo bajarla' });
+      nueva = r;
+    }
     if (!nueva || !esCloudinaria(nueva)) return res.status(400).json({ error: 'Falta la imagen' });
     const a = await pool.query('UPDATE productos SET imagen=$1 WHERE tenant_id=$2 AND imagen=$3', [nueva, t, origen]);
     const b = await pool.query('UPDATE producto_imagenes SET url=$1 WHERE tenant_id=$2 AND url=$3', [nueva, t, origen]);
@@ -1730,6 +1739,8 @@ app.post('/api/bot/sync', botAuth, async (req, res) => {
   const t = req.botTenantId;
   try {
     const { productos, seccion_id } = req.body;
+    const ocultarNuevos = !!req.body.ocultar_nuevos; // el bot pide aprobación por Telegram antes de publicar
+    const nuevos = [];
     if (!Array.isArray(productos)) return res.status(400).json({ error: 'productos debe ser un array' });
 
     // Sección destino: la que mande el bot, o la primera que tenga slug/nombre DEPOSITO, o la primera que exista.
@@ -1781,10 +1792,11 @@ app.post('/api/bot/sync', botAuth, async (req, res) => {
           // Re-hostear la imagen principal en Cloudinary (independiza de rxz/hotlink).
           const imagenRe = await rehostBot(imagen);
           const { rows: ins } = await pool.query(
-            `INSERT INTO productos (tenant_id,seccion_id,categoria,modelo,nombre,descripcion,precio_base,precio_oferta,stock,imagen,sku,envio_gratis,peso,alto,ancho,largo,visible)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,true) RETURNING id`,
-            [t, secId, categoria, nombre, nombre, descripcion, precioBase, precioOferta, stock, imagenRe, skuT, false, peso, alto, ancho, largo]);
+            `INSERT INTO productos (tenant_id,seccion_id,categoria,modelo,nombre,descripcion,precio_base,precio_oferta,stock,imagen,sku,envio_gratis,peso,alto,ancho,largo,visible,pendiente_aprobacion)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18) RETURNING id`,
+            [t, secId, categoria, nombre, nombre, descripcion, precioBase, precioOferta, stock, imagenRe, skuT, false, peso, alto, ancho, largo, !ocultarNuevos, ocultarNuevos]);
           prodId = ins[0].id;
+          if (nuevos.length < 300) nuevos.push({ id: prodId, sku: skuT, nombre, precio: precioOferta > 0 ? precioOferta : precioBase, imagen: imagenRe, categoria });
           // Galería completa: todas las imágenes del proveedor (también re-hosteadas)
           const galeria = Array.isArray(p.imagenes) && p.imagenes.length ? p.imagenes : (imagen ? [imagen] : []);
           for (let gi = 0; gi < galeria.length; gi++) {
@@ -1824,7 +1836,7 @@ app.post('/api/bot/sync', botAuth, async (req, res) => {
       }
     }
 
-    res.json({ ok: true, seccion_id: secId, total: productos.length, insertados, actualizados, errores, primer_error: primerError || undefined, detalles: detalles.length ? detalles : undefined });
+    res.json({ ok: true, seccion_id: secId, total: productos.length, insertados, actualizados, errores, nuevos, ocultos: ocultarNuevos, primer_error: primerError || undefined, detalles: detalles.length ? detalles : undefined });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -1973,6 +1985,31 @@ app.post('/api/bot/fotos-por-nombre', botAuth, async (req, res) => {
       sin_match: sinMatch, aplicados,
       ejemplos_sin_match: noMatch.length ? noMatch.slice(0, 30) : undefined
     });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Productos nuevos del proveedor que esperan aprobación (ocultos hasta que Leandro los publique por Telegram)
+app.get('/api/bot/pendientes', botAuth, async (req, res) => {
+  const t = req.botTenantId;
+  try {
+    const { rows } = await pool.query(
+      `SELECT id, sku, nombre, imagen, categoria, CASE WHEN precio_oferta>0 THEN precio_oferta ELSE precio_base END AS precio
+         FROM productos WHERE tenant_id=$1 AND pendiente_aprobacion=true AND visible=false ORDER BY id DESC LIMIT 300`, [t]);
+    res.json({ ok: true, total: rows.length, productos: rows });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+// POST /api/bot/aprobar — { skus:[...] | todos:true, publicar:true|false }. publicar=false los deja ocultos y sale de pendientes.
+app.post('/api/bot/aprobar', botAuth, async (req, res) => {
+  const t = req.botTenantId;
+  try {
+    const publicar = req.body && req.body.publicar !== false;
+    const todos = !!(req.body && req.body.todos);
+    const skus = Array.isArray(req.body && req.body.skus) ? req.body.skus.map(x => String(x).toUpperCase().trim()).filter(Boolean).slice(0, 500) : [];
+    if (!todos && !skus.length) return res.status(400).json({ error: 'Faltan skus' });
+    const r = todos
+      ? await pool.query('UPDATE productos SET visible=$1, pendiente_aprobacion=false WHERE tenant_id=$2 AND pendiente_aprobacion=true RETURNING sku, nombre', [publicar, t])
+      : await pool.query('UPDATE productos SET visible=$1, pendiente_aprobacion=false WHERE tenant_id=$2 AND UPPER(sku) = ANY($3) RETURNING sku, nombre', [publicar, t, skus]);
+    res.json({ ok: true, afectados: r.rowCount, productos: r.rows.slice(0, 50) });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
