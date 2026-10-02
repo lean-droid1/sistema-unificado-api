@@ -121,9 +121,9 @@ function createCheckout(pool) {
   // Todo lo que depende del cliente y de la tienda (una sola vez por cotización)
   async function contexto(db, tenantId, userId) {
     const [u, promos, secs, cfg] = await Promise.all([
-      userId ? db.query('SELECT id, rol, permisos, lista_precio_id, es_revendedor, descuento_revendedor FROM usuarios WHERE id=$1 AND tenant_id=$2', [userId, tenantId]) : { rows: [] },
+      userId ? db.query('SELECT id, rol, permisos, lista_precio_id, es_revendedor, descuento_revendedor, mayorista, activo FROM usuarios WHERE id=$1 AND tenant_id=$2', [userId, tenantId]) : { rows: [] },
       db.query('SELECT * FROM promociones WHERE tenant_id=$1 AND activo=true AND (fecha_desde IS NULL OR fecha_desde<=CURRENT_DATE) AND (fecha_hasta IS NULL OR fecha_hasta>=CURRENT_DATE)', [tenantId]),
-      db.query('SELECT id, nombre, slug, cp_origen, ignorar_stock, permitir_sin_stock FROM secciones WHERE tenant_id=$1', [tenantId]),
+      db.query('SELECT id, nombre, slug, cp_origen, ignorar_stock, permitir_sin_stock, requiere_aprobacion FROM secciones WHERE tenant_id=$1', [tenantId]),
       db.query("SELECT clave, valor FROM configuracion WHERE tenant_id=$1 AND (clave LIKE 'envio_gratis_desde_%' OR clave LIKE 'compra_minima_%' OR clave LIKE 'min_aplica_retiro_%')", [tenantId]),
     ]);
     const user = u.rows[0] || null;
@@ -139,7 +139,9 @@ function createCheckout(pool) {
     const config = {}; cfg.rows.forEach(r => { config[r.clave] = r.valor; });
     const secciones = {}; secs.rows.forEach(s => { secciones[s.id] = s; });
     const esStaff = !!user && (user.rol === 'admin' || (user.rol === 'subadmin' && String(user.permisos || '').split(',').includes('pedidos')));
-    return { tenantId, user, lista, pf, promos: promos.rows, secciones, config, esStaff };
+    // Tiendas con aprobación (mayorista): solo clientes autorizados o el equipo
+    const accesoMayorista = !!user && user.activo !== false && (user.rol === 'admin' || user.rol === 'subadmin' || !!user.mayorista);
+    return { tenantId, user, lista, pf, promos: promos.rows, secciones, config, esStaff, accesoMayorista };
   }
 
   // Normaliza los ítems que manda la web y les pone el precio del servidor
@@ -168,6 +170,9 @@ function createCheckout(pool) {
     for (const i of items) {
       const p = prodMap[i.producto_id];
       if (!p || (!p.visible && !permitirOcultos)) { falla(i, 'no_disponible', p ? `"${p.nombre || p.modelo}" ya no está disponible.` : 'Un producto del carrito ya no está disponible.'); continue; }
+      if (ctx.secciones[p.seccion_id] && ctx.secciones[p.seccion_id].requiere_aprobacion && !ctx.accesoMayorista) {
+        falla(i, 'no_disponible', `"${p.nombre || p.modelo}" es de la lista mayorista: solo pueden comprarlo clientes autorizados.`); continue;
+      }
       let v = null;
       if (i.variante_id) {
         v = varMap[i.variante_id];

@@ -505,6 +505,9 @@ async function migrate(){
     `ALTER TABLE productos ADD COLUMN IF NOT EXISTS visible BOOLEAN DEFAULT true`,
     `ALTER TABLE productos ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW()`,
     `ALTER TABLE productos ADD COLUMN IF NOT EXISTS pendiente_aprobacion BOOLEAN DEFAULT false`,
+    `ALTER TABLE productos ADD COLUMN IF NOT EXISTS posicion INT DEFAULT 0`,
+    `ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS mayorista BOOLEAN DEFAULT false`,
+    `ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS mayorista_solicitado_at TIMESTAMP`,
     // usuarios
     `ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS reset_codigo VARCHAR(20) DEFAULT ''`,
     `ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS reset_expira TIMESTAMP`,
@@ -1128,6 +1131,13 @@ app.post('/api/register', async (req,res)=>{
     res.json(rows[0]);
   }catch(e){ res.status(400).json({error:e.message.includes('duplicate')?'Usuario ya existe':e.message}); }
 });
+// El cliente pide acceso a la lista mayorista (queda marcado para que el dueño lo apruebe en Clientes)
+app.post('/api/me/solicitar-mayorista', auth(), async (req,res)=>{
+  try{
+    const { rows } = await pool.query('UPDATE usuarios SET mayorista_solicitado_at=COALESCE(mayorista_solicitado_at, NOW()) WHERE id=$1 AND tenant_id=$2 AND COALESCE(mayorista,false)=false RETURNING mayorista_solicitado_at', [req.user.id, req.tenantId]);
+    res.json({ ok: true, solicitado: !!rows[0], ya_autorizado: !rows[0] });
+  }catch(e){ res.status(500).json({error:e.message}); }
+});
 app.get('/api/me', auth(), async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM usuarios WHERE id=$1 AND tenant_id=$2', [req.user.id, req.tenantId]); res.json(sanitizeUser(rows[0])); }catch(e){ res.status(500).json({error:e.message}); } });
 // Crear cliente rápido desde el panel (venta de mostrador). Genera usuario auto si no se pasa.
 app.post('/api/usuarios/rapido', authPerm('usuarios'), async (req,res)=>{
@@ -1189,6 +1199,7 @@ app.put('/api/secciones/:id', authPerm('config'), async (req,res)=>{
       const td=await getTenantData(req.tenantId).catch(()=>null);
       if(act[0] && !act[0].requiere_aprobacion && td && !featureActiva(td.features,'mayorista')) return res.status(403).json({error:'Las tiendas mayoristas con aprobación no están incluidas en tu plan', upgrade:true});
     }
+    _secRestrCache.delete(String(req.tenantId));
     await pool.query('UPDATE secciones SET nombre=$1,slug=$2,descripcion=$3,imagen=$4,requiere_aprobacion=$5,visible=$6,orden=$7,ignorar_stock=$8,cp_origen=$9,permitir_sin_stock=$10 WHERE id=$11 AND tenant_id=$12', [nombre,slug,descripcion,imagen,requiere_aprobacion,visible,orden||0,ignorar_stock||false,cp_origen||'1888',permitir_sin_stock||false,req.params.id, req.tenantId]);
     res.json({ok:true});
   }catch(e){ res.status(500).json({error:e.message}); }
@@ -1202,6 +1213,7 @@ app.post('/api/secciones', authPerm('config'), async (req,res)=>{
       if((c[0]?.n||0) >= maxT) return res.status(403).json({error:`Tu plan permite hasta ${maxT} ${maxT===1?'tienda':'tiendas'}. Pasate a un plan superior para sumar más.`, upgrade:true});
     }
     if(requiere_aprobacion && Number(req.tenantId)!==1){ const td=await getTenantData(req.tenantId).catch(()=>null); if(td && !featureActiva(td.features,'mayorista')) return res.status(403).json({error:'Las tiendas mayoristas con aprobación no están incluidas en tu plan', upgrade:true}); }
+    _secRestrCache.delete(String(req.tenantId));
     const {rows}=await pool.query('INSERT INTO secciones (tenant_id,nombre,slug,descripcion,imagen,requiere_aprobacion,ignorar_stock,cp_origen) VALUES ($8,$1,$2,$3,$4,$5,$6,$7) RETURNING *', [nombre,slug,descripcion||'',imagen||'',requiere_aprobacion||false,ignorar_stock||false,cp_origen||'1888', req.tenantId]);
     res.json(rows[0]);
   }catch(e){ res.status(400).json({error:e.message}); }
@@ -1360,7 +1372,7 @@ app.get('/api/productos/relacionados/:id', optionalAuth, async (req,res)=>{
         WHERE p.visible=true AND p.tenant_id=$4 AND p.seccion_id=$1 AND p.id != ALL($2::int[]) ORDER BY RANDOM() LIMIT $3`, [b.seccion_id, ids, 8-rows.length, req.tenantId]);
       rows=[...rows, ...extra];
     }
-    res.json(limpiarSiPublico(req, await ocultarPreciosAprobacion(req, rows)));
+    res.json(limpiarSiPublico(req, await sinRestringidas(req, await ocultarPreciosAprobacion(req, rows), { conservarConAcceso: true })));
   }catch(e){ res.status(500).json({error:e.message}); }
 });
 // Recibir la preventa: pasa el cupo al stock físico, descuenta lo reservado, desactiva preventa
@@ -1402,6 +1414,32 @@ const esStaffReq = (req) => !!(req.user && ['admin', 'subadmin'].includes(req.us
 const limpiarProducto = (r) => { if (!r) return r; const o = { ...r }; for (const k of CAMPOS_PRIVADOS_PROD) delete o[k]; return o; };
 const limpiarSiPublico = (req, rows) => esStaffReq(req) ? rows : rows.map(limpiarProducto);
 // Tiendas con aprobación (mayorista): sin sesión no se ven precios (igual que en /api/productos)
+// ── Tiendas con aprobación (mayorista): solo las ven y compran los clientes autorizados ──
+// (marcados como "Cliente mayorista" en Clientes, o el equipo). Tampoco aparecen en el buscador
+// general, novedades, ofertas ni preventa: es un catálogo aparte.
+const _secRestrCache = new Map();
+async function seccionesRestringidas(tenantId){
+  const k = String(tenantId); const hit = _secRestrCache.get(k);
+  if (hit && Date.now() - hit.ts < 30000) return hit.ids;
+  const { rows } = await pool.query('SELECT id FROM secciones WHERE tenant_id=$1 AND requiere_aprobacion=true', [tenantId]).catch(()=>({rows:[]}));
+  const ids = rows.map(r => r.id); _secRestrCache.set(k, { ids, ts: Date.now() }); return ids;
+}
+async function accesoMayorista(req){
+  if (!req.user) return false;
+  if (req._accMay !== undefined) return req._accMay;
+  const { rows } = await pool.query('SELECT rol, mayorista, activo FROM usuarios WHERE id=$1 AND tenant_id=$2', [req.user.id, req.tenantId]).catch(()=>({rows:[]}));
+  const u = rows[0];
+  req._accMay = !!u && u.activo !== false && (u.rol === 'admin' || u.rol === 'subadmin' || !!u.mayorista);
+  return req._accMay;
+}
+// Saca de un listado los productos de tiendas con aprobación (salvo que se pida conservarlos para quien tiene acceso)
+async function sinRestringidas(req, rows, { conservarConAcceso = false } = {}){
+  const restr = await seccionesRestringidas(req.tenantId);
+  if (!restr.length || !rows.length) return rows;
+  if (conservarConAcceso && await accesoMayorista(req)) return rows;
+  const set = new Set(restr.map(String));
+  return rows.filter(r => !set.has(String(r.seccion_id)));
+}
 async function ocultarPreciosAprobacion(req, rows){
   if (req.user || !rows.length) return rows;
   const { rows: secs } = await pool.query('SELECT id FROM secciones WHERE tenant_id=$1 AND (requiere_aprobacion=true OR slug=$2)', [req.tenantId, 'mayorista']).catch(()=>({rows:[]}));
@@ -1429,7 +1467,7 @@ app.get('/api/productos/ofertas', optionalAuth, async (req,res)=>{
           AND ((p.precio_oferta>0 AND p.precio_oferta<p.precio_base) OR p.id = ANY($2::int[]) OR p.categoria = ANY($3::text[]))
         ORDER BY CASE WHEN p.precio_oferta>0 AND p.precio_oferta<p.precio_base THEN 1 - p.precio_oferta/NULLIF(p.precio_base,0) ELSE 0 END DESC, p.created_at DESC
         LIMIT $4`, [t, ids, cats, lim]);
-    res.json(limpiarSiPublico(req, rows));
+    res.json(limpiarSiPublico(req, await sinRestringidas(req, rows)));
   }catch(e){ res.status(500).json({error:e.message}); }
 });
 app.get('/api/productos/preventa', optionalAuth, async (req,res)=>{
@@ -1440,7 +1478,7 @@ app.get('/api/productos/preventa', optionalAuth, async (req,res)=>{
     if(seccion_id && seccion_id!=='all'){ params.push(seccion_id); q+=` AND p.seccion_id=$${params.length}`; }
     q+=' ORDER BY p.preventa_fecha ASC NULLS LAST, p.created_at DESC LIMIT 30';
     const {rows}=await pool.query(q, params);
-    res.json(limpiarSiPublico(req, await ocultarPreciosAprobacion(req, rows)));
+    res.json(limpiarSiPublico(req, await sinRestringidas(req, await ocultarPreciosAprobacion(req, rows))));
   }catch(e){ res.status(500).json({error:e.message}); }
 });
 app.get('/api/productos/novedades', optionalAuth, async (req,res)=>{
@@ -1451,7 +1489,7 @@ app.get('/api/productos/novedades', optionalAuth, async (req,res)=>{
     if(seccion_id && seccion_id!=='all'){ params.push(seccion_id); q+=` AND p.seccion_id=$${params.length}`; }
     q+=` ORDER BY p.created_at DESC LIMIT ${Math.min(Number(limit)||12, 30)}`;
     const {rows}=await pool.query(q, params);
-    res.json(limpiarSiPublico(req, await ocultarPreciosAprobacion(req, rows)));
+    res.json(limpiarSiPublico(req, await sinRestringidas(req, await ocultarPreciosAprobacion(req, rows))));
   }catch(e){ res.status(500).json({error:e.message}); }
 });
 app.get('/api/productos', optionalAuth, async (req,res)=>{
@@ -1469,11 +1507,18 @@ app.get('/api/productos', optionalAuth, async (req,res)=>{
     if(categoria){ where.push(`categoria=$${pi}`); params.push(categoria); pi++; }
     if(seccion_id){ where.push(`seccion_id=$${pi}`); params.push(seccion_id); pi++; }
     if(marca){ where.push(`marca ILIKE $${pi}`); params.push(`%${marca}%`); pi++; }
+    // Mayorista / tiendas con aprobación: solo clientes autorizados; fuera de su tienda no aparecen nunca (salvo en el panel)
+    const restr = await seccionesRestringidas(req.tenantId);
+    if(restr.length){
+      if(seccion_id && restr.includes(parseInt(seccion_id, 10))){
+        if(!(await accesoMayorista(req))) return res.json({ productos: [], total: 0, page: 1, totalPages: 0, bloqueado: true });
+      } else if(!seccion_id && !incluirOcultos){ where.push(`seccion_id <> ALL($${pi}::int[])`); params.push(restr); pi++; }
+    }
     const offset=(parseInt(page)-1)*parseInt(limit);
     const countQ=`SELECT COUNT(*) FROM productos WHERE ${where.join(' AND ')}`;
     const {rows:cRows}=await pool.query(countQ, params);
     const total=parseInt(cRows[0].count);
-    const query=`SELECT *, (SELECT MIN(CASE WHEN v.precio_oferta>0 AND v.precio_oferta<v.precio THEN v.precio_oferta ELSE v.precio END) FROM variantes v WHERE v.producto_id=productos.id AND v.tenant_id=productos.tenant_id AND v.precio>0) AS precio_desde, (SELECT v.moneda FROM variantes v WHERE v.producto_id=productos.id AND v.tenant_id=productos.tenant_id AND v.precio>0 ORDER BY (CASE WHEN v.precio_oferta>0 AND v.precio_oferta<v.precio THEN v.precio_oferta ELSE v.precio END) ASC LIMIT 1) AS moneda_desde, ${IMG2('productos')} FROM productos WHERE ${where.join(' AND ')} ORDER BY created_at DESC LIMIT $${pi} OFFSET $${pi+1}`;
+    const query=`SELECT *, (SELECT MIN(CASE WHEN v.precio_oferta>0 AND v.precio_oferta<v.precio THEN v.precio_oferta ELSE v.precio END) FROM variantes v WHERE v.producto_id=productos.id AND v.tenant_id=productos.tenant_id AND v.precio>0) AS precio_desde, (SELECT v.moneda FROM variantes v WHERE v.producto_id=productos.id AND v.tenant_id=productos.tenant_id AND v.precio>0 ORDER BY (CASE WHEN v.precio_oferta>0 AND v.precio_oferta<v.precio THEN v.precio_oferta ELSE v.precio END) ASC LIMIT 1) AS moneda_desde, ${IMG2('productos')} FROM productos WHERE ${where.join(' AND ')} ORDER BY ${req.query.orden === 'lista' ? 'posicion ASC, id ASC' : 'created_at DESC'} LIMIT $${pi} OFFSET $${pi+1}`;
     const {rows}=await pool.query(query, [...params, parseInt(limit), offset]);
     // hide price mayorista sin login
     let result=rows;
@@ -1486,7 +1531,7 @@ app.get('/api/productos', optionalAuth, async (req,res)=>{
     res.json({productos:result, total, page:parseInt(page), totalPages:Math.ceil(total/parseInt(limit))});
   }catch(e){ res.status(500).json({error:e.message}); }
 });
-app.get('/api/categorias', async (req,res)=>{ try{ const {seccion_id}=req.query; let q='SELECT DISTINCT categoria FROM productos WHERE visible=true AND tenant_id=$1'; const params=[req.tenantId]; if(seccion_id){ q+=' AND seccion_id=$2'; params.push(seccion_id); } q+=' ORDER BY categoria'; const {rows}=await pool.query(q, params); res.json(rows.map(r=>r.categoria).filter(Boolean)); }catch(e){ res.status(500).json({error:e.message}); } });
+app.get('/api/categorias', optionalAuth, async (req,res)=>{ try{ const {seccion_id}=req.query; if(seccion_id && (await seccionesRestringidas(req.tenantId)).includes(parseInt(seccion_id,10)) && !(await accesoMayorista(req))) return res.json([]); let q='SELECT DISTINCT categoria FROM productos WHERE visible=true AND tenant_id=$1'; const params=[req.tenantId]; if(seccion_id){ q+=' AND seccion_id=$2'; params.push(seccion_id); } q+=' ORDER BY categoria'; const {rows}=await pool.query(q, params); res.json(rows.map(r=>r.categoria).filter(Boolean)); }catch(e){ res.status(500).json({error:e.message}); } });
 
 // Categorías con metadata (orden, visible, conteo) — para el ABM del panel
 app.get('/api/categorias/admin', authPerm('productos'), async (req,res)=>{
@@ -1631,69 +1676,95 @@ app.delete('/api/productos/:id', authPerm('productos'), async (req,res)=>{
     res.json({ok:true});
   }catch(e){ res.status(500).json({error:e.message}); }
 });
+// Importación masiva desde Excel. Se manda por partes (lotes) desde el panel.
+// Los productos existentes se buscan SOLO dentro de la sección destino (antes buscaba en toda la tienda
+// y un Excel del mayorista podía pisar el precio de un producto igual de otra sección).
 app.post('/api/productos/bulk', authPerm('productos'), async (req,res)=>{
   try{
-    const {productos, reemplazar, modo, faltantes, seccion_id} = req.body;
-    // MODO "solo_categorias": actualiza SOLO la categoría matcheando por SKU (si tiene) o por nombre. No duplica, no toca precio/stock.
+    const { productos, reemplazar, modo, seccion_id } = req.body || {};
+    const t = req.tenantId;
+    const S = (v, n=300) => (v===undefined || v===null) ? '' : String(v).replace(/\s+/g,' ').trim().slice(0, n);
+    const N = (v) => { const n = Number(v); return Number.isFinite(n) ? n : 0; };
+    const I = (v) => (v===undefined || v===null || v==='') ? null : Math.trunc(N(v));
+    const lista = (Array.isArray(productos) ? productos : []).slice(0, 5000);
+    const secDest = parseInt(seccion_id, 10) || null;
+    if(secDest){ const {rows}=await pool.query('SELECT 1 FROM secciones WHERE id=$1 AND tenant_id=$2', [secDest, t]); if(!rows[0]) return res.status(400).json({error:'La sección elegida no es de esta tienda'}); }
+    const secDe = (p) => secDest || parseInt(p.seccion_id, 10) || null;
+    const buscar = async (p) => {
+      const sec = secDe(p); const sku = S(p.sku, 100); const nom = S(p.nombre || p.modelo);
+      if(sku){ const {rows}=await pool.query('SELECT id FROM productos WHERE sku=$1 AND tenant_id=$2 AND ($3::int IS NULL OR seccion_id=$3) LIMIT 1', [sku, t, sec]); if(rows[0]) return rows[0]; }
+      if(nom){ const {rows}=await pool.query('SELECT id FROM productos WHERE LOWER(TRIM(nombre))=LOWER($1) AND tenant_id=$2 AND ($3::int IS NULL OR seccion_id=$3) LIMIT 1', [nom, t, sec]); if(rows[0]) return rows[0]; }
+      return null;
+    };
+    const insertar = (p) => pool.query(`INSERT INTO productos (tenant_id,seccion_id,categoria,modelo,nombre,precio_base,precio_oferta,precio_original,stock,imagen,sku,descripcion,compatibilidad,peso,alto,ancho,largo,visible,permitir_sin_stock,posicion)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,true,$18,$19)`,
+      [t, secDe(p) || 1, S(p.categoria,200), S(p.modelo,200), S(p.nombre || p.modelo), N(p.precio_base), N(p.precio_oferta), N(p.precio_original), I(p.stock) ?? 0,
+       S(p.imagen,2000), S(p.sku,100), S(p.descripcion,8000), S(p.compatibilidad,2000), N(p.peso), N(p.alto), N(p.ancho), N(p.largo), !!p.permitir_sin_stock, I(p.posicion) ?? 0]);
+    const actualizar = (id, p) => pool.query(`UPDATE productos SET
+        categoria=CASE WHEN $1<>'' THEN $1 ELSE categoria END, precio_base=$2, precio_oferta=$3,
+        precio_original=CASE WHEN $4>0 THEN $4 ELSE precio_original END,
+        stock=COALESCE($5::int, stock),
+        compatibilidad=CASE WHEN $6<>'' THEN $6 ELSE compatibilidad END,
+        posicion=COALESCE($7::int, posicion),
+        permitir_sin_stock=COALESCE($8::boolean, permitir_sin_stock),
+        peso=CASE WHEN $9>0 THEN $9 ELSE peso END, alto=CASE WHEN $10>0 THEN $10 ELSE alto END,
+        ancho=CASE WHEN $11>0 THEN $11 ELSE ancho END, largo=CASE WHEN $12>0 THEN $12 ELSE largo END
+      WHERE id=$13 AND tenant_id=$14`,
+      [S(p.categoria,200), N(p.precio_base), N(p.precio_oferta), N(p.precio_original), I(p.stock), S(p.compatibilidad,2000), I(p.posicion),
+       (p.permitir_sin_stock===undefined || p.permitir_sin_stock===null) ? null : !!p.permitir_sin_stock, N(p.peso), N(p.alto), N(p.ancho), N(p.largo), id, t]);
+    let insertados=0, actualizados=0, saltados=0, errores=0, primerError=null;
+    const fallo = (e, p) => { errores++; if(!primerError) primerError = `${S(p && (p.nombre || p.modelo), 80)}: ${String(e.message || e).slice(0,140)}`; };
+
+    // Productos de la sección que ya NO vienen en el Excel → sin stock u ocultos (se llama una vez al final)
+    if(modo==='marcar_faltantes'){
+      if(!secDest) return res.status(400).json({error:'Falta la sección'});
+      const presentes = Array.isArray(req.body.presentes) ? req.body.presentes : [];
+      const skus = new Set(presentes.map(x => S(x && x.sku, 100)).filter(Boolean));
+      const noms = new Set(presentes.map(x => S(x && x.nombre).toLowerCase()).filter(Boolean));
+      const {rows} = await pool.query('SELECT id, sku, nombre FROM productos WHERE tenant_id=$1 AND seccion_id=$2', [t, secDest]);
+      const faltan = rows.filter(r => !(r.sku && skus.has(String(r.sku).trim())) && !noms.has(S(r.nombre).toLowerCase())).map(r => r.id);
+      if(faltan.length){
+        if(req.body.accion==='ocultar') await pool.query('UPDATE productos SET visible=false WHERE id = ANY($1::int[]) AND tenant_id=$2', [faltan, t]);
+        else await pool.query('UPDATE productos SET stock=0, permitir_sin_stock=false WHERE id = ANY($1::int[]) AND tenant_id=$2', [faltan, t]);
+      }
+      return res.json({ok:true, modo, marcados: faltan.length});
+    }
+    // Solo corregir categorías
     if(modo==='solo_categorias'){
-      let actualizados=0, noEncontrados=0;
-      for(const p of (productos||[])){
-        if(!p.categoria || p.categoria==='Sin categoría') continue;
-        let r;
-        if(p.sku && p.sku.trim()){
-          r=await pool.query('UPDATE productos SET categoria=$1 WHERE sku=$2 AND tenant_id=$3', [p.categoria, p.sku.trim(), req.tenantId]);
-        }
-        if((!r || r.rowCount===0) && (p.nombre||p.modelo)){
-          r=await pool.query('UPDATE productos SET categoria=$1 WHERE tenant_id=$3 AND (LOWER(TRIM(nombre))=LOWER(TRIM($2)) OR LOWER(TRIM(modelo))=LOWER(TRIM($2)))', [p.categoria, (p.nombre||p.modelo).trim(), req.tenantId]);
-        }
-        if(r && r.rowCount>0){ actualizados+=r.rowCount; await pool.query('INSERT INTO categorias_meta (tenant_id, categoria, orden, visible) VALUES ($2,$1,0,true) ON CONFLICT DO NOTHING', [p.categoria, req.tenantId]).catch(()=>{}); }
-        else noEncontrados++;
+      for(const p of lista){
+        try{
+          const cat = S(p.categoria,200); if(!cat || cat==='Sin categoría') { saltados++; continue; }
+          const ex = await buscar(p);
+          if(ex){ await pool.query('UPDATE productos SET categoria=$1 WHERE id=$2 AND tenant_id=$3', [cat, ex.id, t]); actualizados++; await pool.query('INSERT INTO categorias_meta (tenant_id, categoria, orden, visible) VALUES ($2,$1,0,true) ON CONFLICT DO NOTHING', [cat, t]).catch(()=>{}); }
+          else saltados++;
+        }catch(e){ fallo(e, p); }
       }
-      return res.json({ok:true, modo:'solo_categorias', actualizados, noEncontrados, saltados:noEncontrados});
+      return res.json({ok:true, modo, actualizados, saltados, noEncontrados: saltados, errores, primer_error: primerError || undefined});
     }
-    // MODO "crear_actualizar": si existe (por SKU o nombre) actualiza, si no inserta
-    if(modo==='crear_actualizar' || modo==='actualizar'){
-      let insertados=0, actualizados=0;
-      for(const p of (productos||[])){
-        let existe=null;
-        if(p.sku && p.sku.trim()){ const {rows}=await pool.query('SELECT id FROM productos WHERE sku=$1 AND tenant_id=$2 LIMIT 1', [p.sku.trim(), req.tenantId]); existe=rows[0]; }
-        if(!existe && (p.nombre||p.modelo)){ const {rows}=await pool.query('SELECT id FROM productos WHERE LOWER(TRIM(nombre))=LOWER(TRIM($1)) AND tenant_id=$2 LIMIT 1', [(p.nombre||p.modelo).trim(), req.tenantId]); existe=rows[0]; }
-        if(existe){
-          // Actualiza precio/stock/categoría y también peso/medidas (COALESCE: si el Excel trae 0/vacío, conserva el valor actual)
-          await pool.query(`UPDATE productos SET categoria=$1, precio_base=$2, stock=$3, precio_oferta=$4,
-            peso=CASE WHEN $5>0 THEN $5 ELSE peso END,
-            alto=CASE WHEN $6>0 THEN $6 ELSE alto END,
-            ancho=CASE WHEN $7>0 THEN $7 ELSE ancho END,
-            largo=CASE WHEN $8>0 THEN $8 ELSE largo END
-            WHERE id=$9 AND tenant_id=$10`,
-            [p.categoria||'', p.precio_base||0, p.stock||0, p.precio_oferta||0, p.peso||0, p.alto||0, p.ancho||0, p.largo||0, existe.id, req.tenantId]);
-          actualizados++;
-        } else {
-          await pool.query(`INSERT INTO productos (tenant_id,seccion_id,categoria,modelo,nombre,precio_base,stock,imagen,sku,descripcion,peso,alto,ancho,largo,visible) VALUES ($14,$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,true)`, [p.seccion_id||seccion_id||1, p.categoria||'', p.modelo||'', p.nombre||p.modelo||'', p.precio_base||0, p.stock||0, p.imagen||'', p.sku||'', p.descripcion||'', p.peso||0, p.alto||0, p.ancho||0, p.largo||0, req.tenantId]);
-          insertados++;
-        }
+    // Borrar la sección y cargar de cero (solo el primer lote; los siguientes vienen como 'insertar')
+    if(modo==='reemplazar' || reemplazar){
+      const sec = secDest || 1;
+      const {rows:ids} = await pool.query('SELECT id FROM productos WHERE tenant_id=$1 AND seccion_id=$2', [t, sec]);
+      const lst = ids.map(r => r.id);
+      if(lst.length){
+        // El historial de pedidos queda intacto (solo se desvincula el producto). Antes se borraban TODOS los ítems de pedidos de la tienda.
+        await pool.query('UPDATE pedido_items SET producto_id=NULL WHERE producto_id = ANY($1::int[])', [lst]).catch(()=>{});
+        await pool.query('UPDATE orden_compra_items SET producto_id=NULL WHERE producto_id = ANY($1::int[])', [lst]).catch(()=>{});
+        for(const tb of ['precios_fijos','historial_precios','notificaciones_stock','producto_imagenes','variantes','favoritos']) await pool.query(`DELETE FROM ${tb} WHERE producto_id = ANY($1::int[])`, [lst]).catch(()=>{});
+        await pool.query('DELETE FROM productos WHERE id = ANY($1::int[]) AND tenant_id=$2', [lst, t]);
       }
-      return res.json({ok:true, modo:'crear_actualizar', insertados, actualizados});
     }
-    // MODO "solo_nuevos": inserta solo los que no existen (por SKU o nombre)
-    if(modo==='solo_nuevos'){
-      let insertados=0, saltados=0;
-      for(const p of (productos||[])){
-        let existe=null;
-        if(p.sku && p.sku.trim()){ const {rows}=await pool.query('SELECT id FROM productos WHERE sku=$1 AND tenant_id=$2 LIMIT 1', [p.sku.trim(), req.tenantId]); existe=rows[0]; }
-        if(!existe && (p.nombre||p.modelo)){ const {rows}=await pool.query('SELECT id FROM productos WHERE LOWER(TRIM(nombre))=LOWER(TRIM($1)) AND tenant_id=$2 LIMIT 1', [(p.nombre||p.modelo).trim(), req.tenantId]); existe=rows[0]; }
-        if(existe){ saltados++; continue; }
-        await pool.query(`INSERT INTO productos (tenant_id,seccion_id,categoria,modelo,nombre,precio_base,stock,imagen,sku,descripcion,peso,alto,ancho,largo,visible) VALUES ($14,$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,true)`, [p.seccion_id||seccion_id||1, p.categoria||'', p.modelo||'', p.nombre||p.modelo||'', p.precio_base||0, p.stock||0, p.imagen||'', p.sku||'', p.descripcion||'', p.peso||0, p.alto||0, p.ancho||0, p.largo||0, req.tenantId]);
-        insertados++;
-      }
-      return res.json({ok:true, modo:'solo_nuevos', insertados, saltados});
+    for(const p of lista){
+      try{
+        if(!S(p.nombre || p.modelo)) { saltados++; continue; }
+        if(modo==='reemplazar' || reemplazar || modo==='insertar'){ await insertar(p); insertados++; continue; }
+        const ex = await buscar(p);
+        if(modo==='solo_nuevos'){ if(ex){ saltados++; continue; } await insertar(p); insertados++; continue; }
+        // crear_actualizar (por defecto)
+        if(ex){ await actualizar(ex.id, p); actualizados++; } else { await insertar(p); insertados++; }
+      }catch(e){ fallo(e, p); }
     }
-    // MODO por defecto / "reemplazar": insertar (con reemplazar opcional)
-    if(reemplazar || modo==='reemplazar'){ await pool.query('DELETE FROM producto_imagenes WHERE tenant_id=$1', [req.tenantId]); await pool.query('DELETE FROM pedido_items WHERE tenant_id=$1', [req.tenantId]); await pool.query('DELETE FROM productos WHERE seccion_id=$1 AND tenant_id=$2', [seccion_id||1, req.tenantId]); }
-    for(const p of (productos||[])){
-      await pool.query(`INSERT INTO productos (tenant_id,seccion_id,categoria,modelo,nombre,precio_base,stock,imagen,sku,descripcion,compatibilidad,peso,alto,ancho,largo,visible,permitir_sin_stock,es_digital) VALUES ($18,$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) ON CONFLICT DO NOTHING`, [p.seccion_id||seccion_id||1, p.categoria||'', p.modelo||'', p.nombre||p.modelo||'', p.precio_base||0, p.stock||0, p.imagen||'', p.sku||'', p.descripcion||'', p.compatibilidad||'', p.peso||0, p.alto||0, p.ancho||0, p.largo||0, true, p.permitir_sin_stock||false, p.es_digital||false, req.tenantId]);
-    }
-    res.json({ok:true, count: productos.length, insertados: productos.length});
+    res.json({ok:true, modo: modo || 'crear_actualizar', insertados, actualizados, saltados, errores, primer_error: primerError || undefined});
   }catch(e){ res.status(500).json({error:e.message}); }
 });
 app.delete('/api/categorias/:categoria', authPerm('productos'), async (req,res)=>{ try{ const {mover_a}=req.query; const destino = mover_a || 'Sin categoría'; const r=await pool.query('UPDATE productos SET categoria=$1 WHERE categoria=$2 AND tenant_id=$3', [destino, req.params.categoria, req.tenantId]); await pool.query('DELETE FROM categorias_meta WHERE categoria=$1 AND tenant_id=$2', [req.params.categoria, req.tenantId]).catch(()=>{}); res.json({ok:true, movidos:r.rowCount, destino}); }catch(e){ res.status(500).json({error:e.message}); } });
@@ -2076,7 +2147,7 @@ app.post('/api/bot/stock-cero', botAuth, async (req, res) => {
     res.json({ ok: true, afectados: r.rowCount });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
-app.get('/api/productos/buscar', optionalAuth, async (req,res)=>{ try{ const {q}=req.query; if(!q) return res.json([]); const toks=String(q).trim().split(/\s+/).filter(Boolean).slice(0,8); const campos=`(coalesce(p.nombre,'')||' '||coalesce(p.modelo,'')||' '||coalesce(p.categoria,'')||' '||coalesce(p.marca,'')||' '||coalesce(p.sku,'')||' '||coalesce(p.compatibilidad,''))`; const cond=[]; const params=[req.tenantId]; let pi=2; for(const tk of toks){ cond.push(`${SQL_SIN_ACENTOS(campos)} LIKE $${pi}`); params.push(tokenBusqueda(tk)); pi++; } const whereTok=cond.length?(' AND '+cond.join(' AND ')):''; const {rows}=await pool.query(`SELECT p.id,p.nombre,p.modelo,p.categoria,p.precio_base,p.precio_oferta,p.stock,p.imagen,p.sku,p.codigo_barras,p.seccion_id,p.permitir_sin_stock,p.es_digital,p.usa_variantes,(SELECT MIN(CASE WHEN v.precio_oferta>0 AND v.precio_oferta<v.precio THEN v.precio_oferta ELSE v.precio END) FROM variantes v WHERE v.producto_id=p.id AND v.tenant_id=p.tenant_id AND v.precio>0) AS precio_desde,s.nombre as seccion_nombre,s.color as seccion_color FROM productos p LEFT JOIN secciones s ON p.seccion_id=s.id WHERE p.tenant_id=$1${whereTok}${esStaffReq(req)?'':' AND p.visible=true'} ORDER BY p.nombre LIMIT 20`, params); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
+app.get('/api/productos/buscar', optionalAuth, async (req,res)=>{ try{ const {q}=req.query; if(!q) return res.json([]); const toks=String(q).trim().split(/\s+/).filter(Boolean).slice(0,8); const campos=`(coalesce(p.nombre,'')||' '||coalesce(p.modelo,'')||' '||coalesce(p.categoria,'')||' '||coalesce(p.marca,'')||' '||coalesce(p.sku,'')||' '||coalesce(p.compatibilidad,''))`; const cond=[]; const params=[req.tenantId]; let pi=2; for(const tk of toks){ cond.push(`${SQL_SIN_ACENTOS(campos)} LIKE $${pi}`); params.push(tokenBusqueda(tk)); pi++; } const whereTok=cond.length?(' AND '+cond.join(' AND ')):''; const {rows}=await pool.query(`SELECT p.id,p.nombre,p.modelo,p.categoria,p.precio_base,p.precio_oferta,p.stock,p.imagen,p.sku,p.codigo_barras,p.seccion_id,p.permitir_sin_stock,p.es_digital,p.usa_variantes,(SELECT MIN(CASE WHEN v.precio_oferta>0 AND v.precio_oferta<v.precio THEN v.precio_oferta ELSE v.precio END) FROM variantes v WHERE v.producto_id=p.id AND v.tenant_id=p.tenant_id AND v.precio>0) AS precio_desde,s.nombre as seccion_nombre,s.color as seccion_color FROM productos p LEFT JOIN secciones s ON p.seccion_id=s.id WHERE p.tenant_id=$1${whereTok}${esStaffReq(req)?'':' AND p.visible=true'} ORDER BY p.nombre LIMIT 20`, params); res.json(esStaffReq(req) ? rows : await sinRestringidas(req, rows, { conservarConAcceso: true })); }catch(e){ res.status(500).json({error:e.message}); } });
 // Buscar producto por código de barras/SKU exacto (para el escáner). Devuelve 1 producto.
 app.get('/api/productos/por-codigo/:codigo', optionalAuth, async (req,res)=>{
   try{
@@ -2085,6 +2156,7 @@ app.get('/api/productos/por-codigo/:codigo', optionalAuth, async (req,res)=>{
     const {rows}=await pool.query(`SELECT p.*, s.nombre as seccion_nombre FROM productos p LEFT JOIN secciones s ON p.seccion_id=s.id
       WHERE p.tenant_id=$2 AND (p.codigo_barras=$1 OR p.sku=$1 OR CAST(p.id AS TEXT)=$1) LIMIT 1`, [c, req.tenantId]);
     if(!rows[0] || (!esStaffReq(req) && rows[0].visible===false)) return res.status(404).json({error:'No se encontró ningún producto con ese código'});
+    if(!esStaffReq(req) && (await sinRestringidas(req, rows, { conservarConAcceso: true })).length===0) return res.status(404).json({error:'No se encontró ningún producto con ese código'});
     res.json(esStaffReq(req) ? rows[0] : limpiarProducto(rows[0]));
   }catch(e){ res.status(500).json({error:e.message}); }
 });
@@ -2105,7 +2177,7 @@ app.post('/api/productos/generar-codigos', authPerm('productos'), async (req,res
     res.json({ok:true, generados});
   }catch(e){ res.status(500).json({error:e.message}); }
 });
-app.get('/api/productos/id/:id', optionalAuth, async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM productos WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); if(!rows[0] || (!esStaffReq(req) && rows[0].visible===false)) return res.status(404).json({error:'No encontrado'}); if(esStaffReq(req)) return res.json(rows[0]); const [r]=await ocultarPreciosAprobacion(req, rows); res.json(limpiarProducto(r)); }catch(e){ res.status(500).json({error:e.message}); } });
+app.get('/api/productos/id/:id', optionalAuth, async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM productos WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); if(!rows[0] || (!esStaffReq(req) && rows[0].visible===false)) return res.status(404).json({error:'No encontrado'}); if(!esStaffReq(req) && (await sinRestringidas(req, rows, { conservarConAcceso: true })).length===0) return res.status(404).json({error:'Este producto es solo para clientes mayoristas autorizados'}); if(esStaffReq(req)) return res.json(rows[0]); const [r]=await ocultarPreciosAprobacion(req, rows); res.json(limpiarProducto(r)); }catch(e){ res.status(500).json({error:e.message}); } });
 
 // Validar presupuesto antes de convertir: chequear stock y precios actuales
 app.post('/api/pedidos/:id/validar-conversion', authPerm('pedidos'), async (req,res)=>{
@@ -2327,7 +2399,8 @@ app.put('/api/usuarios/:id', authPerm('usuarios'), async (req,res)=>{
         if((c[0]?.n||0) >= maxS) return res.status(403).json({error: maxS===0 ? 'Tu plan no incluye sub-administradores' : `Tu plan permite hasta ${maxS} sub-administradores`, upgrade:true});
       }
     }
-    const fields=['nombre','usuario','telefono','email','direccion','nombre_fantasia','rol','lista_precio_id','activo','aprobado','permisos','notas_admin','es_revendedor','descuento_revendedor'];
+    const fields=['nombre','usuario','telefono','email','direccion','nombre_fantasia','rol','lista_precio_id','activo','aprobado','permisos','notas_admin','es_revendedor','descuento_revendedor','mayorista'];
+    if(u.mayorista===true){ sets.push(`mayorista_solicitado_at=NULL`); }
     for(const f of fields){ if(u[f]!==undefined){ sets.push(`${f}=$${pi++}`); params.push(u[f]); } }
     if(u.password){ const hash=await bcrypt.hash(u.password,10); sets.push(`password=$${pi++}`); params.push(hash); }
     if(!sets.length) return res.json({ok:true});
@@ -2829,7 +2902,7 @@ app.get('/api/stats', authPerm('stats'), async (req,res)=>{
     if(desde||hasta){ if(desde){ cliParams.push(desde); cliWhere+=` AND ${fLocal('created_at')} >= $${cliParams.length}`; } if(hasta){ cliParams.push(hasta); cliWhere+=` AND ${fLocal('created_at')} <= $${cliParams.length}`; } }
     else cliWhere=` AND ${fLocal('created_at')} >= ${HOY_LOCAL} - INTERVAL '30 days'`;
     const cliNuevos = await pool.query(`SELECT COUNT(*)::int AS n FROM usuarios WHERE tenant_id=$1 AND rol='cliente'${cliWhere}`, cliParams).catch(()=>({rows:[{n:0}]}));
-    const pendAprob = await pool.query(`SELECT COUNT(*)::int AS n FROM usuarios WHERE tenant_id=$1 AND rol='cliente' AND aprobado=false AND activo<>false`, [req.tenantId]).catch(()=>({rows:[{n:0}]}));
+    const pendAprob = await pool.query(`SELECT COUNT(*)::int AS n FROM usuarios WHERE tenant_id=$1 AND rol='cliente' AND ((aprobado=false AND activo<>false) OR (mayorista_solicitado_at IS NOT NULL AND COALESCE(mayorista,false)=false))`, [req.tenantId]).catch(()=>({rows:[{n:0}]}));
     const sinStock = await pool.query(`SELECT COUNT(*)::int AS n FROM productos WHERE tenant_id=$1 AND visible=true AND stock<=0 AND COALESCE(permitir_sin_stock,false)=false AND COALESCE(es_digital,false)=false${seccion_id && seccion_id!=='all' ? ' AND seccion_id=$2' : ''}`, seccion_id && seccion_id!=='all' ? [req.tenantId, seccion_id] : [req.tenantId]).catch(()=>({rows:[{n:0}]}));
 
     // ── APARTADO USDT (mismo criterio: solo cobrado + seña) ──
@@ -3011,7 +3084,8 @@ app.delete('/api/envio/custom/:id', authPerm('config'), async (req,res)=>{ try{ 
 app.get('/api/busqueda-global', optionalAuth, async (req,res)=>{
   try{
     const {q}=req.query; if(!q||q.length<2) return res.json({resultados:[], total:0});
-    const {rows:secciones}=await pool.query('SELECT * FROM secciones WHERE visible=true AND tenant_id=$1 ORDER BY orden, id', [req.tenantId]);
+    // El buscador general no incluye las tiendas con aprobación (mayorista): es un catálogo aparte
+    const {rows:secciones}=await pool.query('SELECT * FROM secciones WHERE visible=true AND COALESCE(requiere_aprobacion,false)=false AND tenant_id=$1 ORDER BY orden, id', [req.tenantId]);
     const resultados=[];
     const toks = String(q).trim().split(/\s+/).filter(Boolean).slice(0,8);
     const campos = `(coalesce(nombre,'')||' '||coalesce(modelo,'')||' '||coalesce(categoria,'')||' '||coalesce(marca,'')||' '||coalesce(sku,'')||' '||coalesce(compatibilidad,'')||' '||coalesce(descripcion,''))`;
