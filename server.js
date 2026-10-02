@@ -2388,6 +2388,13 @@ async function staffProtegido(req, targetId){
   if(req._rol!=='admin' && (t.rol==='admin' || t.rol==='subadmin') && String(targetId)!==String(req.user?.id)) return 'Solo el administrador puede modificar cuentas del equipo';
   return null;
 }
+// Lista de precios de un usuario: vacío → null; inexistente en la tienda → false
+async function listaPrecioValida(tenantId, valor){
+  const lp=String(valor==null?'':valor).trim();
+  if(!lp || lp==='0' || lp==='null') return null;
+  const {rows}=await pool.query('SELECT 1 FROM listas_precio WHERE id=$1 AND tenant_id=$2', [lp, tenantId]).catch(()=>({rows:[]}));
+  return rows[0] ? lp : false;
+}
 app.put('/api/usuarios/:id', authPerm('usuarios'), async (req,res)=>{
   try{
     const u=req.body; const sets=[]; const params=[]; let pi=1;
@@ -2404,6 +2411,12 @@ app.put('/api/usuarios/:id', authPerm('usuarios'), async (req,res)=>{
       }
     }
     const fields=['nombre','usuario','telefono','email','direccion','nombre_fantasia','rol','lista_precio_id','activo','aprobado','permisos','notas_admin','es_revendedor','descuento_revendedor','mayorista'];
+    // "Sin lista" llega vacío: en la base es NULL (la columna tiene clave foránea a listas_precio y '' no existe)
+    if(u.lista_precio_id!==undefined){
+      const lp=await listaPrecioValida(req.tenantId, u.lista_precio_id);
+      if(lp===false) return res.status(400).json({error:'Esa lista de precios no existe más. Elegí otra o "Sin lista".'});
+      u.lista_precio_id=lp;
+    }
     if(u.mayorista===true){ sets.push(`mayorista_solicitado_at=NULL`); }
     for(const f of fields){ if(u[f]!==undefined){ sets.push(`${f}=$${pi++}`); params.push(u[f]); } }
     if(u.password){ const hash=await bcrypt.hash(u.password,10); sets.push(`password=$${pi++}`); params.push(hash); }
@@ -2413,7 +2426,7 @@ app.put('/api/usuarios/:id', authPerm('usuarios'), async (req,res)=>{
     res.json({ok:true});
   }catch(e){ res.status(500).json({error:e.message}); }
 });
-app.post('/api/usuarios/:id/aprobar', authPerm('usuarios'), async (req,res)=>{ try{ const {lista_precio_id}=req.body; await pool.query('UPDATE usuarios SET aprobado=true, activo=true, lista_precio_id=$1 WHERE id=$2 AND tenant_id=$3', [lista_precio_id||'', req.params.id, req.tenantId]); const {rows}=await pool.query('SELECT * FROM usuarios WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); res.json({ok:true, user:{...rows[0], password:undefined}}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.post('/api/usuarios/:id/aprobar', authPerm('usuarios'), async (req,res)=>{ try{ const lp=await listaPrecioValida(req.tenantId, req.body && req.body.lista_precio_id); await pool.query('UPDATE usuarios SET aprobado=true, activo=true, lista_precio_id=$1 WHERE id=$2 AND tenant_id=$3', [lp||null, req.params.id, req.tenantId]); const {rows}=await pool.query('SELECT * FROM usuarios WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); res.json({ok:true, user:{...rows[0], password:undefined}}); }catch(e){ res.status(500).json({error:e.message}); } });
 app.post('/api/usuarios/:id/rechazar', authPerm('usuarios'), async (req,res)=>{ try{ await pool.query('UPDATE usuarios SET activo=false WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 app.post('/api/usuarios/:id/suspender', authPerm('usuarios'), async (req,res)=>{ try{ const bloqueo=await staffProtegido(req, req.params.id); if(bloqueo) return res.status(403).json({error:bloqueo}); if(String(req.params.id)===String(req.user?.id)) return res.status(400).json({error:'No podés suspender tu propia cuenta'}); const {activo}=req.body; await pool.query('UPDATE usuarios SET activo=$1 WHERE id=$2 AND tenant_id=$3', [activo, req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 // RESET MEJORADO - codigo largo
