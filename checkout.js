@@ -234,11 +234,16 @@ function createCheckout(pool) {
     const todosGratis = fisicos.length > 0 && fisicos.every(i => i.envio_gratis);
     const gratisSeccion = (umbral > 0 && subtotal >= umbral) || todosGratis;
     const { rows } = await db.query('SELECT * FROM metodos_envio_custom WHERE activo=true AND tenant_id=$1 AND (seccion_id=$2 OR seccion_id IS NULL) ORDER BY orden, id', [ctx.tenantId, sec.id]);
+    // tipo: 'fijo' (cobra su precio), 'gratis' (siempre sin cargo) o 'a_cotizar' (el costo se pasa después).
+    // Un método 'fijo' sin precio cargado también es "a cotizar": nunca se muestra como gratis por error.
     const opciones = rows.map(m => {
-      const original = num(m.precio);
+      const esGratis = m.tipo === 'gratis';
+      const sinPrecio = !esGratis && (m.tipo === 'a_cotizar' || num(m.precio) <= 0);
+      const original = esGratis || sinPrecio ? 0 : num(m.precio);
       const gd = num(m.gratis_desde);
-      const gratis = original > 0 && (gratisSeccion || (gd > 0 && subtotal >= gd));
-      return { id: `custom:${m.id}`, nombre: m.nombre, descripcion: m.descripcion || '', tiempo_estimado: m.tiempo_estimado || '', icono: m.icono || 'truck', costo: gratis ? 0 : original, costo_original: original, gratis, proveedor: 'propio' };
+      const bonificado = !esGratis && (gratisSeccion || (gd > 0 && subtotal >= gd));
+      const aCotizar = sinPrecio && !bonificado;
+      return { id: `custom:${m.id}`, nombre: m.nombre, descripcion: m.descripcion || '', tiempo_estimado: m.tiempo_estimado || '', icono: m.icono || 'truck', costo: bonificado || aCotizar ? 0 : original, costo_original: original, gratis: esGratis || bonificado, a_cotizar: aCotizar, proveedor: 'propio' };
     });
     const cpLimpio = String(cp || '').replace(/\D/g, '').slice(0, 8);
     if (cpLimpio.length >= 4) {
@@ -331,7 +336,7 @@ function createCheckout(pool) {
       let elegido = null, costoEnvio = 0;
       if (requiereEnvio) {
         envio = await opcionesEnvio(db, ctx, sec, ars, subtotal, cp);
-        if (envioGratisCupon) envio.opciones = envio.opciones.map(o => ({ ...o, costo: 0, gratis: o.costo_original > 0 }));
+        if (envioGratisCupon) envio.opciones = envio.opciones.map(o => ({ ...o, costo: 0, gratis: true, a_cotizar: false }));
         if (entregaTipo === 'envio') {
           const pedido = envioElegido[String(secId)];
           const porNombre = envioElegido[`nombre:${secId}`];
@@ -354,7 +359,7 @@ function createCheckout(pool) {
         seccion_id: secId, nombre: sec.nombre, slug: sec.slug,
         items: items.map(({ _prod, _var, peso, alto, ancho, largo, ...rest }) => rest),
         subtotal, subtotal_usdt: subtotalUsdt, descuento, cupon: cuponAplicado,
-        requiere_envio: requiereEnvio, envio: { ...envio, elegido, costo: costoEnvio, a_coordinar: entregaTipo === 'envio' && requiereEnvio && !envio.opciones.length },
+        requiere_envio: requiereEnvio, envio: { ...envio, elegido, costo: costoEnvio, a_cotizar: !!(elegido && elegido.a_cotizar), a_coordinar: entregaTipo === 'envio' && requiereEnvio && !envio.opciones.length },
         total, compra_minima: min, compra_minima_usd: minUsd ? minBase : null, falta_minimo: faltaMinimo,
         _items: items,
       });
@@ -364,6 +369,7 @@ function createCheckout(pool) {
       subtotal: round2(resultado.reduce((s, r) => s + r.subtotal, 0)),
       descuento: round2(resultado.reduce((s, r) => s + r.descuento, 0)),
       envio: round2(resultado.reduce((s, r) => s + r.envio.costo, 0)),
+      envio_a_cotizar: resultado.some(r => r.envio.a_cotizar),
       total: round2(resultado.reduce((s, r) => s + r.total, 0)),
       total_usdt: round2(resultado.reduce((s, r) => s + r.subtotal_usdt, 0)),
     };

@@ -2609,7 +2609,7 @@ app.post('/api/pedidos/multi', auth(), async (req,res)=>{
       let notas=TXT(ped.notas,4000);
       if(s._items.some(i=>i._preventa)) notas=`${notas} [RESERVA/PREVENTA — requiere seña]`.trim();
       if(!soloUsdt && s.subtotal_usdt>0) notas=`${notas} [Además: USDT ${s.subtotal_usdt} a pagar aparte]`.trim();
-      const metodoEnvio = entrega.tipo==='retiro' ? 'Retiro en el local' : (s.envio.elegido ? s.envio.elegido.nombre : (s.requiere_envio ? 'A coordinar' : ''));
+      const metodoEnvio = (entrega.tipo==='retiro' ? 'Retiro en el local' : (s.envio.elegido ? (s.envio.elegido.a_cotizar ? `${s.envio.elegido.nombre} (envío a cotizar)` : s.envio.elegido.nombre) : (s.requiere_envio ? 'A coordinar' : ''))).slice(0,100);
       const {rows}=await client.query('INSERT INTO pedidos (tenant_id,usuario_id,seccion_id,tipo,metodo_pago,notas,cupon_codigo,subtotal,descuento,total,datos_envio,costo_envio,metodo_envio,cp_destino,is_test,datos_facturacion,estado_pago,es_reserva) VALUES ($17,$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$18) RETURNING *',
         [req.user.id, s.seccion_id, 'pedido', TXT(ped.metodo_pago,100), notas, s.cupon||'', soloUsdt ? s.subtotal_usdt : s.subtotal, s.descuento, soloUsdt ? s.subtotal_usdt : s.total, TXT(ped.datos_envio,8000), s.envio.costo, metodoEnvio, TXT(entrega.cp,20), staff ? !!b.is_test : false, TXT(ped.datos_facturacion,4000), 'impago', req.tenantId, s._items.some(i=>i._preventa)]);
       await insertarItems(client, req.tenantId, rows[0].id, s._items, true);
