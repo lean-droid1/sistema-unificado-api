@@ -80,7 +80,7 @@ if (!SECRET) {
   console.error('JWT_SECRET no configurado - usando clave de desarrollo (solo local)');
 }
 const JWT_SECRET = SECRET || crypto.randomBytes(32).toString('hex');
-const { createCheckout, CheckoutError } = require('./checkout');
+const { createCheckout, CheckoutError, cotizacionDolar } = require('./checkout');
 const checkout = createCheckout(pool);
 
 // Datos de usuario que nunca deben salir hacia el navegador
@@ -917,14 +917,10 @@ app.delete('/api/tenants/:id', authOwner, async (req,res)=>{
 
 
 // Dolar blue
+// Cotización del dólar que usa la tienda (blue, oficial o manual según Reglas de compra)
 app.get('/api/dolar-blue', async (req,res)=>{
-  try{
-    if(dolarBlueCache.valor && Date.now()-dolarBlueCache.ts<15*60*1000) return res.json({venta:dolarBlueCache.valor});
-    const r = await fetch('https://dolarapi.com/v1/dolares/blue');
-    if(r.ok){ const d=await r.json(); dolarBlueCache={valor:d.venta, ts:Date.now()}; return res.json({venta:d.venta}); }
-    const {rows}=await pool.query("SELECT valor FROM configuracion WHERE clave='dolar_blue' AND tenant_id=$1", [req.tenantId]);
-    res.json({venta: rows[0]?.valor?Number(rows[0].valor):null});
-  }catch(e){ const {rows}=await pool.query("SELECT valor FROM configuracion WHERE clave='dolar_blue' AND tenant_id=$1", [req.tenantId]).catch(()=>({rows:[]})); res.json({venta: rows[0]?.valor?Number(rows[0].valor):null}); }
+  try{ const c=await cotizacionDolar(pool, req.tenantId); res.json({ venta: c.valor || null, fuente: c.fuente, actualizado: c.actualizado || null }); }
+  catch(e){ res.json({ venta: null }); }
 });
 
 // Maintenance
@@ -1719,12 +1715,20 @@ app.post('/api/productos/bulk', authPerm('productos'), async (req,res)=>{
     if(modo==='marcar_faltantes'){
       if(!secDest) return res.status(400).json({error:'Falta la sección'});
       const presentes = Array.isArray(req.body.presentes) ? req.body.presentes : [];
+      if(!presentes.length) return res.status(400).json({error:'El Excel vino vacío: no toco nada'});
       const skus = new Set(presentes.map(x => S(x && x.sku, 100)).filter(Boolean));
       const noms = new Set(presentes.map(x => S(x && x.nombre).toLowerCase()).filter(Boolean));
       const {rows} = await pool.query('SELECT id, sku, nombre FROM productos WHERE tenant_id=$1 AND seccion_id=$2', [t, secDest]);
       const faltan = rows.filter(r => !(r.sku && skus.has(String(r.sku).trim())) && !noms.has(S(r.nombre).toLowerCase())).map(r => r.id);
       if(faltan.length){
-        if(req.body.accion==='ocultar') await pool.query('UPDATE productos SET visible=false WHERE id = ANY($1::int[]) AND tenant_id=$2', [faltan, t]);
+        if(req.body.accion==='borrar'){
+          // Borrado seguro: el historial de pedidos queda intacto (solo se desvincula el producto)
+          await pool.query('UPDATE pedido_items SET producto_id=NULL WHERE producto_id = ANY($1::int[])', [faltan]).catch(()=>{});
+          await pool.query('UPDATE orden_compra_items SET producto_id=NULL WHERE producto_id = ANY($1::int[])', [faltan]).catch(()=>{});
+          for(const tb of ['precios_fijos','historial_precios','notificaciones_stock','producto_imagenes','variantes','favoritos']) await pool.query(`DELETE FROM ${tb} WHERE producto_id = ANY($1::int[])`, [faltan]).catch(()=>{});
+          await pool.query('DELETE FROM productos WHERE id = ANY($1::int[]) AND tenant_id=$2', [faltan, t]);
+        }
+        else if(req.body.accion==='ocultar') await pool.query('UPDATE productos SET visible=false WHERE id = ANY($1::int[]) AND tenant_id=$2', [faltan, t]);
         else await pool.query('UPDATE productos SET stock=0, permitir_sin_stock=false WHERE id = ANY($1::int[]) AND tenant_id=$2', [faltan, t]);
       }
       return res.json({ok:true, modo, marcados: faltan.length});

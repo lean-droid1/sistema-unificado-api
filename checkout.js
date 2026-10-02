@@ -117,6 +117,29 @@ const PROVEEDORES_ENVIO = [
   },
 ];
 
+// Cotización del dólar para mínimos en USD y precios en dólares.
+// Fuente configurable (configuracion.usd_fuente): blue (por defecto) | oficial | manual (usd_manual).
+const _cotCache = {};
+async function cotizacionDolar(db, tenantId) {
+  const { rows } = await db.query("SELECT clave, valor FROM configuracion WHERE tenant_id=$1 AND clave IN ('usd_fuente','usd_manual','dolar_blue')", [tenantId]).catch(() => ({ rows: [] }));
+  const cfg = {}; rows.forEach(r => { cfg[r.clave] = r.valor; });
+  const fuente = ['oficial', 'manual'].includes(cfg.usd_fuente) ? cfg.usd_fuente : 'blue';
+  if (fuente === 'manual' && num(cfg.usd_manual) > 0) return { valor: num(cfg.usd_manual), fuente: 'manual' };
+  const tipo = fuente === 'oficial' ? 'oficial' : 'blue';
+  const hit = _cotCache[tipo];
+  if (hit && Date.now() - hit.ts < 15 * 60 * 1000) return { valor: hit.valor, fuente: tipo, actualizado: hit.fecha };
+  try {
+    const r = await fetch(`https://dolarapi.com/v1/dolares/${tipo}`, { signal: AbortSignal.timeout(6000) });
+    if (r.ok) {
+      const d = await r.json(); const v = num(d.venta);
+      if (v > 0) { _cotCache[tipo] = { valor: v, ts: Date.now(), fecha: d.fechaActualizacion || null }; return { valor: v, fuente: tipo, actualizado: d.fechaActualizacion || null }; }
+    }
+  } catch (e) { /* sin conexión: usa lo último que se obtuvo o el valor manual */ }
+  if (hit) return { valor: hit.valor, fuente: tipo, actualizado: hit.fecha, viejo: true };
+  const resp = num(cfg.usd_manual) || num(cfg.dolar_blue);
+  return resp > 0 ? { valor: resp, fuente: 'respaldo' } : { valor: 0, fuente: 'sin_datos' };
+}
+
 function createCheckout(pool) {
   // Todo lo que depende del cliente y de la tienda (una sola vez por cotización)
   async function contexto(db, tenantId, userId) {
@@ -264,6 +287,9 @@ function createCheckout(pool) {
   // Cotiza el carrito completo. body = { secciones:[{seccion_id, items, envio_id}], entrega:{tipo, cp}, cupon, metodo_pago }
   async function cotizarCarrito(db, tenantId, userId, body, opts = {}) {
     const ctx = opts.ctx || await contexto(db, tenantId, userId);
+    // Cotización del dólar: solo si alguna tienda tiene el mínimo en USD o muestra precios en dólares
+    const usaUsd = Object.keys(ctx.config).some(k => (k.startsWith('compra_minima_moneda_') && ctx.config[k] === 'USD'));
+    const usd = usaUsd ? await cotizacionDolar(db, tenantId) : null;
     const entregaTipo = body?.entrega?.tipo === 'retiro' ? 'retiro' : 'envio';
     const cp = body?.entrega?.cp || '';
     const cuponCodigo = String(body?.cupon || '').trim();
@@ -314,17 +340,22 @@ function createCheckout(pool) {
         }
       }
       const total = round2(Math.max(0, subtotal - descuento) + costoEnvio);
-      const min = num(ctx.config[`compra_minima_${secId}`]);
+      // Compra mínima en pesos o en dólares (en USD se cotiza al momento de cerrar el carrito)
+      const minUsd = ctx.config[`compra_minima_moneda_${secId}`] === 'USD';
+      const minBase = num(ctx.config[`compra_minima_${secId}`]);
+      const min = minUsd ? (usd && usd.valor > 0 ? Math.round(minBase * usd.valor) : 0) : minBase;
       const minAplica = min > 0 && (entregaTipo === 'envio' || ctx.config[`min_aplica_retiro_${secId}`] === 'true');
       const faltaMinimo = minAplica && subtotal < min ? round2(min - subtotal) : 0;
-      if (faltaMinimo > 0) errores.push({ seccion_id: secId, tipo: 'minimo', mensaje: `${sec.nombre}: la compra mínima${entregaTipo === 'envio' ? ' para envío' : ''} es de $${min.toLocaleString('es-AR')}.` });
+      if (faltaMinimo > 0) errores.push({ seccion_id: secId, tipo: 'minimo', mensaje: minUsd
+        ? `${sec.nombre}: la compra mínima${entregaTipo === 'envio' ? ' para envío' : ''} es de USD ${minBase.toLocaleString('es-AR')} (hoy $${min.toLocaleString('es-AR')} al dólar de $${num(usd && usd.valor).toLocaleString('es-AR')}).`
+        : `${sec.nombre}: la compra mínima${entregaTipo === 'envio' ? ' para envío' : ''} es de $${min.toLocaleString('es-AR')}.` });
       if (entregaTipo === 'envio' && requiereEnvio && envio.opciones.length && !elegido) errores.push({ seccion_id: secId, tipo: 'envio', mensaje: `Elegí cómo querés recibir lo de ${sec.nombre}.` });
       resultado.push({
         seccion_id: secId, nombre: sec.nombre, slug: sec.slug,
         items: items.map(({ _prod, _var, peso, alto, ancho, largo, ...rest }) => rest),
         subtotal, subtotal_usdt: subtotalUsdt, descuento, cupon: cuponAplicado,
         requiere_envio: requiereEnvio, envio: { ...envio, elegido, costo: costoEnvio, a_coordinar: entregaTipo === 'envio' && requiereEnvio && !envio.opciones.length },
-        total, compra_minima: min, falta_minimo: faltaMinimo,
+        total, compra_minima: min, compra_minima_usd: minUsd ? minBase : null, falta_minimo: faltaMinimo,
         _items: items,
       });
     }
@@ -336,13 +367,13 @@ function createCheckout(pool) {
       total: round2(resultado.reduce((s, r) => s + r.total, 0)),
       total_usdt: round2(resultado.reduce((s, r) => s + r.subtotal_usdt, 0)),
     };
-    return { ctx, entrega: { tipo: entregaTipo, cp }, secciones: resultado, totales, cupon: cuponInfo, errores, avisos: avisos || [] };
+    return { ctx, entrega: { tipo: entregaTipo, cp }, secciones: resultado, totales, cupon: cuponInfo, errores, avisos: avisos || [], usd };
   }
 
   // Versión para mandar a la web (sin datos internos)
   function publico(cot) {
     return {
-      entrega: cot.entrega, totales: cot.totales, cupon: cot.cupon, errores: cot.errores, avisos: cot.avisos,
+      entrega: cot.entrega, totales: cot.totales, cupon: cot.cupon, errores: cot.errores, avisos: cot.avisos, usd: cot.usd || null,
       secciones: cot.secciones.map(({ _items, ...s }) => s),
     };
   }
@@ -350,4 +381,4 @@ function createCheckout(pool) {
   return { contexto, preciarItems, cotizarCarrito, evaluarCupon, publico, CheckoutError };
 }
 
-module.exports = { createCheckout, precioCliente, aplicarPromo, CheckoutError, PROVEEDORES_ENVIO };
+module.exports = { createCheckout, precioCliente, aplicarPromo, CheckoutError, PROVEEDORES_ENVIO, cotizacionDolar };
