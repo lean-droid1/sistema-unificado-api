@@ -533,6 +533,7 @@ async function migrate(){
     // Contador propio de visitas y búsquedas (sin Google)
     `CREATE TABLE IF NOT EXISTS visitas_eventos (id BIGSERIAL PRIMARY KEY, tenant_id INT NOT NULL DEFAULT 1, visitante VARCHAR(40) DEFAULT '', sesion VARCHAR(40) DEFAULT '', tipo VARCHAR(12) DEFAULT 'vista', path VARCHAR(300) DEFAULT '', origen VARCHAR(120) DEFAULT '', dispositivo VARCHAR(12) DEFAULT '', termino VARCHAR(120), resultados INT, created_at TIMESTAMP DEFAULT NOW())`,
     `CREATE INDEX IF NOT EXISTS idx_visitas_tenant_fecha ON visitas_eventos(tenant_id, created_at)`,
+    `ALTER TABLE visitas_eventos ADD COLUMN IF NOT EXISTS bot_nombre VARCHAR(40) DEFAULT ''`,
     // usuarios
     `ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS reset_codigo VARCHAR(20) DEFAULT ''`,
     `ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS reset_expira TIMESTAMP`,
@@ -2934,9 +2935,21 @@ const TZ_TIENDA = `'${(process.env.TZ_TIENDA || 'America/Argentina/Buenos_Aires'
 const fLocal = (c) => `(${c} AT TIME ZONE current_setting('TimeZone') AT TIME ZONE ${TZ_TIENDA})`;
 const HOY_LOCAL = `(now() AT TIME ZONE ${TZ_TIENDA})::date`;
 // ─── CONTADOR PROPIO DE VISITAS Y BÚSQUEDAS ───
+// Nombre legible del bot (null si es una persona). Los navegadores de adentro de Telegram/WhatsApp/Instagram son personas.
+const BOTS_CONOCIDOS=[[/googlebot|google-inspectiontool|adsbot-google|googleother|google-read-aloud|mediapartners-google/i,'Google'],[/lighthouse|pagespeed|gtmetrix/i,'Pruebas de velocidad'],
+  [/bingbot|bingpreview|msnbot/i,'Bing'],[/vercel/i,'Vercel'],[/facebookexternalhit|meta-externalagent|facebookbot/i,'Meta'],[/applebot/i,'Apple'],
+  [/gptbot|chatgpt|oai-searchbot/i,'ChatGPT'],[/claudebot|claude-user|anthropic/i,'Claude'],[/perplexity/i,'Perplexity'],[/bytespider/i,'TikTok'],
+  [/ahrefsbot/i,'Ahrefs'],[/semrushbot/i,'Semrush'],[/yandex/i,'Yandex'],[/duckduck/i,'DuckDuckGo'],[/headlesschrome|phantomjs|puppeteer|playwright|selenium/i,'Navegador automático']];
+function botDe(ua){
+  const u=String(ua||'');
+  for(const [re,n] of BOTS_CONOCIDOS) if(re.test(u)) return n;
+  if(/bot\b|bot\/|crawl|spider|slurp|scrap/i.test(u)) { const m=/([a-z0-9_-]*(?:bot|crawler|spider))/i.exec(u); return (m&&m[1]?m[1]:'Otro bot').slice(0,40); }
+  if(!u.trim()) return 'Sin navegador';
+  return null;
+}
 function dispositivoDe(ua){
   const u=String(ua||'');
-  if(/bot|crawl|spider|slurp|preview|facebookexternalhit|whatsapp|telegram|headless|lighthouse/i.test(u)) return 'bot';
+  if(botDe(u)) return 'bot';
   if(/ipad|tablet|kindle|silk|playbook/i.test(u) || (/android/i.test(u) && !/mobile/i.test(u))) return 'tablet';
   if(/mobi|iphone|ipod|android|blackberry|opera mini|iemobile/i.test(u)) return 'mobile';
   return 'desktop';
@@ -2952,8 +2965,9 @@ app.post('/api/track', rateLimit({ windowMs: 60*1000, max: 120, standardHeaders:
     try{ if(origen){ const h=new URL(origen).hostname.replace(/^www\./,''); origen = h; } }catch{ origen=T(origen,120); }
     const termino = tipo==='busqueda' ? T(b.q,120).toLowerCase() : null;
     if(tipo==='busqueda' && (!termino || termino.length<2)) return res.status(204).end();
-    await pool.query('INSERT INTO visitas_eventos (tenant_id,visitante,sesion,tipo,path,origen,dispositivo,termino,resultados) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)',
-      [req.tenantId, visitante, sesion, tipo, T(b.p,300), T(origen,120), dispositivoDe(req.headers['user-agent']), termino, tipo==='busqueda' ? Math.max(0, parseInt(b.n,10)||0) : null]);
+    const ua=req.headers['user-agent'];
+    await pool.query('INSERT INTO visitas_eventos (tenant_id,visitante,sesion,tipo,path,origen,dispositivo,termino,resultados,bot_nombre) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)',
+      [req.tenantId, visitante, sesion, tipo, T(b.p,300), T(origen,120), dispositivoDe(ua), termino, tipo==='busqueda' ? Math.max(0, parseInt(b.n,10)||0) : null, botDe(ua)||'']);
     if(Math.random()<0.002) pool.query("DELETE FROM visitas_eventos WHERE created_at < NOW() - INTERVAL '400 days'").catch(()=>{});
     res.status(204).end();
   }catch(e){ res.status(204).end(); }
@@ -2971,6 +2985,7 @@ app.get('/api/analytics/visitas', authPerm('stats'), async (req,res)=>{
     const [tp] = await q(`SELECT COALESCE(ROUND(AVG(dur))::int,0) AS seg FROM (SELECT EXTRACT(EPOCH FROM MAX(created_at)-MIN(created_at)) AS dur FROM visitas_eventos WHERE ${w} AND dispositivo<>'bot' GROUP BY sesion) x`);
     const dias = await q(`SELECT to_char(${fLocal('created_at')}::date,'YYYY-MM-DD') AS fecha, COUNT(DISTINCT sesion)::int AS visitas, COUNT(*)::int AS paginas FROM visitas_eventos WHERE ${w} AND tipo='vista' AND dispositivo<>'bot' GROUP BY 1 ORDER BY 1`);
     const disp = await q(`SELECT dispositivo AS k, COUNT(DISTINCT sesion)::int AS n FROM visitas_eventos WHERE ${w} AND tipo='vista' GROUP BY 1 ORDER BY 2 DESC`);
+    const bots = await q(`SELECT COALESCE(NULLIF(bot_nombre,''),'Sin identificar (de antes)') AS k, COUNT(DISTINCT sesion)::int AS n FROM visitas_eventos WHERE ${w} AND dispositivo='bot' GROUP BY 1 ORDER BY 2 DESC LIMIT 8`);
     const origenes = await q(`SELECT COALESCE(NULLIF(origen,''),'directo') AS k, COUNT(DISTINCT sesion)::int AS n FROM visitas_eventos WHERE ${w} AND tipo='vista' AND dispositivo<>'bot' GROUP BY 1 ORDER BY 2 DESC LIMIT 8`);
     const paginas = await q(`SELECT path AS k, COUNT(*)::int AS n FROM visitas_eventos WHERE ${w} AND tipo='vista' AND dispositivo<>'bot' GROUP BY 1 ORDER BY 2 DESC LIMIT 10`);
     const busq = await q(`SELECT termino AS k, COUNT(*)::int AS n, MIN(resultados)::int AS min_res, to_char(MAX(${fLocal('created_at')}),'YYYY-MM-DD HH24:MI') AS ultima FROM visitas_eventos WHERE ${w} AND tipo='busqueda' GROUP BY 1 ORDER BY 2 DESC LIMIT 15`);
@@ -2979,7 +2994,7 @@ app.get('/api/analytics/visitas', authPerm('stats'), async (req,res)=>{
     const ids=paginas.map(p=>{ const m=/^\/producto\/.*-(\d+)$/.exec(p.k||''); return m?parseInt(m[1],10):null; }).filter(Boolean);
     let nombres={}; if(ids.length){ const {rows}=await pool.query('SELECT id, nombre FROM productos WHERE tenant_id=$1 AND id = ANY($2::int[])', [t, ids]); rows.forEach(r=>nombres[r.id]=r.nombre); }
     paginas.forEach(p=>{ const m=/^\/producto\/.*-(\d+)$/.exec(p.k||''); if(m && nombres[m[1]]) p.nombre=nombres[m[1]]; });
-    res.json({ desde, hasta, ...k, tiempo_promedio_seg: tp ? tp.seg : 0, dias, dispositivos: disp, origenes, paginas_top: paginas, busquedas_top: busq, busquedas_sin_resultado: sinRes });
+    res.json({ desde, hasta, ...k, tiempo_promedio_seg: tp ? tp.seg : 0, dias, dispositivos: disp, bots, origenes, paginas_top: paginas, busquedas_top: busq, busquedas_sin_resultado: sinRes });
   }catch(e){ res.status(500).json({error:e.message}); }
 });
 app.get('/api/stats', authPerm('stats'), async (req,res)=>{
