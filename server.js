@@ -530,6 +530,9 @@ async function migrate(){
        END IF;
      END $$`,
     `CREATE UNIQUE INDEX IF NOT EXISTS uq_cupones_tenant_codigo ON cupones(tenant_id, UPPER(codigo))`,
+    // Contador propio de visitas y búsquedas (sin Google)
+    `CREATE TABLE IF NOT EXISTS visitas_eventos (id BIGSERIAL PRIMARY KEY, tenant_id INT NOT NULL DEFAULT 1, visitante VARCHAR(40) DEFAULT '', sesion VARCHAR(40) DEFAULT '', tipo VARCHAR(12) DEFAULT 'vista', path VARCHAR(300) DEFAULT '', origen VARCHAR(120) DEFAULT '', dispositivo VARCHAR(12) DEFAULT '', termino VARCHAR(120), resultados INT, created_at TIMESTAMP DEFAULT NOW())`,
+    `CREATE INDEX IF NOT EXISTS idx_visitas_tenant_fecha ON visitas_eventos(tenant_id, created_at)`,
     // usuarios
     `ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS reset_codigo VARCHAR(20) DEFAULT ''`,
     `ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS reset_expira TIMESTAMP`,
@@ -2930,6 +2933,55 @@ app.get('/api/reportes', authPerm('stats'), requiereFeature('reportes'), async (
 const TZ_TIENDA = `'${(process.env.TZ_TIENDA || 'America/Argentina/Buenos_Aires').replace(/'/g, '')}'`;
 const fLocal = (c) => `(${c} AT TIME ZONE current_setting('TimeZone') AT TIME ZONE ${TZ_TIENDA})`;
 const HOY_LOCAL = `(now() AT TIME ZONE ${TZ_TIENDA})::date`;
+// ─── CONTADOR PROPIO DE VISITAS Y BÚSQUEDAS ───
+function dispositivoDe(ua){
+  const u=String(ua||'');
+  if(/bot|crawl|spider|slurp|preview|facebookexternalhit|whatsapp|telegram|headless|lighthouse/i.test(u)) return 'bot';
+  if(/ipad|tablet|kindle|silk|playbook/i.test(u) || (/android/i.test(u) && !/mobile/i.test(u))) return 'tablet';
+  if(/mobi|iphone|ipod|android|blackberry|opera mini|iemobile/i.test(u)) return 'mobile';
+  return 'desktop';
+}
+const T = (x, n) => String(x==null?'':x).replace(/[\u0000-\u001F\u007F]/g,'').trim().slice(0, n);
+app.post('/api/track', rateLimit({ windowMs: 60*1000, max: 120, standardHeaders: true, legacyHeaders: false, message: { ok:false } }), async (req,res)=>{
+  try{
+    const b=req.body||{};
+    const tipo = b.t==='busqueda' ? 'busqueda' : b.t==='ping' ? 'ping' : 'vista'; // ping: el cliente sigue en la página (para el tiempo promedio)
+    const visitante=T(b.v,40), sesion=T(b.s,40);
+    if(!visitante || !sesion) return res.status(204).end();
+    let origen=T(b.r,300);
+    try{ if(origen){ const h=new URL(origen).hostname.replace(/^www\./,''); origen = h; } }catch{ origen=T(origen,120); }
+    const termino = tipo==='busqueda' ? T(b.q,120).toLowerCase() : null;
+    if(tipo==='busqueda' && (!termino || termino.length<2)) return res.status(204).end();
+    await pool.query('INSERT INTO visitas_eventos (tenant_id,visitante,sesion,tipo,path,origen,dispositivo,termino,resultados) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)',
+      [req.tenantId, visitante, sesion, tipo, T(b.p,300), T(origen,120), dispositivoDe(req.headers['user-agent']), termino, tipo==='busqueda' ? Math.max(0, parseInt(b.n,10)||0) : null]);
+    if(Math.random()<0.002) pool.query("DELETE FROM visitas_eventos WHERE created_at < NOW() - INTERVAL '400 days'").catch(()=>{});
+    res.status(204).end();
+  }catch(e){ res.status(204).end(); }
+});
+app.get('/api/analytics/visitas', authPerm('stats'), async (req,res)=>{
+  try{
+    const t=req.tenantId; const params=[t]; let w='tenant_id=$1';
+    const hoy=new Date(); const d0=new Date(hoy.getTime()-29*86400000);
+    const desde=/^\d{4}-\d{2}-\d{2}$/.test(String(req.query.desde||'')) ? req.query.desde : d0.toISOString().slice(0,10);
+    const hasta=/^\d{4}-\d{2}-\d{2}$/.test(String(req.query.hasta||'')) ? req.query.hasta : null;
+    params.push(desde); w+=` AND ${fLocal('created_at')}::date >= $${params.length}`;
+    if(hasta){ params.push(hasta); w+=` AND ${fLocal('created_at')}::date <= $${params.length}`; }
+    const q=(sql)=>pool.query(sql, params).then(r=>r.rows);
+    const [k] = await q(`SELECT COUNT(DISTINCT sesion) FILTER (WHERE tipo='vista' AND dispositivo<>'bot')::int AS visitas, COUNT(DISTINCT visitante) FILTER (WHERE tipo='vista' AND dispositivo<>'bot')::int AS visitantes, COUNT(*) FILTER (WHERE tipo='vista' AND dispositivo<>'bot')::int AS paginas, COUNT(*) FILTER (WHERE tipo='busqueda')::int AS busquedas FROM visitas_eventos WHERE ${w}`);
+    const [tp] = await q(`SELECT COALESCE(ROUND(AVG(dur))::int,0) AS seg FROM (SELECT EXTRACT(EPOCH FROM MAX(created_at)-MIN(created_at)) AS dur FROM visitas_eventos WHERE ${w} AND dispositivo<>'bot' GROUP BY sesion) x`);
+    const dias = await q(`SELECT to_char(${fLocal('created_at')}::date,'YYYY-MM-DD') AS fecha, COUNT(DISTINCT sesion)::int AS visitas, COUNT(*)::int AS paginas FROM visitas_eventos WHERE ${w} AND tipo='vista' AND dispositivo<>'bot' GROUP BY 1 ORDER BY 1`);
+    const disp = await q(`SELECT dispositivo AS k, COUNT(DISTINCT sesion)::int AS n FROM visitas_eventos WHERE ${w} AND tipo='vista' GROUP BY 1 ORDER BY 2 DESC`);
+    const origenes = await q(`SELECT COALESCE(NULLIF(origen,''),'directo') AS k, COUNT(DISTINCT sesion)::int AS n FROM visitas_eventos WHERE ${w} AND tipo='vista' AND dispositivo<>'bot' GROUP BY 1 ORDER BY 2 DESC LIMIT 8`);
+    const paginas = await q(`SELECT path AS k, COUNT(*)::int AS n FROM visitas_eventos WHERE ${w} AND tipo='vista' AND dispositivo<>'bot' GROUP BY 1 ORDER BY 2 DESC LIMIT 10`);
+    const busq = await q(`SELECT termino AS k, COUNT(*)::int AS n, MIN(resultados)::int AS min_res, to_char(MAX(${fLocal('created_at')}),'YYYY-MM-DD HH24:MI') AS ultima FROM visitas_eventos WHERE ${w} AND tipo='busqueda' GROUP BY 1 ORDER BY 2 DESC LIMIT 15`);
+    const sinRes = await q(`SELECT termino AS k, COUNT(*)::int AS n, to_char(MAX(${fLocal('created_at')}),'YYYY-MM-DD HH24:MI') AS ultima FROM visitas_eventos WHERE ${w} AND tipo='busqueda' AND resultados=0 GROUP BY 1 ORDER BY 2 DESC LIMIT 15`);
+    // Nombre del producto para las páginas /producto/...-ID
+    const ids=paginas.map(p=>{ const m=/^\/producto\/.*-(\d+)$/.exec(p.k||''); return m?parseInt(m[1],10):null; }).filter(Boolean);
+    let nombres={}; if(ids.length){ const {rows}=await pool.query('SELECT id, nombre FROM productos WHERE tenant_id=$1 AND id = ANY($2::int[])', [t, ids]); rows.forEach(r=>nombres[r.id]=r.nombre); }
+    paginas.forEach(p=>{ const m=/^\/producto\/.*-(\d+)$/.exec(p.k||''); if(m && nombres[m[1]]) p.nombre=nombres[m[1]]; });
+    res.json({ desde, hasta, ...k, tiempo_promedio_seg: tp ? tp.seg : 0, dias, dispositivos: disp, origenes, paginas_top: paginas, busquedas_top: busq, busquedas_sin_resultado: sinRes });
+  }catch(e){ res.status(500).json({error:e.message}); }
+});
 app.get('/api/stats', authPerm('stats'), async (req,res)=>{
   try{
     const {seccion_id,desde,hasta,is_test}=req.query;
