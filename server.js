@@ -64,15 +64,23 @@ app.set('trust proxy', 1);
 
 const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
 // Recalcula preventa_reservado de un producto desde los pedidos reales (activos)
-async function recalcReservado(productoId){
+async function recalcReservado(productoId, tenantId){
   try{
-    if(!productoId) return;
+    if(!productoId || !tenantId) return;
     await pool.query(`UPDATE productos SET preventa_reservado = (
       SELECT COALESCE(SUM(pi.cantidad),0) FROM pedido_items pi JOIN pedidos p ON pi.pedido_id=p.id
-      WHERE pi.producto_id=$1 AND p.tipo='pedido' AND LOWER(COALESCE(p.estado,'')) NOT IN ('cancelado','anulado','rechazado')
-    ) WHERE id=$1 AND es_preventa=true`, [productoId]);
+      WHERE pi.producto_id=$1 AND p.tenant_id=$2 AND p.tipo='pedido' AND LOWER(COALESCE(p.estado,'')) NOT IN ('cancelado','anulado','rechazado')
+    ) WHERE id=$1 AND tenant_id=$2 AND es_preventa=true`, [productoId, tenantId]);
   }catch(e){ /* noop */ }
 }
+// Aislamiento entre tiendas: de una lista de ids de producto, deja solo los que son de esta tienda
+async function idsProductosDeTienda(db, tenantId, ids){
+  const lista=[...new Set((ids||[]).map(x=>parseInt(x,10)).filter(n=>Number.isFinite(n)&&n>0))];
+  if(!lista.length) return new Set();
+  const {rows}=await db.query('SELECT id FROM productos WHERE tenant_id=$1 AND id = ANY($2::int[])', [tenantId, lista]);
+  return new Set(rows.map(r=>r.id));
+}
+async function productoDeTienda(db, tenantId, id){ return (await idsProductosDeTienda(db, tenantId, [id])).has(parseInt(id,10)); }
 const SECRET = process.env.JWT_SECRET;
 if (!SECRET) {
   // En producción NO se arranca sin clave propia: con la de ejemplo cualquiera podría fabricar sesiones de admin.
@@ -377,7 +385,7 @@ async function migrate(){
     `ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS moneda VARCHAR(10) DEFAULT 'ARS'`,
     `ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS codigo_seguimiento VARCHAR(120) DEFAULT ''`,
     `DELETE FROM carritos_abandonados c USING carritos_abandonados c2 WHERE c.recuperado=false AND c2.recuperado=false AND c.tenant_id=c2.tenant_id AND c.usuario_id=c2.usuario_id AND c.usuario_id IS NOT NULL AND (c.created_at < c2.created_at OR (c.created_at=c2.created_at AND c.id<c2.id))`,
-    `UPDATE pedidos SET moneda='USDT' WHERE (moneda IS NULL OR moneda='ARS') AND EXISTS(SELECT 1 FROM pedido_items pi LEFT JOIN productos pr ON pr.id=pi.producto_id LEFT JOIN variantes v ON v.id=pi.variante_id WHERE pi.pedido_id=pedidos.id AND COALESCE(v.moneda, pr.moneda,'ARS')='USDT')`,
+    `UPDATE pedidos SET moneda='USDT' WHERE (moneda IS NULL OR moneda='ARS') AND EXISTS(SELECT 1 FROM pedido_items pi LEFT JOIN productos pr ON pr.id=pi.producto_id AND pr.tenant_id=(SELECT tenant_id FROM pedidos WHERE id=pi.pedido_id) LEFT JOIN variantes v ON v.id=pi.variante_id WHERE pi.pedido_id=pedidos.id AND COALESCE(v.moneda, pr.moneda,'ARS')='USDT')`,
     `CREATE TABLE IF NOT EXISTS ordenes_compra (id SERIAL PRIMARY KEY, proveedor VARCHAR(200), seccion_id INT, estado VARCHAR(20) DEFAULT 'pendiente', total NUMERIC(12,2) DEFAULT 0, notas TEXT, recibida BOOLEAN DEFAULT false, created_at TIMESTAMP DEFAULT NOW())`,
     `CREATE TABLE IF NOT EXISTS orden_compra_items (id SERIAL PRIMARY KEY, orden_id INT REFERENCES ordenes_compra(id) ON DELETE CASCADE, producto_id INT, nombre_producto VARCHAR(300), cantidad INT DEFAULT 1, costo_unitario NUMERIC(12,2) DEFAULT 0)`,
     `ALTER TABLE secciones ADD COLUMN IF NOT EXISTS permitir_sin_stock BOOLEAN DEFAULT false`,
@@ -508,6 +516,21 @@ async function migrate(){
     `ALTER TABLE productos ADD COLUMN IF NOT EXISTS posicion INT DEFAULT 0`,
     `ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS mayorista BOOLEAN DEFAULT false`,
     `ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS mayorista_solicitado_at TIMESTAMP`,
+    // Seguridad multi-tienda: categorías y códigos de cupón únicos POR TIENDA (antes eran globales y una tienda pisaba a otra)
+    `DO $$ DECLARE pk text; cols int; BEGIN
+       SELECT conname, array_length(conkey,1) INTO pk, cols FROM pg_constraint WHERE conrelid='categorias_meta'::regclass AND contype='p';
+       IF pk IS NOT NULL AND cols=1 THEN
+         UPDATE categorias_meta SET tenant_id=1 WHERE tenant_id IS NULL;
+         EXECUTE format('ALTER TABLE categorias_meta DROP CONSTRAINT %I', pk);
+         ALTER TABLE categorias_meta ADD PRIMARY KEY (tenant_id, categoria);
+       END IF;
+     END $$`,
+    `DO $$ BEGIN
+       IF EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='cupones'::regclass AND conname='cupones_codigo_key') THEN
+         ALTER TABLE cupones DROP CONSTRAINT cupones_codigo_key;
+       END IF;
+     END $$`,
+    `CREATE UNIQUE INDEX IF NOT EXISTS uq_cupones_tenant_codigo ON cupones(tenant_id, UPPER(codigo))`,
     // usuarios
     `ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS reset_codigo VARCHAR(20) DEFAULT ''`,
     `ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS reset_expira TIMESTAMP`,
@@ -1179,8 +1202,12 @@ app.put('/api/config', authPerm('config'), async (req,res)=>{ try{ for(const [k,
 
 // LISTAS
 app.get('/api/listas', async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM listas_precio WHERE tenant_id=$1 ORDER BY multiplicador', [req.tenantId]); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
-app.put('/api/listas', authPerm('listas'), requiereFeature('listas_precio'), async (req,res)=>{ try{ const {listas}=req.body; for(const l of listas){ await pool.query('INSERT INTO listas_precio (id,nombre,multiplicador,modo,color,compra_minima,promo_msg,tenant_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (id) DO UPDATE SET nombre=$2,multiplicador=$3,modo=$4,color=$5,compra_minima=$6,promo_msg=$7', [l.id,l.nombre,l.multiplicador,l.modo||'porcentaje',l.color||'#2563eb',l.compra_minima||0,l.promo_msg||'', req.tenantId]); } res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
-app.post('/api/listas', authPerm('listas'), requiereFeature('listas_precio'), async (req,res)=>{ try{ const l=req.body; const {rows}=await pool.query('INSERT INTO listas_precio (id,nombre,multiplicador,modo,color,compra_minima,promo_msg,tenant_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *', [l.id,l.nombre,l.multiplicador||1,l.modo||'porcentaje',l.color||'#2563eb',l.compra_minima||0,l.promo_msg||'', req.tenantId]); res.json(rows[0]); }catch(e){ res.status(400).json({error:e.message}); } });
+app.put('/api/listas', authPerm('listas'), requiereFeature('listas_precio'), async (req,res)=>{ try{ const {listas}=req.body; if(!Array.isArray(listas)) return res.status(400).json({error:'Faltan las listas'});
+  // El código de lista es único en toda la base: nunca pisar la lista de otra tienda
+  const {rows:ajenas}=await pool.query('SELECT id FROM listas_precio WHERE id = ANY($1::text[]) AND tenant_id<>$2', [listas.map(l=>String(l&&l.id||'')), req.tenantId]);
+  if(ajenas.length) return res.status(409).json({error:`El código de lista "${ajenas[0].id}" ya está en uso. Elegí otro.`});
+  for(const l of listas){ await pool.query('INSERT INTO listas_precio (id,nombre,multiplicador,modo,color,compra_minima,promo_msg,tenant_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (id) DO UPDATE SET nombre=$2,multiplicador=$3,modo=$4,color=$5,compra_minima=$6,promo_msg=$7 WHERE listas_precio.tenant_id=EXCLUDED.tenant_id', [l.id,l.nombre,l.multiplicador,l.modo||'porcentaje',l.color||'#2563eb',l.compra_minima||0,l.promo_msg||'', req.tenantId]); } res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.post('/api/listas', authPerm('listas'), requiereFeature('listas_precio'), async (req,res)=>{ try{ const l=req.body; const {rows:ya}=await pool.query('SELECT 1 FROM listas_precio WHERE id=$1', [String(l.id||'')]); if(ya[0]) return res.status(409).json({error:'Ese código de lista ya está en uso. Elegí otro.'}); const {rows}=await pool.query('INSERT INTO listas_precio (id,nombre,multiplicador,modo,color,compra_minima,promo_msg,tenant_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *', [l.id,l.nombre,l.multiplicador||1,l.modo||'porcentaje',l.color||'#2563eb',l.compra_minima||0,l.promo_msg||'', req.tenantId]); res.json(rows[0]); }catch(e){ res.status(400).json({error:e.message}); } });
 app.put('/api/listas/:id', authPerm('listas'), requiereFeature('listas_precio'), async (req,res)=>{ try{ const l=req.body; await pool.query('UPDATE listas_precio SET nombre=$1,multiplicador=$2,modo=$3,color=$4,compra_minima=$5,promo_msg=$6 WHERE id=$7 AND tenant_id=$8', [l.nombre,l.multiplicador,l.modo,l.color,l.compra_minima||0,l.promo_msg||'',req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 app.delete('/api/listas/:id', authPerm('listas'), requiereFeature('listas_precio'), async (req,res)=>{ try{ await pool.query('DELETE FROM listas_precio WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 
@@ -1385,7 +1412,7 @@ app.post('/api/productos/:id/recibir-preventa', authPerm('productos'), async (re
     const cantidadRecibida = req.body.cantidad!==undefined ? Number(req.body.cantidad) : cupo;
     // stock nuevo = stock actual + (recibido - reservado). Lo reservado ya se vendió.
     const aStock = Math.max(0, cantidadRecibida - reservado);
-    await pool.query('UPDATE productos SET stock = stock + $1, es_preventa=false, preventa_cupo=0, preventa_reservado=0, preventa_descuento_pct=0 WHERE id=$2', [aStock, req.params.id]);
+    await pool.query('UPDATE productos SET stock = stock + $1, es_preventa=false, preventa_cupo=0, preventa_reservado=0, preventa_descuento_pct=0 WHERE id=$2 AND tenant_id=$3', [aStock, req.params.id, req.tenantId]);
     res.json({ ok:true, sumado_a_stock: aStock, reservas_tomadas: reservado, recibido: cantidadRecibida });
   }catch(e){ res.status(500).json({error:e.message}); }
 });
@@ -1554,9 +1581,9 @@ app.post('/api/categorias/crear', authPerm('productos'), async (req,res)=>{
     if(!nombre || !nombre.trim()) return res.status(400).json({error:'Falta el nombre'});
     const n=nombre.trim();
     const {rows:ex}=await pool.query('SELECT 1 FROM productos WHERE categoria=$1 AND tenant_id=$2 LIMIT 1', [n, req.tenantId]);
-    const {rows:exM}=await pool.query('SELECT 1 FROM categorias_meta WHERE categoria=$1', [n]);
+    const {rows:exM}=await pool.query('SELECT 1 FROM categorias_meta WHERE categoria=$1 AND tenant_id=$2', [n, req.tenantId]);
     if(ex.length || exM.length) return res.status(400).json({error:'Esa categoría ya existe'});
-    await pool.query('INSERT INTO categorias_meta (categoria, orden, visible) VALUES ($1, 0, true) ON CONFLICT DO NOTHING', [n]);
+    await pool.query('INSERT INTO categorias_meta (tenant_id, categoria, orden, visible) VALUES ($2, $1, 0, true) ON CONFLICT DO NOTHING', [n, req.tenantId]);
     res.json({ok:true, nombre:n});
   }catch(e){ res.status(500).json({error:e.message}); }
 });
@@ -1586,8 +1613,8 @@ app.post('/api/categorias/meta', authPerm('productos'), async (req,res)=>{
   try{
     const {categorias}=req.body; // [{nombre, orden, visible}]
     for(const c of (categorias||[])){
-      await pool.query(`INSERT INTO categorias_meta (categoria, orden, visible) VALUES ($1,$2,$3)
-        ON CONFLICT (categoria) DO UPDATE SET orden=$2, visible=$3`, [c.nombre, c.orden||0, c.visible!==false]);
+      await pool.query(`INSERT INTO categorias_meta (tenant_id, categoria, orden, visible) VALUES ($4,$1,$2,$3)
+        ON CONFLICT (tenant_id, categoria) DO UPDATE SET orden=$2, visible=$3`, [c.nombre, c.orden||0, c.visible!==false, req.tenantId]);
     }
     res.json({ok:true});
   }catch(e){ res.status(500).json({error:e.message}); }
@@ -1660,6 +1687,7 @@ app.put('/api/productos/:id', authPerm('productos'), async (req,res)=>{
 app.delete('/api/productos/:id', authPerm('productos'), async (req,res)=>{
   try{
     const id=req.params.id, tid=req.tenantId;
+    if(!(await productoDeTienda(pool, tid, id))) return res.status(404).json({error:'Producto no encontrado'});
     // Limpiar referencias que NO tienen ON DELETE CASCADE (evita que el borrado falle o deje huérfanos)
     await pool.query('DELETE FROM precios_fijos WHERE producto_id=$1', [id]).catch(()=>{});
     await pool.query('DELETE FROM historial_precios WHERE producto_id=$1', [id]).catch(()=>{});
@@ -2214,8 +2242,8 @@ app.post('/api/producto-imagenes', authPerm('productos'), async (req,res)=>{ try
 app.delete('/api/producto-imagenes/:id', authPerm('productos'), async (req,res)=>{ try{ const {rows:pv}=await pool.query('SELECT producto_id FROM producto_imagenes WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); await pool.query('DELETE FROM producto_imagenes WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); if(pv[0]) await syncImagenPrincipal(pv[0].producto_id, req.tenantId); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 app.put('/api/producto-imagenes/reorder', authPerm('productos'), async (req,res)=>{ try{ const {items}=req.body; for(const it of items){ await pool.query('UPDATE producto_imagenes SET orden=$1 WHERE id=$2 AND tenant_id=$3', [it.orden,it.id, req.tenantId]); } if(items&&items[0]){ const {rows:pv}=await pool.query('SELECT producto_id FROM producto_imagenes WHERE id=$1 AND tenant_id=$2', [items[0].id, req.tenantId]); if(pv[0]) await syncImagenPrincipal(pv[0].producto_id, req.tenantId); } res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 app.get('/api/variantes/:producto_id', async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM variantes WHERE producto_id=$1 AND tenant_id=$2 ORDER BY id', [req.params.producto_id, req.tenantId]); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
-app.post('/api/variantes', authPerm('productos'), async (req,res)=>{ try{ const {producto_id,nombre,valor,stock,precio_extra,precio}=req.body; const {rows}=await pool.query('INSERT INTO variantes (tenant_id,producto_id,nombre,valor,stock,precio_extra,precio) VALUES ($7,$1,$2,$3,$4,$5,$6) RETURNING *', [producto_id,nombre,valor||'',stock||0,precio_extra||0,precio||0, req.tenantId]); res.json(rows[0]); }catch(e){ res.status(500).json({error:e.message}); } });
-app.put('/api/variantes/:id', authPerm('productos'), async (req,res)=>{ try{ const v=req.body; await pool.query('UPDATE variantes SET nombre=$1,valor=$2,stock=$3,precio_extra=$4,precio=$5 WHERE id=$6', [v.nombre,v.valor,v.stock||0,v.precio_extra||0,v.precio||0,req.params.id]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.post('/api/variantes', authPerm('productos'), async (req,res)=>{ try{ const {producto_id,nombre,valor,stock,precio_extra,precio}=req.body; if(!(await productoDeTienda(pool, req.tenantId, producto_id))) return res.status(404).json({error:'Producto no encontrado'}); const {rows}=await pool.query('INSERT INTO variantes (tenant_id,producto_id,nombre,valor,stock,precio_extra,precio) VALUES ($7,$1,$2,$3,$4,$5,$6) RETURNING *', [producto_id,nombre,valor||'',stock||0,precio_extra||0,precio||0, req.tenantId]); res.json(rows[0]); }catch(e){ res.status(500).json({error:e.message}); } });
+app.put('/api/variantes/:id', authPerm('productos'), async (req,res)=>{ try{ const v=req.body; const r=await pool.query('UPDATE variantes SET nombre=$1,valor=$2,stock=$3,precio_extra=$4,precio=$5 WHERE id=$6 AND tenant_id=$7', [v.nombre,v.valor,v.stock||0,v.precio_extra||0,v.precio||0,req.params.id, req.tenantId]); if(!r.rowCount) return res.status(404).json({error:'Variante no encontrada'}); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 app.delete('/api/variantes/:id', authPerm('productos'), async (req,res)=>{ try{ await pool.query('DELETE FROM variantes WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 
 // ── ATRIBUTOS + VARIANTES COMBINADAS (modelo Empretienda) ──
@@ -2242,6 +2270,7 @@ app.put('/api/productos/:id/variantes-full', authPerm('productos'), async (req,r
   try{
     const t=req.tenantId; const pid=req.params.id;
     const { usa_variantes, atributos=[], variantes=[] } = req.body;
+    if(!(await productoDeTienda(client, t, pid))) return res.status(404).json({error:'Producto no encontrado'});
     await client.query('BEGIN');
     await client.query('UPDATE productos SET usa_variantes=$1 WHERE id=$2 AND tenant_id=$3',[!!usa_variantes, pid, t]);
     await client.query('DELETE FROM producto_atributos WHERE producto_id=$1 AND tenant_id=$2',[pid,t]); // cascade borra valores
@@ -2329,7 +2358,10 @@ app.delete('/api/ordenes-compra/:id', authPerm('pedidos'), requiereFeature('orde
 });
 // Precios fijos por lista: el personal ve todos; cada cliente solo los de SU lista (para que la tienda le muestre su precio real)
 app.get('/api/precios-fijos', optionalAuth, async (req,res)=>{ try{ if(!req.user) return res.json([]); const {rows:u}=await pool.query('SELECT rol, permisos, lista_precio_id FROM usuarios WHERE id=$1 AND tenant_id=$2', [req.user.id, req.tenantId]); const me=u[0]; if(!me) return res.json([]); const staff=me.rol==='admin' || (me.rol==='subadmin' && String(me.permisos||'').split(',').includes('productos')); if(staff){ const {rows}=await pool.query('SELECT * FROM precios_fijos WHERE tenant_id=$1', [req.tenantId]); return res.json(rows); } if(!me.lista_precio_id) return res.json([]); const {rows}=await pool.query('SELECT producto_id, lista_precio_id, precio_fijo FROM precios_fijos WHERE tenant_id=$1 AND lista_precio_id=$2', [req.tenantId, me.lista_precio_id]); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
-app.post('/api/precios-fijos', authPerm('productos'), requiereFeature('listas_precio'), async (req,res)=>{ try{ const {producto_id,lista_precio_id,precio_fijo}=req.body; await pool.query('INSERT INTO precios_fijos (tenant_id,producto_id,lista_precio_id,precio_fijo) VALUES ($4,$1,$2,$3) ON CONFLICT (producto_id,lista_precio_id) DO UPDATE SET precio_fijo=$3', [producto_id,lista_precio_id,precio_fijo, req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.post('/api/precios-fijos', authPerm('productos'), requiereFeature('listas_precio'), async (req,res)=>{ try{ const {producto_id,lista_precio_id,precio_fijo}=req.body;
+  if(!(await productoDeTienda(pool, req.tenantId, producto_id))) return res.status(404).json({error:'Producto no encontrado'});
+  const {rows:lp}=await pool.query('SELECT 1 FROM listas_precio WHERE id=$1 AND tenant_id=$2', [lista_precio_id, req.tenantId]); if(!lp[0]) return res.status(404).json({error:'Lista no encontrada'});
+  await pool.query('INSERT INTO precios_fijos (tenant_id,producto_id,lista_precio_id,precio_fijo) VALUES ($4,$1,$2,$3) ON CONFLICT (producto_id,lista_precio_id) DO UPDATE SET precio_fijo=$3 WHERE precios_fijos.tenant_id=EXCLUDED.tenant_id', [producto_id,lista_precio_id,precio_fijo, req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 
 // USUARIOS
 app.get('/api/usuarios/:id/cuenta', authPerm('usuarios'), requiereFeature('cuenta_corriente'), async (req,res)=>{
@@ -2487,8 +2519,10 @@ async function validarStockItems(client, tenantId, items){
   }
 }
 async function insertarItems(client, tenantId, pedidoId, items, descontarStock){
+  const propios=await idsProductosDeTienda(client, tenantId, items.map(i=>i.producto_id));
   for(const item of items){
-    const pid=parseInt(item.producto_id,10)||null;
+    // Un producto de otra tienda queda como línea de texto (sin id): no toca su stock ni sus datos
+    const pid0=parseInt(item.producto_id,10)||null; const pid=pid0 && propios.has(pid0) ? pid0 : null;
     const cant=Number(item.cantidad)||1;
     await client.query("INSERT INTO pedido_items (tenant_id,pedido_id,producto_id,categoria,modelo,nombre_producto,cantidad,precio_unitario,precio_base,variante_id,variante_combinacion,imagen) VALUES ($9,$1,$2,$3,$4,$5,$6,$7,$8,$10,$11,COALESCE((SELECT imagen FROM productos WHERE id=$2 AND tenant_id=$9),''))",
       [pedidoId, pid, TXT(item.categoria,200), TXT(item.modelo,200), TXT(item.nombre_producto,300), cant, Number(item.precio_unitario)||0, Number(item.precio_base)||0, tenantId, item.variante_id||null, TXT(item.variante_label||item.variante_combinacion,500)]);
@@ -2507,7 +2541,7 @@ async function insertarItems(client, tenantId, pedidoId, items, descontarStock){
   }
 }
 async function etiquetarMoneda(client, pedidoId){
-  await client.query(`UPDATE pedidos SET moneda = CASE WHEN EXISTS(SELECT 1 FROM pedido_items pi LEFT JOIN productos pr ON pr.id=pi.producto_id LEFT JOIN variantes v ON v.id=pi.variante_id WHERE pi.pedido_id=$1 AND COALESCE(v.moneda, pr.moneda,'ARS')='USDT') THEN 'USDT' ELSE 'ARS' END WHERE id=$1`, [pedidoId]).catch(()=>{});
+  await client.query(`UPDATE pedidos SET moneda = CASE WHEN EXISTS(SELECT 1 FROM pedido_items pi LEFT JOIN productos pr ON pr.id=pi.producto_id AND pr.tenant_id=(SELECT tenant_id FROM pedidos WHERE id=pi.pedido_id) LEFT JOIN variantes v ON v.id=pi.variante_id WHERE pi.pedido_id=$1 AND COALESCE(v.moneda, pr.moneda,'ARS')='USDT') THEN 'USDT' ELSE 'ARS' END WHERE id=$1`, [pedidoId]).catch(()=>{});
 }
 // Lee {tipo, cp} de la entrega: del body nuevo o, si la web es vieja, del JSON datos_envio
 function leerEntrega(body, peds){
@@ -2766,10 +2800,13 @@ app.put('/api/pedidos/:id', authPerm('pedidos'), async (req,res)=>{  try{
       const {rows:viejos}=await pool.query('SELECT DISTINCT producto_id FROM pedido_items WHERE pedido_id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]);
       await pool.query('DELETE FROM pedido_items WHERE pedido_id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]);
       // tenant_id explícito (antes quedaba en 1 por defecto y en otras tiendas el pedido editado se quedaba sin productos) + foto del producto
+      // Solo productos de esta tienda: uno ajeno queda como línea de texto y no toca su stock
+      const propios=await idsProductosDeTienda(pool, req.tenantId, p.items.map(it=>it.producto_id||it.id));
+      p.items=p.items.map(it=>{ const id=parseInt(it.producto_id||it.id,10); return propios.has(id) ? it : { ...it, producto_id:null, id:null }; });
       for(const item of p.items){ await pool.query("INSERT INTO pedido_items (tenant_id,pedido_id,producto_id,categoria,modelo,nombre_producto,cantidad,precio_unitario,precio_base,variante_id,variante_combinacion,imagen) VALUES ($11,$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,COALESCE((SELECT imagen FROM productos WHERE id=$2 AND tenant_id=$11),''))", [req.params.id, item.producto_id||item.id||null, item.categoria||'', item.modelo||'', item.nombre_producto||`${item.categoria} - ${item.modelo}`, item.cantidad||item.qty||1, item.precio_unitario||0, item.precio_base||0, item.variante_id||null, item.variante_label||item.variante_combinacion||'', req.tenantId]); }
       // Recalcular reservado de preventa para todos los productos tocados
       const afectados=new Set([...viejos.map(v=>v.producto_id), ...p.items.map(it=>it.producto_id||it.id)].filter(Boolean));
-      for(const pid of afectados) await recalcReservado(pid);
+      for(const pid of afectados) await recalcReservado(pid, req.tenantId);
     }
 
     // ── RECONCILIACIÓN DE STOCK ──
@@ -2799,20 +2836,21 @@ app.put('/api/pedidos/:id', authPerm('pedidos'), async (req,res)=>{  try{
     for(const pid in stockAdd){
       const q=stockAdd[pid]; if(!q) continue;
       // No tocar stock de productos en preventa (su cupo se maneja aparte con preventa_reservado)
-      const {rows:esPre}=await pool.query('SELECT es_preventa FROM productos WHERE id=$1', [pid]);
-      if(esPre[0] && esPre[0].es_preventa){ await recalcReservado(pid); continue; }
-      await pool.query('UPDATE productos SET stock=GREATEST(0, stock + $1) WHERE id=$2 AND permitir_sin_stock=false AND es_digital=false', [q, pid]);
+      const {rows:esPre}=await pool.query('SELECT es_preventa FROM productos WHERE id=$1 AND tenant_id=$2', [pid, req.tenantId]);
+      if(!esPre[0]) continue; // producto de otra tienda o borrado: no se toca
+      if(esPre[0].es_preventa){ await recalcReservado(pid, req.tenantId); continue; }
+      await pool.query('UPDATE productos SET stock=GREATEST(0, stock + $1) WHERE id=$2 AND tenant_id=$3 AND permitir_sin_stock=false AND es_digital=false', [q, pid, req.tenantId]);
     }
     // Recalcular reservado si cambió el estado (cancelación/reactivación) para productos del pedido
     if(p.estado!==undefined && !p.items){
-      for(const it of oldItemsRows){ if(it.producto_id) await recalcReservado(it.producto_id); }
+      for(const it of oldItemsRows){ if(it.producto_id) await recalcReservado(it.producto_id, req.tenantId); }
     }
     res.json({ok:true});
   }catch(e){ res.status(500).json({error:e.message}); }
 });
 app.post('/api/pedidos/:id/archivar', authPerm('pedidos'), async (req,res)=>{ try{ await pool.query('UPDATE pedidos SET archivado=true WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 app.post('/api/pedidos/:id/desarchivar', authPerm('pedidos'), async (req,res)=>{ try{ await pool.query('UPDATE pedidos SET archivado=false WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
-app.delete('/api/pedidos/:id', authPerm('pedidos'), async (req,res)=>{ try{ const {rows:oep}=await pool.query('SELECT estado, tipo FROM pedidos WHERE id=$1 AND tenant_id=$2',[req.params.id, req.tenantId]); if(!oep[0]) return res.status(404).json({error:'No encontrado'}); const oe=String((oep[0]||{}).estado||'').toLowerCase(); const ot=String((oep[0]||{}).tipo||''); const afectabaStock = ot==='pedido' && !['cancelado','anulado','rechazado'].includes(oe); const {rows:its}=await pool.query('SELECT producto_id, cantidad, variante_id FROM pedido_items WHERE pedido_id=$1',[req.params.id]); const preIds=[]; if(afectabaStock){ for(const it of its){ if(it.variante_id){ await pool.query('UPDATE variantes SET stock=GREATEST(0, stock + $1) WHERE id=$2 AND tenant_id=$3',[it.cantidad||0, it.variante_id, req.tenantId]); continue; } if(!it.producto_id) continue; const {rows:pp}=await pool.query('SELECT es_preventa FROM productos WHERE id=$1',[it.producto_id]); if(pp[0] && pp[0].es_preventa){ preIds.push(it.producto_id); } else { await pool.query('UPDATE productos SET stock=GREATEST(0, stock + $1) WHERE id=$2 AND permitir_sin_stock=false AND es_digital=false',[it.cantidad||0, it.producto_id]); } } } await pool.query('DELETE FROM pedido_items WHERE pedido_id=$1', [req.params.id]); await pool.query('DELETE FROM pedidos WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); for(const pid of preIds) await recalcReservado(pid); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.delete('/api/pedidos/:id', authPerm('pedidos'), async (req,res)=>{ try{ const {rows:oep}=await pool.query('SELECT estado, tipo FROM pedidos WHERE id=$1 AND tenant_id=$2',[req.params.id, req.tenantId]); if(!oep[0]) return res.status(404).json({error:'No encontrado'}); const oe=String((oep[0]||{}).estado||'').toLowerCase(); const ot=String((oep[0]||{}).tipo||''); const afectabaStock = ot==='pedido' && !['cancelado','anulado','rechazado'].includes(oe); const {rows:its}=await pool.query('SELECT producto_id, cantidad, variante_id FROM pedido_items WHERE pedido_id=$1',[req.params.id]); const preIds=[]; if(afectabaStock){ for(const it of its){ if(it.variante_id){ await pool.query('UPDATE variantes SET stock=GREATEST(0, stock + $1) WHERE id=$2 AND tenant_id=$3',[it.cantidad||0, it.variante_id, req.tenantId]); continue; } if(!it.producto_id) continue; const {rows:pp}=await pool.query('SELECT es_preventa FROM productos WHERE id=$1 AND tenant_id=$2',[it.producto_id, req.tenantId]); if(!pp[0]) continue; if(pp[0].es_preventa){ preIds.push(it.producto_id); } else { await pool.query('UPDATE productos SET stock=GREATEST(0, stock + $1) WHERE id=$2 AND tenant_id=$3 AND permitir_sin_stock=false AND es_digital=false',[it.cantidad||0, it.producto_id, req.tenantId]); } } } await pool.query('DELETE FROM pedido_items WHERE pedido_id=$1', [req.params.id]); await pool.query('DELETE FROM pedidos WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); for(const pid of preIds) await recalcReservado(pid, req.tenantId); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 
 // STATS
 // REPORTES: más vendidos, ventas por sección, por mes, ganancias
@@ -2845,13 +2883,13 @@ app.get('/api/reportes', authPerm('stats'), requiereFeature('reportes'), async (
 
     const masVendidos=await pool.query(`SELECT pi.producto_id, pi.nombre_producto, SUM(pi.cantidad)::int as unidades, SUM(pi.cantidad*pi.precio_unitario)::numeric as facturado FROM pedido_items pi JOIN pedidos p ON pi.pedido_id=p.id ${where} GROUP BY pi.producto_id, pi.nombre_producto ORDER BY unidades DESC LIMIT 20`, params);
     const porSeccion=await pool.query(`SELECT s.id as seccion_id, s.nombre as seccion, COUNT(DISTINCT p.id)::int as pedidos, COALESCE(SUM(p.total),0)::numeric as total FROM pedidos p LEFT JOIN secciones s ON p.seccion_id=s.id ${where} GROUP BY s.id, s.nombre ORDER BY total DESC`, params);
-    const gananciaPorSeccion=await pool.query(`SELECT p.seccion_id, COALESCE(SUM(pi.cantidad*pi.precio_unitario),0)::numeric as facturado, COALESCE(SUM(pi.cantidad*COALESCE(NULLIF(pr.precio_original,0),0)),0)::numeric as costo FROM pedido_items pi JOIN pedidos p ON pi.pedido_id=p.id LEFT JOIN productos pr ON pi.producto_id=pr.id ${where} GROUP BY p.seccion_id`, params);
+    const gananciaPorSeccion=await pool.query(`SELECT p.seccion_id, COALESCE(SUM(pi.cantidad*pi.precio_unitario),0)::numeric as facturado, COALESCE(SUM(pi.cantidad*COALESCE(NULLIF(pr.precio_original,0),0)),0)::numeric as costo FROM pedido_items pi JOIN pedidos p ON pi.pedido_id=p.id LEFT JOIN productos pr ON pi.producto_id=pr.id AND pr.tenant_id=p.tenant_id ${where} GROUP BY p.seccion_id`, params);
     const gxs={}; gananciaPorSeccion.rows.forEach(r=>{ gxs[r.seccion_id]={ facturado:Number(r.facturado), costo:Number(r.costo), ganancia:Number(r.facturado)-Number(r.costo) }; });
     const porSeccionConGanancia = porSeccion.rows.map(s=>({ ...s, facturado: gxs[s.seccion_id]?.facturado||0, costo: gxs[s.seccion_id]?.costo||0, ganancia: gxs[s.seccion_id]?.ganancia||0 }));
     const porMes=await pool.query(`SELECT TO_CHAR(DATE_TRUNC('month', p.created_at),'YYYY-MM') as mes, COUNT(*)::int as pedidos, COALESCE(SUM(p.total),0)::numeric as total FROM pedidos p ${where} GROUP BY mes ORDER BY mes DESC LIMIT 12`, params);
-    const ganancias=await pool.query(`SELECT COALESCE(SUM(pi.cantidad*pi.precio_unitario),0)::numeric as facturado, COALESCE(SUM(pi.cantidad*COALESCE(NULLIF(pr.precio_original,0), 0)),0)::numeric as costo FROM pedido_items pi JOIN pedidos p ON pi.pedido_id=p.id LEFT JOIN productos pr ON pi.producto_id=pr.id ${where}`, params);
+    const ganancias=await pool.query(`SELECT COALESCE(SUM(pi.cantidad*pi.precio_unitario),0)::numeric as facturado, COALESCE(SUM(pi.cantidad*COALESCE(NULLIF(pr.precio_original,0), 0)),0)::numeric as costo FROM pedido_items pi JOIN pedidos p ON pi.pedido_id=p.id LEFT JOIN productos pr ON pi.producto_id=pr.id AND pr.tenant_id=p.tenant_id ${where}`, params);
     const g=ganancias.rows[0]||{facturado:0,costo:0};
-    const gU=await pool.query(`SELECT COALESCE(SUM(pi.cantidad*pi.precio_unitario),0)::numeric as facturado, COALESCE(SUM(pi.cantidad*COALESCE(NULLIF(pr.precio_original,0),0)),0)::numeric as costo, COALESCE(SUM(pi.cantidad),0)::int as unidades FROM pedido_items pi JOIN pedidos p ON pi.pedido_id=p.id LEFT JOIN productos pr ON pi.producto_id=pr.id ${whereU}`, params);
+    const gU=await pool.query(`SELECT COALESCE(SUM(pi.cantidad*pi.precio_unitario),0)::numeric as facturado, COALESCE(SUM(pi.cantidad*COALESCE(NULLIF(pr.precio_original,0),0)),0)::numeric as costo, COALESCE(SUM(pi.cantidad),0)::int as unidades FROM pedido_items pi JOIN pedidos p ON pi.pedido_id=p.id LEFT JOIN productos pr ON pi.producto_id=pr.id AND pr.tenant_id=p.tenant_id ${whereU}`, params);
     const pedU=await pool.query(`SELECT COUNT(*)::int as pedidos FROM pedidos p ${whereU}`, params);
     const gu=gU.rows[0]||{facturado:0,costo:0,unidades:0};
     res.json({
@@ -3032,7 +3070,7 @@ app.post('/api/cupones/validar', optionalAuth, async (req,res)=>{
   }catch(e){ if(e instanceof CheckoutError) return res.status(400).json({error:e.message}); res.status(500).json({error:'No se pudo validar el cupón'}); }
 });
 app.post('/api/cupones', authPerm('config'), requiereFeature('marketing'), async (req,res)=>{ try{ const c=req.body; const {rows}=await pool.query('INSERT INTO cupones (codigo,tipo,valor,secciones_ids,categoria,uso_maximo,monto_minimo,metodo_pago,activo,fecha_desde,fecha_hasta,solo_primera_compra,tenant_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *', [c.codigo,c.tipo||'porcentaje',c.valor||0,c.secciones_ids||'',c.categoria||'',c.uso_maximo||0,c.monto_minimo||0,c.metodo_pago||'',c.activo!==false,c.fecha_desde||null,c.fecha_hasta||null,c.solo_primera_compra||false, req.tenantId]); if(c.productos_ids){ for(const pid of c.productos_ids){ await pool.query('INSERT INTO cupon_productos (cupon_id,producto_id,tenant_id) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING', [rows[0].id,pid, req.tenantId]); } } res.json(rows[0]); }catch(e){ res.status(500).json({error:e.message}); } });
-app.put('/api/cupones/:id', authPerm('config'), requiereFeature('marketing'), async (req,res)=>{ try{ const c=req.body; await pool.query('UPDATE cupones SET codigo=$1,tipo=$2,valor=$3,secciones_ids=$4,categoria=$5,uso_maximo=$6,monto_minimo=$7,metodo_pago=$8,activo=$9,fecha_desde=$10,fecha_hasta=$11,solo_primera_compra=$12 WHERE id=$13 AND tenant_id=$14', [c.codigo,c.tipo,c.valor,c.secciones_ids||'',c.categoria||'',c.uso_maximo||0,c.monto_minimo||0,c.metodo_pago||'',c.activo!==false,c.fecha_desde||null,c.fecha_hasta||null,c.solo_primera_compra||false,req.params.id, req.tenantId]); await pool.query('DELETE FROM cupon_productos WHERE cupon_id=$1', [req.params.id]); if(c.productos_ids){ for(const pid of c.productos_ids){ await pool.query('INSERT INTO cupon_productos (cupon_id,producto_id,tenant_id) VALUES ($1,$2,$3)', [req.params.id,pid, req.tenantId]); } } res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.put('/api/cupones/:id', authPerm('config'), requiereFeature('marketing'), async (req,res)=>{ try{ const c=req.body; await pool.query('UPDATE cupones SET codigo=$1,tipo=$2,valor=$3,secciones_ids=$4,categoria=$5,uso_maximo=$6,monto_minimo=$7,metodo_pago=$8,activo=$9,fecha_desde=$10,fecha_hasta=$11,solo_primera_compra=$12 WHERE id=$13 AND tenant_id=$14', [c.codigo,c.tipo,c.valor,c.secciones_ids||'',c.categoria||'',c.uso_maximo||0,c.monto_minimo||0,c.metodo_pago||'',c.activo!==false,c.fecha_desde||null,c.fecha_hasta||null,c.solo_primera_compra||false,req.params.id, req.tenantId]).then(r=>{ if(!r.rowCount) throw Object.assign(new Error('Cupón no encontrado'),{status:404}); }); await pool.query('DELETE FROM cupon_productos WHERE cupon_id=$1', [req.params.id]); if(Array.isArray(c.productos_ids)){ const propios=await idsProductosDeTienda(pool, req.tenantId, c.productos_ids); for(const pid of propios){ await pool.query('INSERT INTO cupon_productos (cupon_id,producto_id,tenant_id) VALUES ($1,$2,$3)', [req.params.id,pid, req.tenantId]); } } res.json({ok:true}); }catch(e){ res.status(e.status||500).json({error:e.message}); } });
 app.delete('/api/cupones/:id', authPerm('config'), requiereFeature('marketing'), async (req,res)=>{ try{ await pool.query('DELETE FROM cupones WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 
 // PROMOCIONES
@@ -3087,7 +3125,7 @@ app.delete('/api/badges/:id', authPerm('config'), async (req,res)=>{ try{ await 
 
 // ENVIO CONFIG + CUSTOM
 app.get('/api/envio/config/:seccion_id', async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM config_envio WHERE seccion_id=$1 AND tenant_id=$2', [req.params.seccion_id, req.tenantId]); res.json(rows[0]||{metodo:'manual',costo_fijo:0,gratis_desde:0,cp_origen:'1888'}); }catch(e){ res.status(500).json({error:e.message}); } });
-app.put('/api/envio/config/:seccion_id', authPerm('config'), async (req,res)=>{ try{ const c=req.body; await pool.query('INSERT INTO config_envio (seccion_id,metodo,costo_fijo,gratis_desde,zonas,cp_origen,tenant_id) VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT (seccion_id) DO UPDATE SET metodo=$2,costo_fijo=$3,gratis_desde=$4,zonas=$5,cp_origen=$6', [req.params.seccion_id,c.metodo||'manual',c.costo_fijo||0,c.gratis_desde||0,JSON.stringify(c.zonas||[]),c.cp_origen||'1888', req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.put('/api/envio/config/:seccion_id', authPerm('config'), async (req,res)=>{ try{ const c=req.body; const {rows:sp}=await pool.query('SELECT 1 FROM secciones WHERE id=$1 AND tenant_id=$2', [req.params.seccion_id, req.tenantId]); if(!sp[0]) return res.status(404).json({error:'Sección no encontrada'}); await pool.query('INSERT INTO config_envio (seccion_id,metodo,costo_fijo,gratis_desde,zonas,cp_origen,tenant_id) VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT (seccion_id) DO UPDATE SET metodo=$2,costo_fijo=$3,gratis_desde=$4,zonas=$5,cp_origen=$6 WHERE config_envio.tenant_id=EXCLUDED.tenant_id', [req.params.seccion_id,c.metodo||'manual',c.costo_fijo||0,c.gratis_desde||0,JSON.stringify(c.zonas||[]),c.cp_origen||'1888', req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 app.post('/api/envio/cotizar', async (req,res)=>{ try{ const {seccion_id,codigo_postal}=req.body; const {rows}=await pool.query('SELECT * FROM config_envio WHERE seccion_id=$1 AND tenant_id=$2', [seccion_id, req.tenantId]); const cfg=rows[0]||{metodo:'manual',costo_fijo:0}; res.json({costo:cfg.costo_fijo, metodo:cfg.metodo, gratis_desde:cfg.gratis_desde}); }catch(e){ res.status(500).json({error:e.message}); } });
 
 // METODOS ENVIO CUSTOM - Uber, Didi, etc
