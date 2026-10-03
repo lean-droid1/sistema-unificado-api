@@ -261,7 +261,7 @@ function createCheckout(pool) {
   }
 
   // Valida un cupón contra los ítems de UNA sección. Devuelve { descuento, envio_gratis } o tira CheckoutError.
-  async function evaluarCupon(db, ctx, codigo, { seccion_id, items, subtotal, metodo_pago }) {
+  async function evaluarCupon(db, ctx, codigo, { seccion_id, items, subtotal, metodo_pago, final = false }) {
     const { rows } = await db.query('SELECT * FROM cupones WHERE UPPER(codigo)=UPPER($1) AND activo=true AND tenant_id=$2', [String(codigo || '').trim(), ctx.tenantId]);
     const c = rows[0];
     if (!c) throw new CheckoutError('Cupón no válido');
@@ -275,7 +275,8 @@ function createCheckout(pool) {
     }
     const sids = String(c.secciones_ids || '').split(',').map(Number).filter(Boolean);
     if (sids.length && !sids.includes(Number(seccion_id))) throw new CheckoutError('El cupón no aplica a esta tienda');
-    if (c.metodo_pago && metodo_pago && c.metodo_pago !== metodo_pago) throw new CheckoutError(`El cupón solo vale pagando con ${c.metodo_pago}`);
+    // Al cotizar todavía puede no haber medio de pago elegido; al crear el pedido tiene que coincidir sí o sí
+    if (c.metodo_pago && (metodo_pago || final) && c.metodo_pago !== metodo_pago) throw new CheckoutError(`El cupón solo vale pagando con ${c.metodo_pago}`);
     const { rows: cp } = await db.query('SELECT producto_id FROM cupon_productos WHERE cupon_id=$1', [c.id]);
     const pids = cp.map(r => r.producto_id);
     const elegibles = items.filter(i => (!pids.length || pids.includes(i.producto_id)) && (!c.categoria || i.categoria === c.categoria));
@@ -326,7 +327,7 @@ function createCheckout(pool) {
       let descuento = 0, cuponAplicado = null, envioGratisCupon = false;
       if (cuponInfo && !cuponInfo.ok && subtotal > 0) {
         try {
-          const r = await evaluarCupon(db, ctx, cuponCodigo, { seccion_id: secId, items: ars, subtotal, metodo_pago: body?.metodo_pago });
+          const r = await evaluarCupon(db, ctx, cuponCodigo, { seccion_id: secId, items: ars, subtotal, metodo_pago: body?.metodo_pago, final: !opts.cotizacion });
           descuento = r.descuento; envioGratisCupon = r.envio_gratis; cuponAplicado = r.codigo;
           cuponInfo = { ...cuponInfo, ok: true, error: null, seccion_id: secId, codigo: r.codigo, descuento: r.descuento, tipo: r.tipo };
         } catch (e) { if (!cuponInfo.error) cuponInfo.error = e.message; }

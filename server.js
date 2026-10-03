@@ -986,8 +986,8 @@ async function notificarVentaAdmin(pedidos, comprador){
     }
     const html = `
       <div style="font-family:system-ui,sans-serif;max-width:520px;margin:0 auto">
-        <h2 style="color:#16a34a">Nueva venta en ${tienda}</h2>
-        <p>Cliente: <strong>${nombreCliente}</strong></p>
+        <h2 style="color:#16a34a">Nueva venta en ${escMail(tienda)}</h2>
+        <p>Cliente: <strong>${escMail(nombreCliente)}</strong></p>
         <p>Total: <strong style="font-size:20px">$${total.toLocaleString('es-AR')}</strong></p>
         <table style="width:100%;border-collapse:collapse;margin-top:12px">
           <tbody>${filas}</tbody>
@@ -1006,12 +1006,14 @@ async function notificarVentaAdmin(pedidos, comprador){
   }catch(e){ console.log('[venta-mail] excepción:', e.message); }
 }
 // ── Helpers de mail reutilizables ──
+// Escapa texto que viene de clientes antes de meterlo en el HTML de un mail
+const escMail = (x) => String(x==null?'':x).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 async function _itemsPedidoHtml(pedidoId){
   const {rows}=await pool.query('SELECT nombre_producto, cantidad, precio_unitario, variante_combinacion FROM pedido_items WHERE pedido_id=$1', [pedidoId]).catch(()=>({rows:[]}));
   return rows.map(i=>{
     const sub=Number(i.precio_unitario||0)*Number(i.cantidad||1);
-    const varTxt=i.variante_combinacion?`<div style="color:#888;font-size:12px">${i.variante_combinacion}</div>`:'';
-    return `<tr><td style="padding:8px 12px;border-bottom:1px solid #eee">${i.cantidad||1}× ${i.nombre_producto||'Producto'}${varTxt}</td><td style="padding:8px 12px;border-bottom:1px solid #eee;text-align:right;white-space:nowrap">$${sub.toLocaleString('es-AR')}</td></tr>`;
+    const varTxt=i.variante_combinacion?`<div style="color:#888;font-size:12px">${escMail(i.variante_combinacion)}</div>`:'';
+    return `<tr><td style="padding:8px 12px;border-bottom:1px solid #eee">${escMail(i.cantidad||1)}× ${escMail(i.nombre_producto||'Producto')}${varTxt}</td><td style="padding:8px 12px;border-bottom:1px solid #eee;text-align:right;white-space:nowrap">$${sub.toLocaleString('es-AR')}</td></tr>`;
   }).join('');
 }
 async function _sendMail(to, subject, html, opts={}){
@@ -1032,7 +1034,7 @@ async function emailBienvenida(tenantId, email, nombre){
   const {tienda, baseUrl, email:tiendaEmail}=await _tiendaInfo(tenantId);
   const html=`<div style="font-family:system-ui,sans-serif;max-width:520px;margin:0 auto">
     <h2 style="color:#111">¡Bienvenido/a a ${tienda}!</h2>
-    <p>Hola ${nombre||''}, tu cuenta ya está creada. Ya podés comprar y seguir tus pedidos.</p>
+    <p>Hola ${escMail(nombre||'')}, tu cuenta ya está creada. Ya podés comprar y seguir tus pedidos.</p>
     ${baseUrl?`<p style="margin-top:16px"><a href="${baseUrl}" style="background:#111;color:#fff;padding:10px 18px;border-radius:8px;text-decoration:none">Ir a la tienda</a></p>`:''}
     <p style="color:#888;font-size:12px;margin-top:20px">${tienda}</p>
   </div>`;
@@ -1140,6 +1142,9 @@ app.post('/api/register', async (req,res)=>{
     if(!telefono||String(telefono).replace(/\D/g,'').length<8) return res.status(400).json({error:'Teléfono inválido (con característica)'});
     if(!email||!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(String(email).trim())) return res.status(400).json({error:'Email inválido'});
     const pwError=validatePassword(password); if(pwError) return res.status(400).json({error:pwError});
+    // "ADMIN" y "admin" son el mismo usuario para el login: no dejar registrar variantes con mayúsculas
+    const {rows:yaUs}=await pool.query('SELECT 1 FROM usuarios WHERE LOWER(usuario)=LOWER($1) AND tenant_id=$2', [String(usuario).trim(), req.tenantId]);
+    if(yaUs[0]) return res.status(400).json({error:'Ese usuario ya existe. Elegí otro.'});
     const hash=await bcrypt.hash(password,12);
     const {rows:cfgAprob}=await pool.query("SELECT valor FROM configuracion WHERE tenant_id=$1 AND clave='registro_requiere_aprobacion'", [req.tenantId]);
     const requiereAprob = cfgAprob[0] && cfgAprob[0].valor==='true';
@@ -1191,7 +1196,9 @@ app.put('/api/me', auth(), async (req,res)=>{
 });
 
 // CONFIG
-app.get('/api/config', async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM configuracion WHERE tenant_id=$1', [req.tenantId]); const cfg={}; rows.forEach(r=>cfg[r.clave]=r.valor); res.json(cfg); }catch(e){ res.status(500).json({error:e.message}); } });
+// Config pública: los visitantes no ven datos internos (mails de aviso, claves técnicas). El equipo ve todo.
+const CONFIG_PRIVADA=/^(_|email_|smtp|resend)|token|secret|password|clave_api|api_?key/i;
+app.get('/api/config', optionalAuth, async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM configuracion WHERE tenant_id=$1', [req.tenantId]); let staff=false; if(req.user){ const {rows:u}=await pool.query('SELECT rol FROM usuarios WHERE id=$1 AND tenant_id=$2', [req.user.id, req.tenantId]).catch(()=>({rows:[]})); staff=!!(u[0] && (u[0].rol==='admin'||u[0].rol==='subadmin')); } const cfg={}; rows.forEach(r=>{ if(staff || !CONFIG_PRIVADA.test(r.clave)) cfg[r.clave]=r.valor; }); res.json(cfg); }catch(e){ res.status(500).json({error:e.message}); } });
 // Plan y funciones habilitadas del tenant actual (para que el frontend muestre/oculte)
 app.get('/api/mi-plan', async (req,res)=>{
   try{ const d=await getTenantData(req.tenantId); res.json({ plan:d.plan, estado:d.estado, features:d.features, dias_restantes:d.dias_restantes }); }
@@ -1301,6 +1308,16 @@ const rehostImagen = async (url) => {
     return u;
   }
 };
+// Tipo real de una imagen mirando sus primeros bytes (no confiar en el nombre ni en lo que dice el navegador)
+function extImagenReal(buf){
+  if(!buf || buf.length<12) return null;
+  if(buf[0]===0xFF && buf[1]===0xD8 && buf[2]===0xFF) return '.jpg';
+  if(buf.slice(0,8).equals(Buffer.from([0x89,0x50,0x4E,0x47,0x0D,0x0A,0x1A,0x0A]))) return '.png';
+  if(buf.slice(0,4).toString('latin1')==='RIFF' && buf.slice(8,12).toString('latin1')==='WEBP') return '.webp';
+  if(buf.slice(0,6).toString('latin1')==='GIF87a' || buf.slice(0,6).toString('latin1')==='GIF89a') return '.gif';
+  if(buf.slice(4,12).toString('latin1')==='ftypavif') return '.avif';
+  return null;
+}
 app.post('/api/upload', authPerm('config'), upload.single('imagen'), async (req,res)=>{
   try{
     if(!req.file) return res.status(400).json({error:'No file'});
@@ -1308,7 +1325,9 @@ app.post('/api/upload', authPerm('config'), upload.single('imagen'), async (req,
       try{ const r=await uploadToCloudinary(req.file.buffer); return res.json({url:r.secure_url}); }
       catch(ce){ console.error('Cloudinary falló, guardo en disco:', ce.message); }
     }
-    const ext=path.extname(req.file.originalname)||'.jpg';
+    // Respaldo en disco: solo imágenes de verdad, con extensión según su contenido (nunca .html/.svg/.js)
+    const ext=extImagenReal(req.file.buffer);
+    if(!ext) return res.status(400).json({error:'El archivo no es una imagen válida (jpg, png, webp, gif)'});
     const name=uuidv4()+ext;
     fs.writeFileSync(path.join(uploadsDir,name), req.file.buffer);
     return res.json({url:`/uploads/${name}`});
@@ -1316,16 +1335,19 @@ app.post('/api/upload', authPerm('config'), upload.single('imagen'), async (req,
 });
 app.post('/api/upload-base64', authPerm('config'), async (req,res)=>{
   try{
-    const {data, filename} = req.body;
+    const {data} = req.body;
     if(!data) return res.status(400).json({error:'No data'});
-    const matches=data.match(/^data:(.+);base64,(.+)$/);
+    const matches=String(data).match(/^data:(.+);base64,(.+)$/);
     if(!matches) return res.status(400).json({error:'Invalid base64'});
     const buffer=Buffer.from(matches[2],'base64');
+    if(buffer.length > 8*1024*1024) return res.status(413).json({error:'La imagen es muy pesada (máx. 8 MB)'});
+    const ext=extImagenReal(buffer);
+    if(!ext) return res.status(400).json({error:'El archivo no es una imagen válida (jpg, png, webp, gif)'});
     if(useCloudinary){
       const r=await uploadToCloudinary(buffer);
       return res.json({url:r.secure_url});
     }else{
-      const name=(filename||uuidv4())+'.jpg';
+      const name=uuidv4()+ext; // el nombre lo elige el servidor (antes "filename" permitía escribir fuera de la carpeta)
       fs.writeFileSync(path.join(uploadsDir,name), buffer);
       return res.json({url:`/uploads/${name}`});
     }
@@ -1536,12 +1558,13 @@ app.get('/api/productos', optionalAuth, async (req,res)=>{
         if(!(await accesoMayorista(req))) return res.json({ productos: [], total: 0, page: 1, totalPages: 0, bloqueado: true });
       } else if(!seccion_id && !incluirOcultos){ where.push(`seccion_id <> ALL($${pi}::int[])`); params.push(restr); pi++; }
     }
-    const offset=(parseInt(page)-1)*parseInt(limit);
+    const limN=Math.min(Math.max(parseInt(limit)||50,1),10000), pagN=Math.max(parseInt(page)||1,1); // tope: no volcar sin límite ni romper con página negativa
+    const offset=(pagN-1)*limN;
     const countQ=`SELECT COUNT(*) FROM productos WHERE ${where.join(' AND ')}`;
     const {rows:cRows}=await pool.query(countQ, params);
     const total=parseInt(cRows[0].count);
     const query=`SELECT *, (SELECT MIN(CASE WHEN v.precio_oferta>0 AND v.precio_oferta<v.precio THEN v.precio_oferta ELSE v.precio END) FROM variantes v WHERE v.producto_id=productos.id AND v.tenant_id=productos.tenant_id AND v.precio>0) AS precio_desde, (SELECT v.moneda FROM variantes v WHERE v.producto_id=productos.id AND v.tenant_id=productos.tenant_id AND v.precio>0 ORDER BY (CASE WHEN v.precio_oferta>0 AND v.precio_oferta<v.precio THEN v.precio_oferta ELSE v.precio END) ASC LIMIT 1) AS moneda_desde, ${IMG2('productos')} FROM productos WHERE ${where.join(' AND ')} ORDER BY ${req.query.orden === 'lista' ? 'posicion ASC, id ASC' : 'created_at DESC'} LIMIT $${pi} OFFSET $${pi+1}`;
-    const {rows}=await pool.query(query, [...params, parseInt(limit), offset]);
+    const {rows}=await pool.query(query, [...params, limN, offset]);
     // hide price mayorista sin login
     let result=rows;
     if(!req.user){
@@ -1550,7 +1573,7 @@ app.get('/api/productos', optionalAuth, async (req,res)=>{
       if(mayId) result=rows.map(r=> r.seccion_id==mayId ? {...r, precio_base:0, precio_oferta:0} : r);
     }
     if(!esAdminReq) result=result.map(limpiarProducto);
-    res.json({productos:result, total, page:parseInt(page), totalPages:Math.ceil(total/parseInt(limit))});
+    res.json({productos:result, total, page:pagN, totalPages:Math.ceil(total/limN)});
   }catch(e){ res.status(500).json({error:e.message}); }
 });
 app.get('/api/categorias', optionalAuth, async (req,res)=>{ try{ const {seccion_id}=req.query; if(seccion_id && (await seccionesRestringidas(req.tenantId)).includes(parseInt(seccion_id,10)) && !(await accesoMayorista(req))) return res.json([]); let q='SELECT DISTINCT categoria FROM productos WHERE visible=true AND tenant_id=$1'; const params=[req.tenantId]; if(seccion_id){ q+=' AND seccion_id=$2'; params.push(seccion_id); } q+=' ORDER BY categoria'; const {rows}=await pool.query(q, params); res.json(rows.map(r=>r.categoria).filter(Boolean)); }catch(e){ res.status(500).json({error:e.message}); } });
@@ -1811,7 +1834,8 @@ app.delete('/api/productos/all', authPerm('productos'), async (req,res)=>{ try{ 
 const botAuth = (req, res, next) => {
   const key = req.headers['x-bot-key'] || '';
   if (!process.env.BOT_API_KEY) return res.status(503).json({ error: 'BOT_API_KEY no configurada en el servidor' });
-  if (key !== process.env.BOT_API_KEY) return res.status(401).json({ error: 'X-Bot-Key inválida' });
+  const kb=Buffer.from(String(key||'')), eb=Buffer.from(String(process.env.BOT_API_KEY));
+  if (kb.length!==eb.length || !crypto.timingSafeEqual(kb, eb)) return res.status(401).json({ error: 'X-Bot-Key inválida' });
   // El bot es solo para la tienda del dueño (tienda 1). BOT_TENANT_ID existe solo para pruebas.
   req.botTenantId = parseInt(process.env.BOT_TENANT_ID || '1', 10);
   next();
@@ -3226,10 +3250,14 @@ app.get('/api/sitemap', async (req,res)=>{
   }catch(e){ res.status(500).set('Content-Type','application/xml').send('<?xml version="1.0"?><error>'+String(e.message)+'</error>'); }
 });
 
-app.post('/api/carritos-abandonados', async (req,res)=>{
+app.post('/api/carritos-abandonados', optionalAuth, rateLimit({ windowMs: 60*1000, max: 20, standardHeaders: true, legacyHeaders: false }), async (req,res)=>{
   try{
-    const {usuario_id,email,telefono,items,total,seccion_id}=req.body;
-    const its=JSON.stringify(items||[]);
+    const {email,telefono,total,seccion_id}=req.body;
+    // El usuario sale del token (antes se podía mandar el id de otro cliente y pisarle el carrito)
+    const usuario_id = req.user ? req.user.id : null;
+    const items = Array.isArray(req.body.items) ? req.body.items.slice(0,100) : [];
+    const its=JSON.stringify(items);
+    if(its.length > 50000) return res.status(413).json({error:'Carrito demasiado grande'});
     // Upsert: si el mismo cliente ya tiene un carrito activo, ACTUALIZARLO (no crear otro) → evita el spam.
     let existing=null;
     if(usuario_id){
