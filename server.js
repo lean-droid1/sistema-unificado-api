@@ -355,6 +355,12 @@ async function tareasSeo(){
     for (const [id, texto] of Object.entries(desc)) { const r = await pool.query('UPDATE productos SET descripcion=$1 WHERE id=$2 AND tenant_id=1', [texto, Number(id)]); n += r.rowCount; }
     await marcar('_seo_desc_v1', n);
     console.log(`📝 Descripciones SEO: ${n} productos`);
+  }  // 3) Página "Cambios, devoluciones y garantía" (la pide Google Merchant Center). Editable en Panel → Diseño → Páginas.
+  if (!(await hecho('_pagina_devoluciones_v1'))) {
+    const {rows:ya} = await pool.query("SELECT id FROM paginas_info WHERE tenant_id=1 AND slug='devoluciones'");
+    if (!ya[0]) await pool.query("INSERT INTO paginas_info (tenant_id,titulo,slug,contenido,visible,orden) VALUES (1,'Cambios, devoluciones y garantía','devoluciones',$1,true,10)", ["Garantía\n• Las máquinas y equipos (estaciones de soldado, microscopios, fuentes, programadoras y similares) tienen garantía de 90 días desde la fecha de compra, solo por fallas de funcionamiento.\n• Los repuestos no tienen garantía.\n• En estaciones de soldado y cautines la garantía cubre la máquina. Las puntas no tienen garantía porque se desgastan con el uso (por ejemplo, al trabajar a temperaturas muy altas).\n• No se aceptan productos manipulados.\n\nCambios y devoluciones\n• No realizamos cambios ni devoluciones por arrepentimiento y no hay días de prueba.\n• Solo se aceptan devoluciones de máquinas y equipos con falla, dentro de los 90 días de garantía.\n\nCostos de envío por garantía\n• Según el producto, el envío lo cubrimos nosotros o se comparte: el cliente paga un tramo y nosotros el otro.\n\nCómo hacer un reclamo\n• Escribinos por WhatsApp o desde la sección Contacto con tu número de pedido, la descripción de la falla y, si podés, fotos o un video."]);
+    await marcar('_pagina_devoluciones_v1', ya[0] ? 'existia' : 'creada');
+    console.log('📄 Página de devoluciones:', ya[0] ? 'ya existía' : 'creada');
   }
 }
 
