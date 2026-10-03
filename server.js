@@ -312,6 +312,52 @@ const resolveTenant = async (req,res,next)=>{
 
 
 // === MIGRATE V4 ===
+// ── Marca a partir del nombre del producto (para Google: "brand" en los datos del producto) ──
+// Solo marcas de herramientas/equipos. Nunca marcas de celulares (Samsung, iPhone…): en un repuesto
+// indican compatibilidad, no el fabricante. "Tipo JBC" tampoco es la marca. Gana la que aparece primero.
+const MARCAS_FUERTES = [
+  ['RF4', /\bRF4\b/i], ['Luowei', /\bluo ?wei\b/i], ['Mijing', /\bmi ?jing\b/i], ['Kailiwei', /\bkai ?li ?wei\b/i],
+  ['2UUL', /\b2uul\b/i], ['Aifen', /\baifen\b/i], ['Sugon', /\bsugon\b/i], ['Qianli', /\bqianli\b/i],
+  ['iRepair', /\birepair\b/i], ['JCID', /\bjcid\b|\bjc\b/i], ['Z3X', /\bz3x\b|\beasy ?jtag\b/i], ['ICFriend', /\bic ?friend\b/i],
+  ['Yaxun', /\byaxun\b/i], ['Relife', /\brelife\b/i], ['Mechanic', /\bmechanic\b/i], ['Jakemy', /\bjakemy\b/i],
+  ['Amaoe', /\bamaoe\b/i], ['Youtools', /\byou ?tools\b/i], ['GTools', /\bgtools\b/i], ['Sunshine', /\bsunshine\b/i],
+  ['Kaisi', /\bkaisi\b/i], ['Atten', /\batten\b/i], ['Yihua', /\byihua\b/i], ['Aixun', /\baixun\b/i], ['GVDA', /\bgvda\b/i],
+  ['Baku', /\bbaku\b/i], ['Xinzhizao', /\bxinzhizao\b/i], ['Wylie', /\bwylie\b/i], ['Hakko', /\bhakko\b/i],
+  ['UNI-T', /\buni-t\b/i], ['Naviplus', /\bnaviplus\b/i], ['EAB', /\bEAB\b/], ['Miechi', /\bmiechi\b/i], ['MaAnt', /\bma-?ant\b/i],
+];
+// Códigos de modelo que identifican la marca cuando el nombre no la dice (LW-301 → Luowei, MJ-F11 → Mijing…)
+const MARCAS_CODIGO = [['Luowei', /\bLW-\d/i], ['Mijing', /\bMJ[- ]?[A-Z]?\d/i], ['Kailiwei', /\bKLW-/i], ['RF4', /\bRF-[A-Z]{0,4}\d/i]];
+function marcaDeNombre(nombre){
+  const n = String(nombre || '');
+  let mejor = null, pos = Infinity;
+  for (const [marca, re] of MARCAS_FUERTES) { const m = n.match(re); if (m && m.index < pos) { pos = m.index; mejor = marca; } }
+  if (mejor) return mejor;
+  for (const [marca, re] of MARCAS_CODIGO) { if (re.test(n)) return marca; }
+  return '';
+}
+
+// Tareas de una sola vez para Google (tienda principal). Corren en segundo plano después de arrancar.
+async function tareasSeo(){
+  const hecho = async (clave) => { const {rows} = await pool.query('SELECT 1 FROM configuracion WHERE tenant_id=1 AND clave=$1', [clave]); return !!rows[0]; };
+  const marcar = (clave, valor) => pool.query('INSERT INTO configuracion (tenant_id,clave,valor) VALUES (1,$1,$2) ON CONFLICT (tenant_id,clave) DO UPDATE SET valor=$2', [clave, String(valor)]);
+  // 1) Marca automática en los productos que no la tienen
+  if (!(await hecho('_marcas_auto_v1'))) {
+    const {rows} = await pool.query("SELECT id,nombre FROM productos WHERE tenant_id=1 AND COALESCE(marca,'')=''");
+    let n = 0;
+    for (const p of rows) { const m = marcaDeNombre(p.nombre); if (m) { await pool.query("UPDATE productos SET marca=$1 WHERE id=$2 AND tenant_id=1 AND COALESCE(marca,'')=''", [m, p.id]); n++; } }
+    await marcar('_marcas_auto_v1', n);
+    console.log(`🏷️  Marcas automáticas: ${n} productos`);
+  }
+  // 2) Descripciones reescritas de los microscopios principales (venían en inglés/traducción automática)
+  if (!(await hecho('_seo_desc_v1'))) {
+    const desc = require('./seo-desc-v1.json');
+    let n = 0;
+    for (const [id, texto] of Object.entries(desc)) { const r = await pool.query('UPDATE productos SET descripcion=$1 WHERE id=$2 AND tenant_id=1', [texto, Number(id)]); n += r.rowCount; }
+    await marcar('_seo_desc_v1', n);
+    console.log(`📝 Descripciones SEO: ${n} productos`);
+  }
+}
+
 async function migrate(){
   const queries = [
     `CREATE TABLE IF NOT EXISTS configuracion (clave VARCHAR(100) PRIMARY KEY, valor TEXT DEFAULT '')`,
@@ -1967,9 +2013,9 @@ app.post('/api/bot/sync', botAuth, async (req, res) => {
           // Re-hostear la imagen principal en Cloudinary (independiza de rxz/hotlink).
           const imagenRe = await rehostBot(imagen);
           const { rows: ins } = await pool.query(
-            `INSERT INTO productos (tenant_id,seccion_id,categoria,modelo,nombre,descripcion,precio_base,precio_oferta,stock,imagen,sku,envio_gratis,peso,alto,ancho,largo,visible,pendiente_aprobacion,precio_original)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19) RETURNING id`,
-            [t, secId, categoria, nombre, nombre, descripcion, precioBase, precioOferta, stock, imagenRe, skuT, false, peso, alto, ancho, largo, !ocultarNuevos, ocultarNuevos, costo]);
+            `INSERT INTO productos (tenant_id,seccion_id,categoria,modelo,nombre,descripcion,precio_base,precio_oferta,stock,imagen,sku,envio_gratis,peso,alto,ancho,largo,visible,pendiente_aprobacion,precio_original,marca)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20) RETURNING id`,
+            [t, secId, categoria, nombre, nombre, descripcion, precioBase, precioOferta, stock, imagenRe, skuT, false, peso, alto, ancho, largo, !ocultarNuevos, ocultarNuevos, costo, marcaDeNombre(nombre)]);
           prodId = ins[0].id;
           if (nuevos.length < 300) nuevos.push({ id: prodId, sku: skuT, nombre, precio: precioOferta > 0 ? precioOferta : precioBase, imagen: imagenRe, categoria });
           // Galería completa: todas las imágenes del proveedor (también re-hosteadas)
@@ -3384,4 +3430,4 @@ app.get('/api/andreani/etiqueta/:envio', authPerm('pedidos'), async (req,res)=>{
 
 // START
 const PORT=process.env.PORT||3000;
-migrate().then(()=>{ app.listen(PORT, ()=>console.log(`🚀 V4 running on ${PORT}`)); }).catch(e=>{ console.error('Migration failed', e); process.exit(1); });
+migrate().then(()=>{ app.listen(PORT, ()=>console.log(`🚀 V4 running on ${PORT}`)); tareasSeo().catch(e=>console.log('tareas SEO warn', e.message)); }).catch(e=>{ console.error('Migration failed', e); process.exit(1); });
