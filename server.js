@@ -312,6 +312,42 @@ const resolveTenant = async (req,res,next)=>{
 
 
 // === MIGRATE V4 ===
+// ── Costo real de los productos del proveedor (dropshipping) ──
+// costo_proveedor = precio que cobra el proveedor al público; precio_original = costo real = ese precio menos
+// el descuento de la tienda, que depende de la marca o de la categoría (Panel → Catálogo → Costo proveedor).
+const DESC_PROV_DEFAULT = { defecto: 25, marcas: { JCID: 20 }, palabras: { pantalla: 20, modulo: 20, bateria: 20, programador: 20 }, categorias: {} };
+const normTxt = (s) => String(s || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/\s+/g, ' ').trim();
+async function leerDescProveedor(tenantId){
+  const {rows} = await pool.query("SELECT valor FROM configuracion WHERE tenant_id=$1 AND clave='_desc_proveedor'", [tenantId]);
+  try { const c = JSON.parse((rows[0] && rows[0].valor) || 'null'); if (c && typeof c === 'object') return { ...DESC_PROV_DEFAULT, ...c }; } catch(e) {}
+  return Number(tenantId) === 1 ? DESC_PROV_DEFAULT : null; // la tienda principal arranca con sus descuentos; las demás sin descuento
+}
+function pctDescProveedor(cfg, { categoria, nombre, marca } = {}){
+  if (!cfg) return 0;
+  const lim = (v) => Math.min(90, Math.max(0, Number(v) || 0));
+  const mar = normTxt(marca), nom = normTxt(nombre);
+  for (const [m, p] of Object.entries(cfg.marcas || {})) {
+    const k = normTxt(m); if (!k) continue;
+    const re = new RegExp('(^|[^a-z0-9])' + k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '([^a-z0-9]|$)');
+    if (mar === k || re.test(nom)) return lim(p);
+  }
+  const cat = normTxt(categoria);
+  for (const [c, p] of Object.entries(cfg.categorias || {})) if (normTxt(c) === cat) return lim(p);
+  for (const [w, p] of Object.entries(cfg.palabras || {})) if (w && cat.includes(normTxt(w))) return lim(p);
+  return lim(cfg.defecto);
+}
+const costoConDescuento = (costoProv, pct) => Math.round(Number(costoProv) * (1 - pct / 100) * 100) / 100;
+async function recalcularCostosProveedor(tenantId){
+  const cfg = await leerDescProveedor(tenantId);
+  const {rows} = await pool.query('SELECT id,categoria,nombre,marca,costo_proveedor,precio_original FROM productos WHERE tenant_id=$1 AND costo_proveedor>0', [tenantId]);
+  let n = 0;
+  for (const p of rows) {
+    const real = costoConDescuento(p.costo_proveedor, pctDescProveedor(cfg, p));
+    if (Math.abs(real - Number(p.precio_original || 0)) > 0.009) { await pool.query('UPDATE productos SET precio_original=$1 WHERE id=$2 AND tenant_id=$3', [real, p.id, tenantId]); n++; }
+  }
+  return n;
+}
+
 // ── Marca a partir del nombre del producto (para Google: "brand" en los datos del producto) ──
 // Solo marcas de herramientas/equipos. Nunca marcas de celulares (Samsung, iPhone…): en un repuesto
 // indican compatibilidad, no el fabricante. "Tipo JBC" tampoco es la marca. Gana la que aparece primero.
@@ -361,6 +397,14 @@ async function tareasSeo(){
     if (!ya[0]) await pool.query("INSERT INTO paginas_info (tenant_id,titulo,slug,contenido,visible,orden) VALUES (1,'Cambios, devoluciones y garantía','devoluciones',$1,true,10)", ["Garantía\n• Las máquinas y equipos (estaciones de soldado, microscopios, fuentes, programadoras y similares) tienen garantía de 90 días desde la fecha de compra, solo por fallas de funcionamiento.\n• Los repuestos no tienen garantía.\n• En estaciones de soldado y cautines la garantía cubre la máquina. Las puntas no tienen garantía porque se desgastan con el uso (por ejemplo, al trabajar a temperaturas muy altas).\n• No se aceptan productos manipulados.\n\nCambios y devoluciones\n• No realizamos cambios ni devoluciones por arrepentimiento y no hay días de prueba.\n• Solo se aceptan devoluciones de máquinas y equipos con falla, dentro de los 90 días de garantía.\n\nCostos de envío por garantía\n• Según el producto, el envío lo cubrimos nosotros o se comparte: el cliente paga un tramo y nosotros el otro.\n\nCómo hacer un reclamo\n• Escribinos por WhatsApp o desde la sección Contacto con tu número de pedido, la descripción de la falla y, si podés, fotos o un video."]);
     await marcar('_pagina_devoluciones_v1', ya[0] ? 'existia' : 'creada');
     console.log('📄 Página de devoluciones:', ya[0] ? 'ya existía' : 'creada');
+  }
+  // 4) Costo real del proveedor: lo que había en precio_original (precio del proveedor sin descuento) pasa a
+  //    costo_proveedor y precio_original queda con el descuento aplicado
+  if (!(await hecho('_costo_prov_v1'))) {
+    const r = await pool.query("UPDATE productos SET costo_proveedor=precio_original WHERE tenant_id=1 AND sku LIKE 'RXZ-%' AND COALESCE(costo_proveedor,0)=0 AND precio_original>0");
+    const n = await recalcularCostosProveedor(1);
+    await marcar('_costo_prov_v1', `${r.rowCount}/${n}`);
+    console.log(`💲 Costo proveedor: ${r.rowCount} productos, ${n} con descuento aplicado`);
   }
 }
 
@@ -560,6 +604,8 @@ async function migrate(){
     `ALTER TABLE productos ADD COLUMN IF NOT EXISTS moneda VARCHAR(10) DEFAULT 'ARS'`,
     `ALTER TABLE productos ADD COLUMN IF NOT EXISTS precio_oferta NUMERIC(12,2) DEFAULT 0`,
     `ALTER TABLE productos ADD COLUMN IF NOT EXISTS precio_original NUMERIC(12,2) DEFAULT 0`,
+    `ALTER TABLE productos ADD COLUMN IF NOT EXISTS costo_proveedor NUMERIC(12,2) DEFAULT 0`,
+    `ALTER TABLE pedido_items ADD COLUMN IF NOT EXISTS costo_unitario NUMERIC(12,2)`,
     `ALTER TABLE productos ADD COLUMN IF NOT EXISTS stock_minimo INT DEFAULT 0`,
     `ALTER TABLE productos ADD COLUMN IF NOT EXISTS visible BOOLEAN DEFAULT true`,
     `ALTER TABLE productos ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW()`,
@@ -1509,7 +1555,7 @@ const tokenBusqueda = (tk) => '%' + String(tk).toLowerCase().normalize('NFD').re
 // ── Datos de producto que ven los clientes ──
 // El precio de costo (ahora lo carga el bot con lo que cobra el proveedor) y las notas internas
 // NO salen nunca al público: solo admin/sub-admin los reciben.
-const CAMPOS_PRIVADOS_PROD = ['precio_original', 'notas', 'pendiente_aprobacion'];
+const CAMPOS_PRIVADOS_PROD = ['precio_original', 'costo_proveedor', 'notas', 'pendiente_aprobacion'];
 const esStaffReq = (req) => !!(req.user && ['admin', 'subadmin'].includes(req.user.rol));
 const limpiarProducto = (r) => { if (!r) return r; const o = { ...r }; for (const k of CAMPOS_PRIVADOS_PROD) delete o[k]; return o; };
 const limpiarSiPublico = (req, rows) => esStaffReq(req) ? rows : rows.map(limpiarProducto);
@@ -1984,6 +2030,7 @@ app.post('/api/bot/sync', botAuth, async (req, res) => {
     let insertados = 0, actualizados = 0, errores = 0;
     const detalles = [];
     let primerError = null;
+    const descCfg = await leerDescProveedor(t); // descuentos de la tienda sobre el precio del proveedor
 
     for (const p of productos) {
       const sku = String(p.sku || '').trim();
@@ -2005,23 +2052,25 @@ app.post('/api/bot/sync', botAuth, async (req, res) => {
         const envioGratis = !!p.envio_gratis;
         const costo = Math.max(0, Number(p.costo) || 0); // lo que cobra el proveedor → precio de costo (ganancia del dashboard)
 
-        const { rows } = await pool.query('SELECT id FROM productos WHERE sku=$1 AND tenant_id=$2 LIMIT 1', [skuT, t]);
+        const { rows } = await pool.query('SELECT id,categoria,nombre,marca FROM productos WHERE sku=$1 AND tenant_id=$2 LIMIT 1', [skuT, t]);
         let prodId;
         if (rows[0]) {
           // Existe → actualiza SOLO precio/stock/oferta/envío gratis. NO pisa nombre/imagen/categoría (por si Leandro las editó a mano).
           prodId = rows[0].id;
+          const costoReal = costo > 0 ? costoConDescuento(costo, pctDescProveedor(descCfg, rows[0])) : 0;
           await pool.query(
-            `UPDATE productos SET precio_base=$1, precio_oferta=$2, stock=$3, precio_original=CASE WHEN $6>0 THEN $6 ELSE precio_original END WHERE id=$4 AND tenant_id=$5`,
-            [precioBase, precioOferta, stock, prodId, t, costo]);
+            `UPDATE productos SET precio_base=$1, precio_oferta=$2, stock=$3, costo_proveedor=CASE WHEN $6>0 THEN $6 ELSE costo_proveedor END, precio_original=CASE WHEN $6>0 THEN $7 ELSE precio_original END WHERE id=$4 AND tenant_id=$5`,
+            [precioBase, precioOferta, stock, prodId, t, costo, costoReal]);
           actualizados++;
         } else {
           // Nuevo → inserta completo en la sección destino.
           // Re-hostear la imagen principal en Cloudinary (independiza de rxz/hotlink).
           const imagenRe = await rehostBot(imagen);
           const { rows: ins } = await pool.query(
-            `INSERT INTO productos (tenant_id,seccion_id,categoria,modelo,nombre,descripcion,precio_base,precio_oferta,stock,imagen,sku,envio_gratis,peso,alto,ancho,largo,visible,pendiente_aprobacion,precio_original,marca)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20) RETURNING id`,
-            [t, secId, categoria, nombre, nombre, descripcion, precioBase, precioOferta, stock, imagenRe, skuT, false, peso, alto, ancho, largo, !ocultarNuevos, ocultarNuevos, costo, marcaDeNombre(nombre)]);
+            `INSERT INTO productos (tenant_id,seccion_id,categoria,modelo,nombre,descripcion,precio_base,precio_oferta,stock,imagen,sku,envio_gratis,peso,alto,ancho,largo,visible,pendiente_aprobacion,precio_original,marca,costo_proveedor)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21) RETURNING id`,
+            [t, secId, categoria, nombre, nombre, descripcion, precioBase, precioOferta, stock, imagenRe, skuT, false, peso, alto, ancho, largo, !ocultarNuevos, ocultarNuevos,
+             costo > 0 ? costoConDescuento(costo, pctDescProveedor(descCfg, { categoria, nombre, marca: marcaDeNombre(nombre) })) : 0, marcaDeNombre(nombre), costo]);
           prodId = ins[0].id;
           if (nuevos.length < 300) nuevos.push({ id: prodId, sku: skuT, nombre, precio: precioOferta > 0 ? precioOferta : precioBase, imagen: imagenRe, categoria });
           // Galería completa: todas las imágenes del proveedor (también re-hosteadas)
@@ -2603,7 +2652,7 @@ async function insertarItems(client, tenantId, pedidoId, items, descontarStock){
     // Un producto de otra tienda queda como línea de texto (sin id): no toca su stock ni sus datos
     const pid0=parseInt(item.producto_id,10)||null; const pid=pid0 && propios.has(pid0) ? pid0 : null;
     const cant=Number(item.cantidad)||1;
-    await client.query("INSERT INTO pedido_items (tenant_id,pedido_id,producto_id,categoria,modelo,nombre_producto,cantidad,precio_unitario,precio_base,variante_id,variante_combinacion,imagen) VALUES ($9,$1,$2,$3,$4,$5,$6,$7,$8,$10,$11,COALESCE((SELECT imagen FROM productos WHERE id=$2 AND tenant_id=$9),''))",
+    await client.query("INSERT INTO pedido_items (tenant_id,pedido_id,producto_id,categoria,modelo,nombre_producto,cantidad,precio_unitario,precio_base,variante_id,variante_combinacion,imagen,costo_unitario) VALUES ($9,$1,$2,$3,$4,$5,$6,$7,$8,$10,$11,COALESCE((SELECT imagen FROM productos WHERE id=$2 AND tenant_id=$9),''),(SELECT NULLIF(precio_original,0) FROM productos WHERE id=$2 AND tenant_id=$9))",
       [pedidoId, pid, TXT(item.categoria,200), TXT(item.modelo,200), TXT(item.nombre_producto,300), cant, Number(item.precio_unitario)||0, Number(item.precio_base)||0, tenantId, item.variante_id||null, TXT(item.variante_label||item.variante_combinacion,500)]);
     if(!descontarStock || !pid) continue;
     if(item.variante_id){
@@ -2877,12 +2926,14 @@ app.put('/api/pedidos/:id', authPerm('pedidos'), async (req,res)=>{  try{
     if(p.items){
       // Capturar productos afectados (viejos + nuevos) para recalcular preventa
       const {rows:viejos}=await pool.query('SELECT DISTINCT producto_id FROM pedido_items WHERE pedido_id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]);
+      const {rows:costosViejos}=await pool.query('SELECT producto_id, MAX(costo_unitario) AS c FROM pedido_items WHERE pedido_id=$1 AND tenant_id=$2 AND costo_unitario IS NOT NULL GROUP BY producto_id', [req.params.id, req.tenantId]);
+      const costoGuardado={}; costosViejos.forEach(r=>{ if(r.producto_id) costoGuardado[r.producto_id]=r.c; });
       await pool.query('DELETE FROM pedido_items WHERE pedido_id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]);
       // tenant_id explícito (antes quedaba en 1 por defecto y en otras tiendas el pedido editado se quedaba sin productos) + foto del producto
       // Solo productos de esta tienda: uno ajeno queda como línea de texto y no toca su stock
       const propios=await idsProductosDeTienda(pool, req.tenantId, p.items.map(it=>it.producto_id||it.id));
       p.items=p.items.map(it=>{ const id=parseInt(it.producto_id||it.id,10); return propios.has(id) ? it : { ...it, producto_id:null, id:null }; });
-      for(const item of p.items){ await pool.query("INSERT INTO pedido_items (tenant_id,pedido_id,producto_id,categoria,modelo,nombre_producto,cantidad,precio_unitario,precio_base,variante_id,variante_combinacion,imagen) VALUES ($11,$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,COALESCE((SELECT imagen FROM productos WHERE id=$2 AND tenant_id=$11),''))", [req.params.id, item.producto_id||item.id||null, item.categoria||'', item.modelo||'', item.nombre_producto||`${item.categoria} - ${item.modelo}`, item.cantidad||item.qty||1, item.precio_unitario||0, item.precio_base||0, item.variante_id||null, item.variante_label||item.variante_combinacion||'', req.tenantId]); }
+      for(const item of p.items){ const pidI=item.producto_id||item.id||null; await pool.query("INSERT INTO pedido_items (tenant_id,pedido_id,producto_id,categoria,modelo,nombre_producto,cantidad,precio_unitario,precio_base,variante_id,variante_combinacion,imagen,costo_unitario) VALUES ($11,$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,COALESCE((SELECT imagen FROM productos WHERE id=$2 AND tenant_id=$11),''),COALESCE($12::numeric,(SELECT NULLIF(precio_original,0) FROM productos WHERE id=$2 AND tenant_id=$11)))", [req.params.id, pidI, item.categoria||'', item.modelo||'', item.nombre_producto||`${item.categoria} - ${item.modelo}`, item.cantidad||item.qty||1, item.precio_unitario||0, item.precio_base||0, item.variante_id||null, item.variante_label||item.variante_combinacion||'', req.tenantId, (pidI && costoGuardado[pidI]!=null) ? costoGuardado[pidI] : null]); }
       // Recalcular reservado de preventa para todos los productos tocados
       const afectados=new Set([...viejos.map(v=>v.producto_id), ...p.items.map(it=>it.producto_id||it.id)].filter(Boolean));
       for(const pid of afectados) await recalcReservado(pid, req.tenantId);
@@ -2932,6 +2983,35 @@ app.post('/api/pedidos/:id/desarchivar', authPerm('pedidos'), async (req,res)=>{
 app.delete('/api/pedidos/:id', authPerm('pedidos'), async (req,res)=>{ try{ const {rows:oep}=await pool.query('SELECT estado, tipo FROM pedidos WHERE id=$1 AND tenant_id=$2',[req.params.id, req.tenantId]); if(!oep[0]) return res.status(404).json({error:'No encontrado'}); const oe=String((oep[0]||{}).estado||'').toLowerCase(); const ot=String((oep[0]||{}).tipo||''); const afectabaStock = ot==='pedido' && !['cancelado','anulado','rechazado'].includes(oe); const {rows:its}=await pool.query('SELECT producto_id, cantidad, variante_id FROM pedido_items WHERE pedido_id=$1',[req.params.id]); const preIds=[]; if(afectabaStock){ for(const it of its){ if(it.variante_id){ await pool.query('UPDATE variantes SET stock=GREATEST(0, stock + $1) WHERE id=$2 AND tenant_id=$3',[it.cantidad||0, it.variante_id, req.tenantId]); continue; } if(!it.producto_id) continue; const {rows:pp}=await pool.query('SELECT es_preventa FROM productos WHERE id=$1 AND tenant_id=$2',[it.producto_id, req.tenantId]); if(!pp[0]) continue; if(pp[0].es_preventa){ preIds.push(it.producto_id); } else { await pool.query('UPDATE productos SET stock=GREATEST(0, stock + $1) WHERE id=$2 AND tenant_id=$3 AND permitir_sin_stock=false AND es_digital=false',[it.cantidad||0, it.producto_id, req.tenantId]); } } } await pool.query('DELETE FROM pedido_items WHERE pedido_id=$1', [req.params.id]); await pool.query('DELETE FROM pedidos WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); for(const pid of preIds) await recalcReservado(pid, req.tenantId); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 
 // STATS
+// COSTO PROVEEDOR: descuentos sobre el precio del proveedor (por marca / categoría) → costo real y ganancia
+app.get('/api/costos-proveedor', authPerm('config'), async (req,res)=>{
+  try{
+    const cfg = (await leerDescProveedor(req.tenantId)) || { defecto: 0, marcas: {}, palabras: {}, categorias: {} };
+    const {rows:cats} = await pool.query("SELECT COALESCE(NULLIF(categoria,''),'Sin categoría') AS categoria, COUNT(*)::int AS productos FROM productos WHERE tenant_id=$1 AND costo_proveedor>0 GROUP BY 1 ORDER BY 1", [req.tenantId]);
+    const {rows:prods} = await pool.query('SELECT categoria,nombre,marca FROM productos WHERE tenant_id=$1 AND costo_proveedor>0', [req.tenantId]);
+    const porMarca = {};
+    for (const p of prods) for (const m of Object.keys(cfg.marcas || {})) { const pctM = pctDescProveedor({ marcas: { [m]: 1 } }, p); if (pctM === 1) porMarca[m] = (porMarca[m] || 0) + 1; }
+    res.json({
+      defecto: Number(cfg.defecto) || 0, marcas: cfg.marcas || {}, palabras: cfg.palabras || {},
+      categorias: cats.map(c => ({ ...c, pct: pctDescProveedor({ ...cfg, marcas: {} }, { categoria: c.categoria === 'Sin categoría' ? '' : c.categoria }) })),
+      productos_marca: porMarca, total: prods.length,
+    });
+  }catch(e){ res.status(500).json({error:e.message}); }
+});
+app.put('/api/costos-proveedor', authPerm('config'), async (req,res)=>{
+  try{
+    const b = req.body || {};
+    const pct = (v) => Math.min(90, Math.max(0, Math.round((Number(v) || 0) * 10) / 10));
+    const limpiarMapa = (o) => { const r = {}; for (const [k, v] of Object.entries(o && typeof o === 'object' ? o : {}).slice(0, 300)) { const kk = String(k).trim().slice(0, 120); if (kk) r[kk] = pct(v); } return r; };
+    const prev = (await leerDescProveedor(req.tenantId)) || {};
+    const cfg = { defecto: pct(b.defecto), marcas: limpiarMapa(b.marcas), palabras: b.palabras !== undefined ? limpiarMapa(b.palabras) : (prev.palabras || {}), categorias: limpiarMapa(b.categorias) };
+    if (cfg.categorias['Sin categoría'] !== undefined) { cfg.categorias[''] = cfg.categorias['Sin categoría']; delete cfg.categorias['Sin categoría']; }
+    await pool.query("INSERT INTO configuracion (tenant_id,clave,valor) VALUES ($1,'_desc_proveedor',$2) ON CONFLICT (tenant_id,clave) DO UPDATE SET valor=$2", [req.tenantId, JSON.stringify(cfg)]);
+    const actualizados = await recalcularCostosProveedor(req.tenantId);
+    res.json({ ok: true, actualizados });
+  }catch(e){ res.status(500).json({error:e.message}); }
+});
+
 // REPORTES: más vendidos, ventas por sección, por mes, ganancias
 // ==== CAJA / ARQUEO ==== (plata real cobrada, online + presencial)
 app.get('/api/caja', authPerm('stats'), requiereFeature('caja'), async (req,res)=>{
@@ -2962,13 +3042,13 @@ app.get('/api/reportes', authPerm('stats'), requiereFeature('reportes'), async (
 
     const masVendidos=await pool.query(`SELECT pi.producto_id, pi.nombre_producto, SUM(pi.cantidad)::int as unidades, SUM(pi.cantidad*pi.precio_unitario)::numeric as facturado FROM pedido_items pi JOIN pedidos p ON pi.pedido_id=p.id ${where} GROUP BY pi.producto_id, pi.nombre_producto ORDER BY unidades DESC LIMIT 20`, params);
     const porSeccion=await pool.query(`SELECT s.id as seccion_id, s.nombre as seccion, COUNT(DISTINCT p.id)::int as pedidos, COALESCE(SUM(p.total),0)::numeric as total FROM pedidos p LEFT JOIN secciones s ON p.seccion_id=s.id ${where} GROUP BY s.id, s.nombre ORDER BY total DESC`, params);
-    const gananciaPorSeccion=await pool.query(`SELECT p.seccion_id, COALESCE(SUM(pi.cantidad*pi.precio_unitario),0)::numeric as facturado, COALESCE(SUM(pi.cantidad*COALESCE(NULLIF(pr.precio_original,0),0)),0)::numeric as costo FROM pedido_items pi JOIN pedidos p ON pi.pedido_id=p.id LEFT JOIN productos pr ON pi.producto_id=pr.id AND pr.tenant_id=p.tenant_id ${where} GROUP BY p.seccion_id`, params);
+    const gananciaPorSeccion=await pool.query(`SELECT p.seccion_id, COALESCE(SUM(pi.cantidad*pi.precio_unitario),0)::numeric as facturado, COALESCE(SUM(pi.cantidad*COALESCE(COALESCE(NULLIF(pi.costo_unitario,0), NULLIF(pr.precio_original,0)),0)),0)::numeric as costo FROM pedido_items pi JOIN pedidos p ON pi.pedido_id=p.id LEFT JOIN productos pr ON pi.producto_id=pr.id AND pr.tenant_id=p.tenant_id ${where} GROUP BY p.seccion_id`, params);
     const gxs={}; gananciaPorSeccion.rows.forEach(r=>{ gxs[r.seccion_id]={ facturado:Number(r.facturado), costo:Number(r.costo), ganancia:Number(r.facturado)-Number(r.costo) }; });
     const porSeccionConGanancia = porSeccion.rows.map(s=>({ ...s, facturado: gxs[s.seccion_id]?.facturado||0, costo: gxs[s.seccion_id]?.costo||0, ganancia: gxs[s.seccion_id]?.ganancia||0 }));
     const porMes=await pool.query(`SELECT TO_CHAR(DATE_TRUNC('month', p.created_at),'YYYY-MM') as mes, COUNT(*)::int as pedidos, COALESCE(SUM(p.total),0)::numeric as total FROM pedidos p ${where} GROUP BY mes ORDER BY mes DESC LIMIT 12`, params);
-    const ganancias=await pool.query(`SELECT COALESCE(SUM(pi.cantidad*pi.precio_unitario),0)::numeric as facturado, COALESCE(SUM(pi.cantidad*COALESCE(NULLIF(pr.precio_original,0), 0)),0)::numeric as costo FROM pedido_items pi JOIN pedidos p ON pi.pedido_id=p.id LEFT JOIN productos pr ON pi.producto_id=pr.id AND pr.tenant_id=p.tenant_id ${where}`, params);
+    const ganancias=await pool.query(`SELECT COALESCE(SUM(pi.cantidad*pi.precio_unitario),0)::numeric as facturado, COALESCE(SUM(pi.cantidad*COALESCE(COALESCE(NULLIF(pi.costo_unitario,0), NULLIF(pr.precio_original,0)),0)),0)::numeric as costo FROM pedido_items pi JOIN pedidos p ON pi.pedido_id=p.id LEFT JOIN productos pr ON pi.producto_id=pr.id AND pr.tenant_id=p.tenant_id ${where}`, params);
     const g=ganancias.rows[0]||{facturado:0,costo:0};
-    const gU=await pool.query(`SELECT COALESCE(SUM(pi.cantidad*pi.precio_unitario),0)::numeric as facturado, COALESCE(SUM(pi.cantidad*COALESCE(NULLIF(pr.precio_original,0),0)),0)::numeric as costo, COALESCE(SUM(pi.cantidad),0)::int as unidades FROM pedido_items pi JOIN pedidos p ON pi.pedido_id=p.id LEFT JOIN productos pr ON pi.producto_id=pr.id AND pr.tenant_id=p.tenant_id ${whereU}`, params);
+    const gU=await pool.query(`SELECT COALESCE(SUM(pi.cantidad*pi.precio_unitario),0)::numeric as facturado, COALESCE(SUM(pi.cantidad*COALESCE(COALESCE(NULLIF(pi.costo_unitario,0), NULLIF(pr.precio_original,0)),0)),0)::numeric as costo, COALESCE(SUM(pi.cantidad),0)::int as unidades FROM pedido_items pi JOIN pedidos p ON pi.pedido_id=p.id LEFT JOIN productos pr ON pi.producto_id=pr.id AND pr.tenant_id=p.tenant_id ${whereU}`, params);
     const pedU=await pool.query(`SELECT COUNT(*)::int as pedidos FROM pedidos p ${whereU}`, params);
     const gu=gU.rows[0]||{facturado:0,costo:0,unidades:0};
     res.json({
@@ -3090,8 +3170,8 @@ app.get('/api/stats', authPerm('stats'), async (req,res)=>{
     const hoyQ = await pool.query(`SELECT COUNT(*)::int AS pedidos, COALESCE(SUM(total),0) AS total, COALESCE(SUM(${COBR}),0) AS cobrado FROM pedidos WHERE tenant_id=$1 AND archivado=false AND tipo='pedido' AND moneda='ARS' AND estado NOT IN ('cancelado')${secMes}${testWhere} AND ${fLocal('created_at')}::date = ${HOY_LOCAL}`, mesParams);
     // Ganancia estimada: lo cobrado de cada producto menos su precio de costo (solo productos con costo cargado)
     const ganQ = await pool.query(`SELECT COALESCE(SUM(pi.cantidad*pi.precio_unitario),0) AS facturado,
-        COALESCE(SUM(pi.cantidad*pi.precio_unitario) FILTER (WHERE COALESCE(pr.precio_original,0)>0),0) AS facturado_con_costo,
-        COALESCE(SUM(pi.cantidad*pr.precio_original) FILTER (WHERE COALESCE(pr.precio_original,0)>0),0) AS costo
+        COALESCE(SUM(pi.cantidad*pi.precio_unitario) FILTER (WHERE COALESCE(NULLIF(pi.costo_unitario,0), NULLIF(pr.precio_original,0)) IS NOT NULL),0) AS facturado_con_costo,
+        COALESCE(SUM(pi.cantidad*COALESCE(NULLIF(pi.costo_unitario,0), NULLIF(pr.precio_original,0))) FILTER (WHERE COALESCE(NULLIF(pi.costo_unitario,0), NULLIF(pr.precio_original,0)) IS NOT NULL),0) AS costo
       FROM pedido_items pi JOIN pedidos p ON pi.pedido_id=p.id LEFT JOIN productos pr ON pr.id=pi.producto_id AND pr.tenant_id=p.tenant_id
       WHERE p.tenant_id=$1 AND p.archivado=false AND p.tipo='pedido' AND ${cobrRel}${secP}${dateP}${testP}`, params);
     // Clientes nuevos: en el rango elegido, o en los últimos 30 días
@@ -3157,7 +3237,7 @@ app.get('/api/stats/detalle', authPerm('stats'), async (req,res)=>{
       if(tipo==='categoria'){ params.push(valor); extra+=` AND COALESCE(NULLIF(pi.categoria,''),'Sin categoría')=$${params.length}`; }
       const {rows}=await pool.query(`SELECT COALESCE(NULLIF(pi.nombre_producto,''),'—') AS nombre, MAX(pi.producto_id) AS producto_id, MAX(COALESCE(NULLIF(pi.imagen,''), pr.imagen)) AS imagen, SUM(pi.cantidad)::int AS cantidad,
           COALESCE(SUM(pi.cantidad*pi.precio_unitario),0) AS total,
-          CASE WHEN BOOL_AND(COALESCE(pr.precio_original,0)>0) THEN COALESCE(SUM(pi.cantidad*pr.precio_original),0) ELSE NULL END AS costo
+          CASE WHEN BOOL_AND(COALESCE(NULLIF(pi.costo_unitario,0), NULLIF(pr.precio_original,0)) IS NOT NULL) THEN COALESCE(SUM(pi.cantidad*COALESCE(NULLIF(pi.costo_unitario,0), NULLIF(pr.precio_original,0))),0) ELSE NULL END AS costo
         FROM pedido_items pi JOIN pedidos p ON pi.pedido_id=p.id LEFT JOIN productos pr ON pr.id=pi.producto_id AND pr.tenant_id=p.tenant_id
         WHERE ${w}${extra} GROUP BY COALESCE(NULLIF(pi.nombre_producto,''),'—') ORDER BY total DESC LIMIT 300`, params);
       const filas=rows.map(r=>({ ...r, total: parseFloat(r.total), costo: r.costo===null ? null : parseFloat(r.costo), ganancia: r.costo===null ? null : parseFloat(r.total)-parseFloat(r.costo) }));
