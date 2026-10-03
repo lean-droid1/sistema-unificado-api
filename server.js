@@ -398,6 +398,15 @@ async function tareasSeo(){
     await marcar('_pagina_devoluciones_v1', ya[0] ? 'existia' : 'creada');
     console.log('📄 Página de devoluciones:', ya[0] ? 'ya existía' : 'creada');
   }
+  // 5) Búsquedas guardadas letra por letra ("mó", "mód", "módulo") → queda solo la final de cada visita
+  if (!(await hecho('_busq_prefijos_v1'))) {
+    const r = await pool.query(`DELETE FROM visitas_eventos a USING visitas_eventos b
+      WHERE a.tipo='busqueda' AND b.tipo='busqueda' AND a.tenant_id=b.tenant_id AND a.sesion=b.sesion AND a.id<>b.id
+        AND b.created_at >= a.created_at AND b.created_at <= a.created_at + INTERVAL '3 minutes'
+        AND length(b.termino) > length(a.termino) AND left(b.termino, length(a.termino)) = a.termino`);
+    await marcar('_busq_prefijos_v1', r.rowCount);
+    console.log(`🔎 Búsquedas parciales borradas: ${r.rowCount}`);
+  }
   // 4) Costo real del proveedor: lo que había en precio_original (precio del proveedor sin descuento) pasa a
   //    costo_proveedor y precio_original queda con el descuento aplicado
   if (!(await hecho('_costo_prov_v1'))) {
@@ -3087,6 +3096,19 @@ function dispositivoDe(ua){
   return 'desktop';
 }
 const T = (x, n) => String(x==null?'':x).replace(/[\u0000-\u001F\u007F]/g,'').trim().slice(0, n);
+// Origen de la visita con nombre claro (l.wl.co = WhatsApp, utm "ig" = Instagram, etc.)
+function nombreOrigen(h){
+  const x = String(h || '').toLowerCase().trim();
+  if (!x || x === 'directo') return 'Directo';
+  const reglas = [
+    [/(^|\.)wl\.co$|whatsapp|(^|\.)wa\.me$|^wa$/, 'WhatsApp'], [/^ig$|instagram/, 'Instagram'], [/facebook|^fb$|(^|\.)fb\.me$|(^|\.)m\.me$/, 'Facebook'],
+    [/(^|\.)google\.|^google$|googlequicksearch|android-app/, 'Google'], [/(^|\.)bing\.com$/, 'Bing'], [/yahoo\./, 'Yahoo'], [/duckduckgo/, 'DuckDuckGo'],
+    [/youtube|youtu\.be/, 'YouTube'], [/tiktok/, 'TikTok'], [/(^|\.)t\.co$|twitter|(^|\.)x\.com$/, 'X (Twitter)'], [/mercadoli(b|v)re/, 'Mercado Libre'],
+    [/chatgpt|openai/, 'ChatGPT'], [/claude\.ai/, 'Claude'], [/perplexity/, 'Perplexity'],
+  ];
+  for (const [re, nom] of reglas) if (re.test(x)) return nom;
+  return x;
+}
 app.post('/api/track', rateLimit({ windowMs: 60*1000, max: 120, standardHeaders: true, legacyHeaders: false, message: { ok:false } }), async (req,res)=>{
   try{
     const b=req.body||{};
@@ -3098,6 +3120,12 @@ app.post('/api/track', rateLimit({ windowMs: 60*1000, max: 120, standardHeaders:
     const termino = tipo==='busqueda' ? T(b.q,120).toLowerCase() : null;
     if(tipo==='busqueda' && (!termino || termino.length<2)) return res.status(204).end();
     const ua=req.headers['user-agent'];
+    if(tipo==='busqueda'){
+      // El buscador busca mientras escriben ("mó", "mód", "módulo"): se queda solo la palabra final de esa visita
+      const {rows:ya}=await pool.query(`SELECT 1 FROM visitas_eventos WHERE tenant_id=$1 AND sesion=$2 AND tipo='busqueda' AND created_at > NOW() - INTERVAL '3 minutes' AND left(termino, length($3)) = $3 LIMIT 1`, [req.tenantId, sesion, termino]);
+      if(ya[0]) return res.status(204).end(); // ya contada (o están borrando letras de algo más largo)
+      await pool.query(`DELETE FROM visitas_eventos WHERE tenant_id=$1 AND sesion=$2 AND tipo='busqueda' AND created_at > NOW() - INTERVAL '3 minutes' AND length(termino) < length($3) AND left($3, length(termino)) = termino`, [req.tenantId, sesion, termino]);
+    }
     await pool.query('INSERT INTO visitas_eventos (tenant_id,visitante,sesion,tipo,path,origen,dispositivo,termino,resultados,bot_nombre) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)',
       [req.tenantId, visitante, sesion, tipo, T(b.p,300), T(origen,120), dispositivoDe(ua), termino, tipo==='busqueda' ? Math.max(0, parseInt(b.n,10)||0) : null, botDe(ua)||'']);
     if(Math.random()<0.002) pool.query("DELETE FROM visitas_eventos WHERE created_at < NOW() - INTERVAL '400 days'").catch(()=>{});
@@ -3116,9 +3144,11 @@ app.get('/api/analytics/visitas', authPerm('stats'), async (req,res)=>{
     const [k] = await q(`SELECT COUNT(DISTINCT sesion) FILTER (WHERE tipo='vista' AND dispositivo<>'bot')::int AS visitas, COUNT(DISTINCT visitante) FILTER (WHERE tipo='vista' AND dispositivo<>'bot')::int AS visitantes, COUNT(*) FILTER (WHERE tipo='vista' AND dispositivo<>'bot')::int AS paginas, COUNT(*) FILTER (WHERE tipo='busqueda')::int AS busquedas FROM visitas_eventos WHERE ${w}`);
     const [tp] = await q(`SELECT COALESCE(ROUND(AVG(dur))::int,0) AS seg FROM (SELECT EXTRACT(EPOCH FROM MAX(created_at)-MIN(created_at)) AS dur FROM visitas_eventos WHERE ${w} AND dispositivo<>'bot' GROUP BY sesion) x`);
     const dias = await q(`SELECT to_char(${fLocal('created_at')}::date,'YYYY-MM-DD') AS fecha, COUNT(DISTINCT sesion)::int AS visitas, COUNT(*)::int AS paginas FROM visitas_eventos WHERE ${w} AND tipo='vista' AND dispositivo<>'bot' GROUP BY 1 ORDER BY 1`);
-    const disp = await q(`SELECT dispositivo AS k, COUNT(DISTINCT sesion)::int AS n FROM visitas_eventos WHERE ${w} AND tipo='vista' GROUP BY 1 ORDER BY 2 DESC`);
+    const disp = await q(`SELECT dispositivo AS k, COUNT(DISTINCT sesion)::int AS n FROM visitas_eventos WHERE ${w} AND tipo='vista' AND dispositivo<>'bot' GROUP BY 1 ORDER BY 2 DESC`);
     const bots = await q(`SELECT COALESCE(NULLIF(bot_nombre,''),'Sin identificar (de antes)') AS k, COUNT(DISTINCT sesion)::int AS n FROM visitas_eventos WHERE ${w} AND dispositivo='bot' GROUP BY 1 ORDER BY 2 DESC LIMIT 8`);
-    const origenes = await q(`SELECT COALESCE(NULLIF(origen,''),'directo') AS k, COUNT(DISTINCT sesion)::int AS n FROM visitas_eventos WHERE ${w} AND tipo='vista' AND dispositivo<>'bot' GROUP BY 1 ORDER BY 2 DESC LIMIT 8`);
+    const origRaw = await q(`SELECT COALESCE(NULLIF(origen,''),'') AS k, COUNT(DISTINCT sesion)::int AS n FROM visitas_eventos WHERE ${w} AND tipo='vista' AND dispositivo<>'bot' GROUP BY 1 ORDER BY 2 DESC LIMIT 60`);
+    const origAgr = {}; origRaw.forEach(o => { const nom = nombreOrigen(o.k); origAgr[nom] = (origAgr[nom] || 0) + o.n; });
+    const origenes = Object.entries(origAgr).map(([k, n]) => ({ k, n })).sort((a, b) => b.n - a.n).slice(0, 8);
     const paginas = await q(`SELECT path AS k, COUNT(*)::int AS n FROM visitas_eventos WHERE ${w} AND tipo='vista' AND dispositivo<>'bot' GROUP BY 1 ORDER BY 2 DESC LIMIT 10`);
     const busq = await q(`SELECT termino AS k, COUNT(*)::int AS n, MIN(resultados)::int AS min_res, to_char(MAX(${fLocal('created_at')}),'YYYY-MM-DD HH24:MI') AS ultima FROM visitas_eventos WHERE ${w} AND tipo='busqueda' GROUP BY 1 ORDER BY 2 DESC LIMIT 15`);
     const sinRes = await q(`SELECT termino AS k, COUNT(*)::int AS n, to_char(MAX(${fLocal('created_at')}),'YYYY-MM-DD HH24:MI') AS ultima FROM visitas_eventos WHERE ${w} AND tipo='busqueda' AND resultados=0 GROUP BY 1 ORDER BY 2 DESC LIMIT 15`);
