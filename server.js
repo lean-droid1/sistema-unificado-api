@@ -407,6 +407,17 @@ async function tareasSeo(){
     await marcar('_busq_prefijos_v1', r.rowCount);
     console.log(`🔎 Búsquedas parciales borradas: ${r.rowCount}`);
   }
+  // 6) Títulos y textos de las categorías de herramientas (páginas /categoria/... para Google). Editables en Catálogo → Categorías.
+  if (!(await hecho('_cat_seo_v1'))) {
+    const textos = {"Microscopios Y Acc.": ["Microscopios para reparación de celulares", "Microscopios trinoculares y binoculares para microsoldadura y reparación de celulares: RF4, Kailiwei, Luowei, Mijing y más. También cámaras, lentes Barlow, aros de luz y soportes. Envíos a todo el país."], "Estaciones de Soldado Y Acc.": ["Estaciones de soldado y accesorios", "Estaciones de aire caliente, cautines T12 y C210, estaciones 2 en 1 y precalentadoras para reparación de placas: RF4, Luowei, Kailiwei, Aifen, Sugon y Mijing. Además puntas, mangos y boquillas de repuesto. Envíos a todo el país."], "Fuentes de Alimentacion/Mediciones.": ["Fuentes de alimentación y equipos de medición", "Fuentes de alimentación reguladas, multímetros, amperímetros USB, activadores de baterías y cargadores multipuerto para diagnóstico de celulares y electrónica. Marcas RF4, Luowei, Mijing, Kailiwei, Sugon y Aifen. Envíos a todo el país."], "Herramientas/Insumos": ["Herramientas e insumos para técnicos", "Herramientas de precisión para reparación de celulares: bruselas, holders, kits de apertura, cuchillas, mantas, stencils, hilo jumper y más insumos para el taller. Envíos a todo el país."], "Programadoras": ["Programadoras y equipos JCID", "Programadoras JCID (V1S Pro, V1SE, Q1), zócalos para Face ID, baterías y True Tone, y equipos para eMMC/UFS como Easy JTAG. Todo para reparación avanzada de iPhone y Android. Envíos a todo el país."], "Destornilladores": ["Destornilladores de precisión", "Destornilladores y juegos de puntas de precisión para desarmar celulares, tablets y notebooks. Envíos a todo el país."], "Estaño Alambre y Pasta": ["Estaño en alambre y en pasta", "Estaño en alambre y en pasta para soldadura y reballing de componentes en placas de celulares. Envíos a todo el país."], "Flux": ["Flux para soldadura", "Flux en jeringa y en pasta para soldar y desoldar componentes SMD y BGA. Envíos a todo el país."], "Mantas Anti Estaticas y Termicas": ["Mantas antiestáticas y térmicas", "Mantas de silicona antiestáticas y resistentes al calor para trabajar seguro en el banco de reparación. Envíos a todo el país."], "MUEBLES": ["Muebles y mesas de trabajo", "Mesas de trabajo con luz LED y muebles para armar o mejorar tu taller de reparación."], "Remanufactura": ["Remanufactura de pantallas", "Equipos e insumos para remanufactura de pantallas de celulares. Envíos a todo el país."]};
+    let n = 0;
+    for (const [cat, [titulo, desc]] of Object.entries(textos)) {
+      const r = await pool.query(`INSERT INTO categorias_meta (tenant_id, categoria, titulo, descripcion, orden) VALUES (1,$1,$2,$3,999) ON CONFLICT (tenant_id, categoria) DO UPDATE SET titulo=CASE WHEN COALESCE(categorias_meta.titulo,'')='' THEN $2 ELSE categorias_meta.titulo END, descripcion=CASE WHEN COALESCE(categorias_meta.descripcion,'')='' THEN $3 ELSE categorias_meta.descripcion END`, [cat, titulo, desc]);
+      n += r.rowCount;
+    }
+    await marcar('_cat_seo_v1', n);
+    console.log(`📚 Textos de categorías: ${n}`);
+  }
   // 4) Costo real del proveedor: lo que había en precio_original (precio del proveedor sin descuento) pasa a
   //    costo_proveedor y precio_original queda con el descuento aplicado
   if (!(await hecho('_costo_prov_v1'))) {
@@ -614,6 +625,8 @@ async function migrate(){
     `ALTER TABLE productos ADD COLUMN IF NOT EXISTS precio_oferta NUMERIC(12,2) DEFAULT 0`,
     `ALTER TABLE productos ADD COLUMN IF NOT EXISTS precio_original NUMERIC(12,2) DEFAULT 0`,
     `ALTER TABLE productos ADD COLUMN IF NOT EXISTS costo_proveedor NUMERIC(12,2) DEFAULT 0`,
+    `ALTER TABLE categorias_meta ADD COLUMN IF NOT EXISTS titulo VARCHAR(200) DEFAULT ''`,
+    `ALTER TABLE categorias_meta ADD COLUMN IF NOT EXISTS descripcion TEXT DEFAULT ''`,
     `ALTER TABLE pedido_items ADD COLUMN IF NOT EXISTS costo_unitario NUMERIC(12,2)`,
     `ALTER TABLE productos ADD COLUMN IF NOT EXISTS stock_minimo INT DEFAULT 0`,
     `ALTER TABLE productos ADD COLUMN IF NOT EXISTS visible BOOLEAN DEFAULT true`,
@@ -1700,7 +1713,7 @@ app.get('/api/categorias/admin', authPerm('productos'), async (req,res)=>{
     const {rows:meta}=await pool.query('SELECT * FROM categorias_meta WHERE tenant_id=$1', [req.tenantId]).catch(()=>({rows:[]}));
     const metaMap={}; meta.forEach(m=>metaMap[m.categoria]=m);
     const catSet=new Set(cats.map(c=>c.categoria).filter(Boolean));
-    const result=cats.filter(c=>c.categoria).map(c=>({ nombre:c.categoria, cantidad:c.cantidad, orden:(metaMap[c.categoria]?.orden??999), visible:(metaMap[c.categoria]?.visible!==false) }));
+    const result=cats.filter(c=>c.categoria).map(c=>({ nombre:c.categoria, cantidad:c.cantidad, orden:(metaMap[c.categoria]?.orden??999), visible:(metaMap[c.categoria]?.visible!==false), titulo:metaMap[c.categoria]?.titulo||'', descripcion:metaMap[c.categoria]?.descripcion||'' }));
     // Categorías creadas manualmente (en meta) que todavía no tienen productos
     meta.forEach(m=>{ if(!catSet.has(m.categoria)) result.push({ nombre:m.categoria, cantidad:0, orden:(m.orden??999), visible:(m.visible!==false) }); });
     result.sort((a,b)=> a.orden-b.orden || a.nombre.localeCompare(b.nombre));
@@ -1742,6 +1755,46 @@ app.post('/api/categorias/reasignar', authPerm('productos'), async (req,res)=>{
   }catch(e){ res.status(500).json({error:e.message}); }
 });
 // Guardar orden y visibilidad de categorías
+// ── Páginas de categoría para Google: /categoria/<slug> ──
+const slugCat = (x) => String(x || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '').slice(0, 60).replace(/-+$/, '');
+function tituloCat(n){
+  let t = String(n || '').trim().replace(/\s+y\s+acc\.?$/i, ' y accesorios').replace(/\.+$/, '').replace(/\s*\/\s*/g, ' y ');
+  if (t && t === t.toUpperCase()) t = t.charAt(0) + t.slice(1).toLowerCase();
+  return t;
+}
+app.get('/api/categorias-info', async (req,res)=>{
+  try{
+    const restr = await seccionesRestringidas(req.tenantId);
+    const {rows} = await pool.query(`SELECT categoria, COUNT(*)::int AS n FROM productos WHERE tenant_id=$1 AND visible=true AND COALESCE(categoria,'')<>'' AND NOT (seccion_id = ANY($2::int[])) GROUP BY categoria`, [req.tenantId, restr.length ? restr : [0]]);
+    const {rows:meta} = await pool.query('SELECT categoria, visible, titulo, descripcion, orden FROM categorias_meta WHERE tenant_id=$1', [req.tenantId]).catch(()=>({rows:[]}));
+    const mm = {}; meta.forEach(m => { mm[m.categoria] = m; });
+    const grupos = {};
+    for (const r of rows) {
+      if (mm[r.categoria] && mm[r.categoria].visible === false) continue;
+      if (/^prueba$/i.test(r.categoria.trim())) continue;
+      const slug = slugCat(r.categoria); if (!slug) continue;
+      const g = grupos[slug] || (grupos[slug] = { slug, nombres: [], productos: 0, titulo: '', descripcion: '', _max: 0, orden: 999 });
+      g.nombres.push(r.categoria); g.productos += r.n;
+      const m = mm[r.categoria] || {};
+      if (m.titulo && !g.titulo) g.titulo = m.titulo;
+      if (m.descripcion && !g.descripcion) g.descripcion = m.descripcion;
+      if (m.orden != null) g.orden = Math.min(g.orden, m.orden);
+      if (r.n > g._max) { g._max = r.n; g.nombre = r.categoria; }
+    }
+    const lista = Object.values(grupos).map(({ _max, ...g }) => ({ ...g, titulo: g.titulo || tituloCat(g.nombre) })).sort((a, b) => b.productos - a.productos);
+    res.set('Cache-Control', 'public, max-age=300');
+    res.json(lista);
+  }catch(e){ res.status(500).json({error:e.message}); }
+});
+app.post('/api/categorias/seo', authPerm('productos'), async (req,res)=>{
+  try{
+    const nombre = String(req.body?.nombre || '').trim().slice(0, 200);
+    if (!nombre) return res.status(400).json({error:'Falta la categoría'});
+    const titulo = String(req.body?.titulo || '').trim().slice(0, 200), descripcion = String(req.body?.descripcion || '').trim().slice(0, 3000);
+    await pool.query(`INSERT INTO categorias_meta (tenant_id, categoria, titulo, descripcion, orden) VALUES ($1,$2,$3,$4,999) ON CONFLICT (tenant_id, categoria) DO UPDATE SET titulo=$3, descripcion=$4`, [req.tenantId, nombre, titulo, descripcion]);
+    res.json({ok:true});
+  }catch(e){ res.status(500).json({error:e.message}); }
+});
 app.post('/api/categorias/meta', authPerm('productos'), async (req,res)=>{
   try{
     const {categorias}=req.body; // [{nombre, orden, visible}]
