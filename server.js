@@ -426,6 +426,20 @@ async function tareasSeo(){
     await marcar('_cat_seo_v1', n);
     console.log(`📚 Textos de categorías: ${n}`);
   }
+  // 8) Aviso destacado de la tienda Mayorista: cómo funcionan los pedidos. Editable en Panel → Tiendas → Editar.
+  if (!(await hecho('_aviso_mayorista_v1'))) {
+    const r = await pool.query("UPDATE secciones SET aviso_titulo=$1, aviso=$2 WHERE tenant_id=1 AND slug='mayorista' AND COALESCE(aviso,'')=''", [
+      'Importante: cómo funcionan los pedidos mayoristas',
+      [
+        'La compra mayorista no está disponible para retiro inmediato en el local: todas las compras se hacen por pedido.',
+        'Armamos tu pedido y lo enviamos a tu dirección. Si preferís retirarlo en el local, se coordina previamente.',
+        'El armado demora de 24 a 72 hs hábiles.',
+        'Si al armar falta algún producto, te avisamos para que elijas el reintegro o reemplazarlo por otro.',
+      ].join('\n'),
+    ]);
+    await marcar('_aviso_mayorista_v1', r.rowCount);
+    console.log(`📢 Aviso mayorista: ${r.rowCount}`);
+  }
   // 4) Costo real del proveedor: lo que había en precio_original (precio del proveedor sin descuento) pasa a
   //    costo_proveedor y precio_original queda con el descuento aplicado
   if (!(await hecho('_costo_prov_v1'))) {
@@ -634,6 +648,9 @@ async function migrate(){
     `ALTER TABLE productos ADD COLUMN IF NOT EXISTS precio_original NUMERIC(12,2) DEFAULT 0`,
     `ALTER TABLE productos ADD COLUMN IF NOT EXISTS costo_proveedor NUMERIC(12,2) DEFAULT 0`,
     `ALTER TABLE categorias_meta ADD COLUMN IF NOT EXISTS titulo VARCHAR(200) DEFAULT ''`,
+    // Aviso destacado por tienda/sección (condiciones de compra que se muestran como alerta)
+    `ALTER TABLE secciones ADD COLUMN IF NOT EXISTS aviso_titulo VARCHAR(200) DEFAULT ''`,
+    `ALTER TABLE secciones ADD COLUMN IF NOT EXISTS aviso TEXT DEFAULT ''`,
     `ALTER TABLE categorias_meta ADD COLUMN IF NOT EXISTS descripcion TEXT DEFAULT ''`,
     `ALTER TABLE pedido_items ADD COLUMN IF NOT EXISTS costo_unitario NUMERIC(12,2)`,
     `ALTER TABLE productos ADD COLUMN IF NOT EXISTS stock_minimo INT DEFAULT 0`,
@@ -1354,20 +1371,20 @@ app.get('/api/secciones', async (req,res)=>{ try{ const {rows}=await pool.query(
 app.get('/api/secciones/:id', async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM secciones WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); if(!rows[0]) return res.status(404).json({error:'No encontrada'}); res.json(rows[0]); }catch(e){ res.status(500).json({error:e.message}); } });
 app.put('/api/secciones/:id', authPerm('config'), async (req,res)=>{
   try{
-    const {nombre,slug,descripcion,imagen,requiere_aprobacion,visible,orden,ignorar_stock,cp_origen,permitir_sin_stock}=req.body;
+    const {nombre,slug,descripcion,imagen,requiere_aprobacion,visible,orden,ignorar_stock,cp_origen,permitir_sin_stock,aviso_titulo,aviso}=req.body;
     if(requiere_aprobacion && Number(req.tenantId)!==1){
       const {rows:act}=await pool.query('SELECT requiere_aprobacion FROM secciones WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]);
       const td=await getTenantData(req.tenantId).catch(()=>null);
       if(act[0] && !act[0].requiere_aprobacion && td && !featureActiva(td.features,'mayorista')) return res.status(403).json({error:'Las tiendas mayoristas con aprobación no están incluidas en tu plan', upgrade:true});
     }
     _secRestrCache.delete(String(req.tenantId));
-    await pool.query('UPDATE secciones SET nombre=$1,slug=$2,descripcion=$3,imagen=$4,requiere_aprobacion=$5,visible=$6,orden=$7,ignorar_stock=$8,cp_origen=$9,permitir_sin_stock=$10 WHERE id=$11 AND tenant_id=$12', [nombre,slug,descripcion,imagen,requiere_aprobacion,visible,orden||0,ignorar_stock||false,cp_origen||'1888',permitir_sin_stock||false,req.params.id, req.tenantId]);
+    await pool.query('UPDATE secciones SET nombre=$1,slug=$2,descripcion=$3,imagen=$4,requiere_aprobacion=$5,visible=$6,orden=$7,ignorar_stock=$8,cp_origen=$9,permitir_sin_stock=$10,aviso_titulo=COALESCE($13,aviso_titulo),aviso=COALESCE($14,aviso) WHERE id=$11 AND tenant_id=$12', [nombre,slug,descripcion,imagen,requiere_aprobacion,visible,orden||0,ignorar_stock||false,cp_origen||'1888',permitir_sin_stock||false,req.params.id, req.tenantId, typeof aviso_titulo==='string'?aviso_titulo.slice(0,200):null, typeof aviso==='string'?aviso.slice(0,3000):null]);
     res.json({ok:true});
   }catch(e){ res.status(500).json({error:e.message}); }
 });
 app.post('/api/secciones', authPerm('config'), async (req,res)=>{
   try{
-    const {nombre,slug,descripcion,imagen,requiere_aprobacion,ignorar_stock,cp_origen}=req.body;
+    const {nombre,slug,descripcion,imagen,requiere_aprobacion,ignorar_stock,cp_origen,aviso_titulo,aviso}=req.body;
     const maxT = await limitePlan(req, 'max_tiendas');
     if(Number.isFinite(maxT)){
       const {rows:c}=await pool.query('SELECT COUNT(*)::int AS n FROM secciones WHERE tenant_id=$1', [req.tenantId]);
@@ -1375,7 +1392,7 @@ app.post('/api/secciones', authPerm('config'), async (req,res)=>{
     }
     if(requiere_aprobacion && Number(req.tenantId)!==1){ const td=await getTenantData(req.tenantId).catch(()=>null); if(td && !featureActiva(td.features,'mayorista')) return res.status(403).json({error:'Las tiendas mayoristas con aprobación no están incluidas en tu plan', upgrade:true}); }
     _secRestrCache.delete(String(req.tenantId));
-    const {rows}=await pool.query('INSERT INTO secciones (tenant_id,nombre,slug,descripcion,imagen,requiere_aprobacion,ignorar_stock,cp_origen) VALUES ($8,$1,$2,$3,$4,$5,$6,$7) RETURNING *', [nombre,slug,descripcion||'',imagen||'',requiere_aprobacion||false,ignorar_stock||false,cp_origen||'1888', req.tenantId]);
+    const {rows}=await pool.query('INSERT INTO secciones (tenant_id,nombre,slug,descripcion,imagen,requiere_aprobacion,ignorar_stock,cp_origen,aviso_titulo,aviso) VALUES ($8,$1,$2,$3,$4,$5,$6,$7,$9,$10) RETURNING *', [nombre,slug,descripcion||'',imagen||'',requiere_aprobacion||false,ignorar_stock||false,cp_origen||'1888', req.tenantId, String(aviso_titulo||'').slice(0,200), String(aviso||'').slice(0,3000)]);
     res.json(rows[0]);
   }catch(e){ res.status(400).json({error:e.message}); }
 });
