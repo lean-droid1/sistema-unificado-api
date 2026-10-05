@@ -2456,6 +2456,12 @@ app.post('/api/bot/latido', botAuth, async (req, res) => {
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
+// Monitor externo (healthchecks.io): cada 5 min avisa "estoy vivo" si la base responde.
+// Si deja de llegar (Railway caído o sin crédito), healthchecks.io avisa por Telegram desde afuera.
+async function pingExterno() {
+  try { await pool.query('SELECT 1'); await fetch(process.env.HEALTHCHECK_URL, { signal: AbortSignal.timeout(10000) }); }
+  catch (e) { console.log('ping externo', e.message); }
+}
 async function vigilarBot() {
   try {
     const { rows } = await pool.query(`SELECT tenant_id, actualizado_at, ciclo_min, nombre FROM bot_estado
@@ -3776,4 +3782,4 @@ app.get('/api/andreani/etiqueta/:envio', authPerm('pedidos'), async (req,res)=>{
 
 // START
 const PORT=process.env.PORT||3000;
-migrate().then(()=>{ app.listen(PORT, ()=>console.log(`🚀 V4 running on ${PORT}`)); tareasSeo().catch(e=>console.log('tareas SEO warn', e.message)); setInterval(vigilarBot, Number(process.env.VIGILAR_BOT_MS) || 5*60*1000); }).catch(e=>{ console.error('Migration failed', e); process.exit(1); });
+migrate().then(()=>{ app.listen(PORT, ()=>console.log(`🚀 V4 running on ${PORT}`)); tareasSeo().catch(e=>console.log('tareas SEO warn', e.message)); setInterval(vigilarBot, Number(process.env.VIGILAR_BOT_MS) || 5*60*1000); if (process.env.HEALTHCHECK_URL) { pingExterno(); setInterval(pingExterno, 5*60*1000); } }).catch(e=>{ console.error('Migration failed', e); process.exit(1); });
