@@ -440,6 +440,12 @@ async function tareasSeo(){
     await marcar('_aviso_mayorista_v1', r.rowCount);
     console.log(`📢 Aviso mayorista: ${r.rowCount}`);
   }
+  // 9) Reseñas de Clientes en Google: ID de comerciante de Merchant Center (editable en Marketing → Analytics / Pixels)
+  if (!(await hecho('_google_reviews_v1'))) {
+    const r = await pool.query("INSERT INTO configuracion (tenant_id,clave,valor) VALUES (1,'google_merchant_id','5866987507') ON CONFLICT (tenant_id,clave) DO NOTHING");
+    await marcar('_google_reviews_v1', r.rowCount);
+    console.log(`⭐ Reseñas de Google: ${r.rowCount ? 'ID de comerciante cargado' : 'ya estaba'}`);
+  }
   // 4) Costo real del proveedor: lo que había en precio_original (precio del proveedor sin descuento) pasa a
   //    costo_proveedor y precio_original queda con el descuento aplicado
   if (!(await hecho('_costo_prov_v1'))) {
@@ -660,6 +666,9 @@ async function migrate(){
     `ALTER TABLE cupones ADD COLUMN IF NOT EXISTS vence_at TIMESTAMP`,
     `ALTER TABLE cupones ADD COLUMN IF NOT EXISTS usuario_id INT`,
     `ALTER TABLE cupones ADD COLUMN IF NOT EXISTS origen VARCHAR(20) DEFAULT ''`,
+    // Botón de arrepentimiento (Res. 424/2020): solicitudes de revocación de compra
+    `CREATE TABLE IF NOT EXISTS arrepentimientos (id SERIAL PRIMARY KEY, tenant_id INT DEFAULT 1, codigo VARCHAR(20), nombre VARCHAR(200) DEFAULT '', email VARCHAR(200) DEFAULT '', telefono VARCHAR(50) DEFAULT '', dni VARCHAR(30) DEFAULT '', pedido VARCHAR(50) DEFAULT '', pedido_id INT, usuario_id INT, detalle TEXT DEFAULT '', estado VARCHAR(20) DEFAULT 'pendiente', nota_admin TEXT DEFAULT '', created_at TIMESTAMP DEFAULT NOW(), resuelto_at TIMESTAMP)`,
+    `CREATE UNIQUE INDEX IF NOT EXISTS arrepentimientos_codigo_idx ON arrepentimientos (tenant_id, codigo)`,
     // Estado del bot de dropshipping (latido de cada ciclo). Privado: no hay ruta pública que lo lea.
     `CREATE TABLE IF NOT EXISTS bot_estado (tenant_id INT PRIMARY KEY, actualizado_at TIMESTAMP DEFAULT NOW(), scraping_activo BOOLEAN DEFAULT false, ciclo_min INT DEFAULT 15, datos TEXT DEFAULT '{}', tg_token TEXT DEFAULT '', tg_chat VARCHAR(50) DEFAULT '', nombre VARCHAR(100) DEFAULT '', alerta_at TIMESTAMP)`,
     // Aviso destacado por tienda/sección (condiciones de compra que se muestran como alerta)
@@ -1229,6 +1238,85 @@ async function emailCompraCliente(tenantId, pedidos, comprador){
     await _sendMail(email, `Tu compra en ${tienda} — Pedido #${String(pedidos[0].id).padStart(4,'0')}`, html, { fromName: tienda, replyTo: tiendaEmail || undefined });
   }catch(e){ console.log('[mail-cliente] exc:', e.message); }
 }
+// ── BOTÓN DE ARREPENTIMIENTO (Ley 24.240 art. 34 / Res. 424/2020) ─────────────────────────────
+// El cliente pide revocar la compra sin registrarse. Se le da al instante un código de identificación,
+// se le manda por mail y se avisa a la tienda. La tienda lo gestiona en Ventas → Arrepentimientos.
+const ARR_ABC = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+const codigoArrep = () => 'ARR-' + Array.from(crypto.randomBytes(6)).map(b => ARR_ABC[b % ARR_ABC.length]).join('');
+app.post('/api/arrepentimiento', optionalAuth, rateLimit({ windowMs: 60*60*1000, max: 8, standardHeaders: true, legacyHeaders: false, message: { error: 'Demasiados intentos. Probá de nuevo en un rato o escribinos por WhatsApp.' } }), async (req,res)=>{
+  try{
+    const t=req.tenantId; const b=req.body||{};
+    const nombre=String(b.nombre||'').trim().slice(0,200);
+    const email=String(b.email||'').trim().toLowerCase().slice(0,200);
+    const telefono=String(b.telefono||'').replace(/[^\d+ ]/g,'').trim().slice(0,50);
+    const dni=String(b.dni||'').replace(/[^\dA-Za-z]/g,'').slice(0,30);
+    const pedidoTxt=String(b.pedido||'').replace(/[^\d]/g,'').slice(0,12);
+    const detalle=String(b.detalle||'').trim().slice(0,2000);
+    if(nombre.length<2) return res.status(400).json({error:'Escribí tu nombre y apellido'});
+    if(!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email)) return res.status(400).json({error:'Escribí un email válido: ahí te mandamos el código'});
+    // Vincular el pedido solo si es de quien lo pide (por la cuenta o por el email del pedido)
+    let pedidoId=null;
+    if(pedidoTxt){
+      const {rows:pp}=await pool.query('SELECT p.id, p.usuario_id, p.datos_facturacion, u.email AS u_email FROM pedidos p LEFT JOIN usuarios u ON u.id=p.usuario_id WHERE p.id=$1 AND p.tenant_id=$2', [Number(pedidoTxt), t]).catch(()=>({rows:[]}));
+      const pp0=pp[0];
+      if(pp0){
+        let emailPed=''; try{ const o=typeof pp0.datos_facturacion==='string'?JSON.parse(pp0.datos_facturacion||'{}'):(pp0.datos_facturacion||{}); emailPed=String(o.email||o.mail||'').toLowerCase(); }catch(e){}
+        const propio=(req.user && Number(req.user.id)===Number(pp0.usuario_id)) || (email && (email===String(pp0.u_email||'').toLowerCase() || email===emailPed));
+        if(propio) pedidoId=pp0.id;
+      }
+    }
+    let codigo='', fila=null;
+    for(let i=0;i<5 && !fila;i++){
+      codigo=codigoArrep();
+      const r=await pool.query(`INSERT INTO arrepentimientos (tenant_id,codigo,nombre,email,telefono,dni,pedido,pedido_id,usuario_id,detalle) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT (tenant_id,codigo) DO NOTHING RETURNING id, created_at`,
+        [t, codigo, nombre, email, telefono, dni, pedidoTxt, pedidoId, req.user?req.user.id:null, detalle]);
+      fila=r.rows[0]||null;
+    }
+    if(!fila) return res.status(500).json({error:'No se pudo registrar la solicitud. Probá de nuevo.'});
+    const {tienda, email:tiendaEmail}=await _tiendaInfo(t);
+    const fecha=new Date(fila.created_at).toLocaleString('es-AR', { timeZone:'America/Argentina/Buenos_Aires', day:'2-digit', month:'2-digit', year:'numeric', hour:'2-digit', minute:'2-digit', hourCycle:'h23' });
+    // Al cliente: el código de identificación de la revocación
+    _sendMail(email, `Recibimos tu solicitud de arrepentimiento — ${codigo}`, `<div style="font-family:system-ui,sans-serif;max-width:520px;margin:0 auto">
+      <h2 style="color:#111">Recibimos tu solicitud de arrepentimiento</h2>
+      <p>Hola ${escMail(nombre)}, registramos tu pedido para revocar la compra${pedidoTxt?` <strong>#${escMail(pedidoTxt)}</strong>`:''}.</p>
+      <p style="font-size:15px">Tu código de identificación es:</p>
+      <p style="font-size:24px;font-weight:800;letter-spacing:.06em;background:#f3f4f6;border-radius:10px;padding:14px 18px;text-align:center">${codigo}</p>
+      <p>Fecha: ${escMail(fecha)}. Guardá este código. Nos vamos a comunicar con vos para coordinar la devolución del producto y el reintegro.</p>
+      <p style="color:#888;font-size:12px;margin-top:20px">${escMail(tienda)}${tiendaEmail?` · ${escMail(tiendaEmail)}`:''}</p>
+    </div>`, { fromName: tienda, replyTo: tiendaEmail || undefined }).catch(()=>{});
+    // A la tienda: aviso para gestionarlo
+    (async()=>{
+      let destino=tiendaEmail;
+      if(!destino){ const {rows:adm}=await pool.query("SELECT email FROM usuarios WHERE rol='admin' AND email<>'' AND tenant_id=$1 ORDER BY id LIMIT 1", [t]).catch(()=>({rows:[]})); destino=adm[0]&&adm[0].email; }
+      if(destino) await _sendMail(destino, `Arrepentimiento ${codigo}${pedidoTxt?` — pedido #${pedidoTxt}`:''}`, `<div style="font-family:system-ui,sans-serif;max-width:520px;margin:0 auto">
+        <h2 style="color:#b45309">Nueva solicitud de arrepentimiento</h2>
+        <p><strong>${codigo}</strong> · ${escMail(fecha)}</p>
+        <p>Cliente: <strong>${escMail(nombre)}</strong><br>Email: ${escMail(email)}${telefono?`<br>Teléfono: ${escMail(telefono)}`:''}${dni?`<br>DNI: ${escMail(dni)}`:''}${pedidoTxt?`<br>Pedido: #${escMail(pedidoTxt)}${pedidoId?'':' (no coincide con sus datos, revisalo)'}`:''}</p>
+        ${detalle?`<p>Detalle: ${escMail(detalle)}</p>`:''}
+        <p style="color:#888;font-size:12px">Gestionalo en el panel: Ventas → Arrepentimientos.</p>
+      </div>`, { fromName: tienda, replyTo: email });
+    })().catch(()=>{});
+    res.json({ ok:true, codigo, fecha, pedido_vinculado: !!pedidoId });
+  }catch(e){ res.status(500).json({error:e.message}); }
+});
+app.get('/api/arrepentimientos', authPerm('pedidos'), async (req,res)=>{
+  try{
+    const {rows}=await pool.query(`SELECT a.*, p.total AS pedido_total, p.estado AS pedido_estado, p.created_at AS pedido_fecha
+      FROM arrepentimientos a LEFT JOIN pedidos p ON p.id=a.pedido_id AND p.tenant_id=a.tenant_id
+      WHERE a.tenant_id=$1 ORDER BY (a.estado='pendiente') DESC, a.created_at DESC LIMIT 300`, [req.tenantId]);
+    res.json(rows);
+  }catch(e){ res.status(500).json({error:e.message}); }
+});
+app.put('/api/arrepentimientos/:id', authPerm('pedidos'), async (req,res)=>{
+  try{
+    const estado=String(req.body.estado||'');
+    if(!['pendiente','en_proceso','resuelta','rechazada'].includes(estado)) return res.status(400).json({error:'Estado inválido'});
+    const r=await pool.query(`UPDATE arrepentimientos SET estado=$1::varchar, nota_admin=COALESCE($2::text,nota_admin), resuelto_at=CASE WHEN $1::varchar IN ('resuelta','rechazada') THEN COALESCE(resuelto_at,NOW()) ELSE NULL END WHERE id=$3 AND tenant_id=$4`,
+      [estado, typeof req.body.nota_admin==='string'?req.body.nota_admin.slice(0,2000):null, req.params.id, req.tenantId]);
+    if(!r.rowCount) return res.status(404).json({error:'No encontrada'});
+    res.json({ok:true});
+  }catch(e){ res.status(500).json({error:e.message}); }
+});
 const loginAttempts={};
 app.post('/api/login', async (req,res)=>{
   try{
@@ -2561,16 +2649,27 @@ app.get('/api/producto-imagenes/:producto_id', async (req,res)=>{ try{ const {ro
 app.post('/api/producto-imagenes', authPerm('productos'), async (req,res)=>{ try{ const {producto_id,url,orden}=req.body; if(!url||!String(url).trim()) return res.status(400).json({error:'Falta la URL de la imagen'}); const {rows:pp}=await pool.query('SELECT 1 FROM productos WHERE id=$1 AND tenant_id=$2', [producto_id, req.tenantId]); if(!pp[0]) return res.status(404).json({error:'Producto no encontrado'}); const {rows}=await pool.query('INSERT INTO producto_imagenes (tenant_id,producto_id,url,orden) VALUES ($4,$1,$2,$3) RETURNING *', [producto_id,url,orden||0, req.tenantId]); await syncImagenPrincipal(producto_id, req.tenantId); res.json(rows[0]); }catch(e){ res.status(500).json({error:e.message}); } });
 app.delete('/api/producto-imagenes/:id', authPerm('productos'), async (req,res)=>{ try{ const {rows:pv}=await pool.query('SELECT producto_id FROM producto_imagenes WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); await pool.query('DELETE FROM producto_imagenes WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); if(pv[0]) await syncImagenPrincipal(pv[0].producto_id, req.tenantId); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 app.put('/api/producto-imagenes/reorder', authPerm('productos'), async (req,res)=>{ try{ const {items}=req.body; for(const it of items){ await pool.query('UPDATE producto_imagenes SET orden=$1 WHERE id=$2 AND tenant_id=$3', [it.orden,it.id, req.tenantId]); } if(items&&items[0]){ const {rows:pv}=await pool.query('SELECT producto_id FROM producto_imagenes WHERE id=$1 AND tenant_id=$2', [items[0].id, req.tenantId]); if(pv[0]) await syncImagenPrincipal(pv[0].producto_id, req.tenantId); } res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
-app.get('/api/variantes/:producto_id', async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM variantes WHERE producto_id=$1 AND tenant_id=$2 ORDER BY id', [req.params.producto_id, req.tenantId]); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
+// Un producto que el visitante no puede ver (oculto, o de una tienda con aprobación sin acceso) tampoco expone sus variantes ni sus precios
+async function bloqueoProductoPublico(req, pid){
+  const {rows}=await pool.query('SELECT id,seccion_id,visible FROM productos WHERE id=$1 AND tenant_id=$2', [pid, req.tenantId]);
+  if(!rows[0]) return { status:404, error:'Producto no encontrado' };
+  if(esStaffReq(req)) return null;
+  if(rows[0].visible===false) return { status:404, error:'Producto no encontrado' };
+  if((await sinRestringidas(req, rows, { conservarConAcceso: true })).length===0) return { status:404, error:'Este producto es solo para clientes mayoristas autorizados' };
+  return null;
+}
+app.get('/api/variantes/:producto_id', optionalAuth, async (req,res)=>{ try{ const b=await bloqueoProductoPublico(req, req.params.producto_id); if(b) return res.status(b.status).json({error:b.error}); const {rows}=await pool.query('SELECT * FROM variantes WHERE producto_id=$1 AND tenant_id=$2 ORDER BY id', [req.params.producto_id, req.tenantId]); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
 app.post('/api/variantes', authPerm('productos'), async (req,res)=>{ try{ const {producto_id,nombre,valor,stock,precio_extra,precio}=req.body; if(!(await productoDeTienda(pool, req.tenantId, producto_id))) return res.status(404).json({error:'Producto no encontrado'}); const {rows}=await pool.query('INSERT INTO variantes (tenant_id,producto_id,nombre,valor,stock,precio_extra,precio) VALUES ($7,$1,$2,$3,$4,$5,$6) RETURNING *', [producto_id,nombre,valor||'',stock||0,precio_extra||0,precio||0, req.tenantId]); res.json(rows[0]); }catch(e){ res.status(500).json({error:e.message}); } });
 app.put('/api/variantes/:id', authPerm('productos'), async (req,res)=>{ try{ const v=req.body; const r=await pool.query('UPDATE variantes SET nombre=$1,valor=$2,stock=$3,precio_extra=$4,precio=$5 WHERE id=$6 AND tenant_id=$7', [v.nombre,v.valor,v.stock||0,v.precio_extra||0,v.precio||0,req.params.id, req.tenantId]); if(!r.rowCount) return res.status(404).json({error:'Variante no encontrada'}); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 app.delete('/api/variantes/:id', authPerm('productos'), async (req,res)=>{ try{ await pool.query('DELETE FROM variantes WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 
 // ── ATRIBUTOS + VARIANTES COMBINADAS (modelo Empretienda) ──
 // Lee atributos + valores + variantes (combinaciones) de un producto en una sola llamada
-app.get('/api/productos/:id/variantes-full', async (req,res)=>{
+app.get('/api/productos/:id/variantes-full', optionalAuth, async (req,res)=>{
   try{
     const t=req.tenantId; const pid=req.params.id;
+    const bloq=await bloqueoProductoPublico(req, pid);
+    if(bloq) return res.status(bloq.status).json({error:bloq.error});
     const {rows:prod}=await pool.query('SELECT usa_variantes FROM productos WHERE id=$1 AND tenant_id=$2',[pid,t]);
     if(!prod[0]) return res.status(404).json({error:'Producto no encontrado'});
     const {rows:atrs}=await pool.query('SELECT id,nombre,orden FROM producto_atributos WHERE producto_id=$1 AND tenant_id=$2 ORDER BY orden,id',[pid,t]);
@@ -2984,7 +3083,11 @@ app.post('/api/pedidos/multi', auth(), async (req,res)=>{
       const {rows:fin}=await client.query('SELECT * FROM pedidos WHERE id=$1', [rows[0].id]);
       creados.push(fin[0]);
     }
-    if(cot.cupon && cot.cupon.ok) await client.query("UPDATE cupones SET usos_actuales = usos_actuales + 1 WHERE UPPER(codigo)=UPPER($1) AND tenant_id=$2", [cot.cupon.codigo, req.tenantId]).catch(()=>{});
+    if(cot.cupon && cot.cupon.ok){
+      // Atómico: si otra compra usó el último cupo mientras tanto, esta no lo puede usar (la fila queda bloqueada hasta el COMMIT)
+      const u=await client.query("UPDATE cupones SET usos_actuales = COALESCE(usos_actuales,0) + 1 WHERE UPPER(codigo)=UPPER($1) AND tenant_id=$2 AND activo=true AND (COALESCE(uso_maximo,0)=0 OR COALESCE(usos_actuales,0) < uso_maximo)", [cot.cupon.codigo, req.tenantId]);
+      if(!u.rowCount) throw new CheckoutError('Ese cupón ya se usó o se agotó. Quitalo del carrito para seguir con la compra.');
+    }
     await client.query('COMMIT');
     marcarCarritoComprado(req.tenantId, req.user.id, creados).catch(()=>{});
     notificarVentaAdmin(creados, req.user).catch(()=>{});
