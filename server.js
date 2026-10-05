@@ -648,6 +648,18 @@ async function migrate(){
     `ALTER TABLE productos ADD COLUMN IF NOT EXISTS precio_original NUMERIC(12,2) DEFAULT 0`,
     `ALTER TABLE productos ADD COLUMN IF NOT EXISTS costo_proveedor NUMERIC(12,2) DEFAULT 0`,
     `ALTER TABLE categorias_meta ADD COLUMN IF NOT EXISTS titulo VARCHAR(200) DEFAULT ''`,
+    // Carritos abandonados: seguimiento (contactado, recuperado, cupón) y cupones personales con vencimiento por hora
+    `ALTER TABLE carritos_abandonados ADD COLUMN IF NOT EXISTS contactado_at TIMESTAMP`,
+    `ALTER TABLE carritos_abandonados ADD COLUMN IF NOT EXISTS contactos INT DEFAULT 0`,
+    `ALTER TABLE carritos_abandonados ADD COLUMN IF NOT EXISTS recuperado_at TIMESTAMP`,
+    `ALTER TABLE carritos_abandonados ADD COLUMN IF NOT EXISTS recuperado_por VARCHAR(20) DEFAULT ''`,
+    `ALTER TABLE carritos_abandonados ADD COLUMN IF NOT EXISTS pedido_id INT`,
+    `ALTER TABLE carritos_abandonados ADD COLUMN IF NOT EXISTS monto_recuperado NUMERIC(12,2) DEFAULT 0`,
+    `ALTER TABLE carritos_abandonados ADD COLUMN IF NOT EXISTS cupon_codigo VARCHAR(50) DEFAULT ''`,
+    `ALTER TABLE carritos_abandonados ADD COLUMN IF NOT EXISTS cupon_vence TIMESTAMP`,
+    `ALTER TABLE cupones ADD COLUMN IF NOT EXISTS vence_at TIMESTAMP`,
+    `ALTER TABLE cupones ADD COLUMN IF NOT EXISTS usuario_id INT`,
+    `ALTER TABLE cupones ADD COLUMN IF NOT EXISTS origen VARCHAR(20) DEFAULT ''`,
     // Aviso destacado por tienda/sección (condiciones de compra que se muestran como alerta)
     `ALTER TABLE secciones ADD COLUMN IF NOT EXISTS aviso_titulo VARCHAR(200) DEFAULT ''`,
     `ALTER TABLE secciones ADD COLUMN IF NOT EXISTS aviso TEXT DEFAULT ''`,
@@ -2881,12 +2893,22 @@ app.post('/api/pedidos/multi', auth(), async (req,res)=>{
     }
     if(cot.cupon && cot.cupon.ok) await client.query("UPDATE cupones SET usos_actuales = usos_actuales + 1 WHERE UPPER(codigo)=UPPER($1) AND tenant_id=$2", [cot.cupon.codigo, req.tenantId]).catch(()=>{});
     await client.query('COMMIT');
+    marcarCarritoComprado(req.tenantId, req.user.id, creados).catch(()=>{});
     notificarVentaAdmin(creados, req.user).catch(()=>{});
     emailCompraCliente(req.tenantId, creados, req.user).catch(()=>{});
     res.json({ok:true, pedidos: creados, totales: cot.totales});
   }catch(e){ await client.query('ROLLBACK').catch(()=>{}); errorPedido(res, e); }
   finally{ client.release(); }
 });
+
+// Carrito abandonado → recuperado cuando el cliente compra. Si se lo contactó, cuenta como recuperado por contacto.
+async function marcarCarritoComprado(tenantId, usuarioId, pedidos){
+  if(!usuarioId || !pedidos || !pedidos.length) return;
+  const total = pedidos.reduce((a,p)=>a+(Number(p.total)||0),0);
+  await pool.query(`UPDATE carritos_abandonados SET recuperado=true, recuperado_at=NOW(), pedido_id=$3, monto_recuperado=$4,
+      recuperado_por=CASE WHEN contactado_at IS NOT NULL THEN 'contacto' ELSE 'solo' END
+    WHERE tenant_id=$1 AND usuario_id=$2 AND recuperado=false`, [tenantId, usuarioId, pedidos[0].id, total]);
+}
 
 // ==== PAGOS MIXTOS DE UN PEDIDO ====
 // Recalcula estado_pago según la suma de "cuenta_como" (lo que tacha de la deuda)
@@ -3388,7 +3410,7 @@ app.get('/api/stats/detalle', authPerm('stats'), async (req,res)=>{
 });
 
 // CUPONES, PROMOS, POPUPS, REDES, MENU, DESIGN, PAGOS, PAGINAS, BADGES, ENVIO, BUSQUEDA, SLIDER, FAVORITOS, STOCK, ANDREANI (se mantienen igual + fixes Andreani env)
-app.get('/api/cupones', authPerm('config'), requiereFeature('marketing'), async (req,res)=>{ try{ const {rows}=await pool.query('SELECT c.*, array_agg(cp.producto_id) FILTER (WHERE cp.producto_id IS NOT NULL) as productos_ids FROM cupones c LEFT JOIN cupon_productos cp ON c.id=cp.cupon_id WHERE c.tenant_id=$1 GROUP BY c.id ORDER BY c.created_at DESC', [req.tenantId]); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
+app.get('/api/cupones', authPerm('config'), requiereFeature('marketing'), async (req,res)=>{ try{ const {rows}=await pool.query('SELECT c.*, array_agg(cp.producto_id) FILTER (WHERE cp.producto_id IS NOT NULL) as productos_ids FROM cupones c LEFT JOIN cupon_productos cp ON c.id=cp.cupon_id WHERE c.tenant_id=$1 AND c.origen IS DISTINCT FROM \'carrito\' GROUP BY c.id ORDER BY c.created_at DESC', [req.tenantId]); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
 app.post('/api/cupones/validar', optionalAuth, async (req,res)=>{
   try{
     const {codigo,seccion_id,metodo_pago,items}=req.body;
@@ -3582,8 +3604,51 @@ app.post('/api/carritos-abandonados', optionalAuth, rateLimit({ windowMs: 60*100
     res.json(rows[0]);
   }catch(e){ res.status(500).json({error:e.message}); }
 });
-app.get('/api/carritos-abandonados', authPerm('stats'), requiereFeature('marketing'), async (req,res)=>{ try{ const {rows}=await pool.query("SELECT c.*, u.nombre as usuario_nombre, u.nombre_fantasia as usuario_fantasia, COALESCE(u.mayorista,false) as cli_mayorista, COALESCE(u.es_revendedor,false) as cli_revendedor, COALESCE(NULLIF(c.telefono,''), u.telefono) as telefono, COALESCE(NULLIF(c.email,''), u.email) as email, s.nombre as seccion_nombre FROM carritos_abandonados c LEFT JOIN usuarios u ON c.usuario_id=u.id LEFT JOIN secciones s ON c.seccion_id=s.id WHERE c.recuperado=false AND c.tenant_id=$1 ORDER BY c.created_at DESC LIMIT 100", [req.tenantId]); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
-app.post('/api/carritos-abandonados/:id/recuperar', authPerm('stats'), requiereFeature('marketing'), async (req,res)=>{ try{ await pool.query('UPDATE carritos_abandonados SET recuperado=true WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.get('/api/carritos-abandonados', authPerm('stats'), requiereFeature('marketing'), async (req,res)=>{ try{
+  const recup = req.query.estado==='recuperados';
+  const {rows}=await pool.query(`SELECT c.*, u.nombre as usuario_nombre, u.nombre_fantasia as usuario_fantasia, COALESCE(u.mayorista,false) as cli_mayorista, COALESCE(u.es_revendedor,false) as cli_revendedor, COALESCE(NULLIF(c.telefono,''), u.telefono) as telefono, COALESCE(NULLIF(c.email,''), u.email) as email, s.nombre as seccion_nombre
+    FROM carritos_abandonados c LEFT JOIN usuarios u ON c.usuario_id=u.id LEFT JOIN secciones s ON c.seccion_id=s.id
+    WHERE c.tenant_id=$1 AND ${recup ? "c.recuperado=true AND COALESCE(c.recuperado_at, c.created_at) > NOW() - INTERVAL '60 days'" : 'c.recuperado=false'}
+    ORDER BY ${recup ? 'COALESCE(c.recuperado_at, c.created_at)' : 'c.created_at'} DESC LIMIT 200`, [req.tenantId]);
+  res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
+// Números de los últimos 30 días
+app.get('/api/carritos-abandonados/stats', authPerm('stats'), requiereFeature('marketing'), async (req,res)=>{ try{
+  const {rows}=await pool.query(`SELECT
+      COUNT(*) FILTER (WHERE COALESCE(recuperado_por,'')<>'solo')::int AS dejados,
+      COALESCE(SUM(total) FILTER (WHERE COALESCE(recuperado_por,'')<>'solo'),0) AS monto_dejado,
+      COUNT(*) FILTER (WHERE recuperado_por IN ('contacto','manual'))::int AS recuperados,
+      COALESCE(SUM(CASE WHEN recuperado_por='contacto' THEN monto_recuperado WHEN recuperado_por='manual' THEN total ELSE 0 END),0) AS monto_recuperado,
+      COUNT(*) FILTER (WHERE recuperado_por='solo')::int AS compraron_solos,
+      COUNT(*) FILTER (WHERE recuperado=false AND contactado_at IS NULL)::int AS sin_contactar
+    FROM carritos_abandonados WHERE tenant_id=$1 AND GREATEST(created_at, COALESCE(recuperado_at, created_at)) > NOW() - INTERVAL '30 days'`, [req.tenantId]);
+  const r=rows[0]||{};
+  res.json({ ...r, monto_dejado:Number(r.monto_dejado)||0, monto_recuperado:Number(r.monto_recuperado)||0, tasa: r.dejados ? Math.round(r.recuperados*100/r.dejados) : 0 });
+}catch(e){ res.status(500).json({error:e.message}); } });
+app.post('/api/carritos-abandonados/:id/contactado', authPerm('stats'), requiereFeature('marketing'), async (req,res)=>{ try{
+  const {rows}=await pool.query('UPDATE carritos_abandonados SET contactado_at=NOW(), contactos=COALESCE(contactos,0)+1 WHERE id=$1 AND tenant_id=$2 RETURNING contactado_at, contactos', [req.params.id, req.tenantId]);
+  res.json(rows[0]||{}); }catch(e){ res.status(500).json({error:e.message}); } });
+// Cupón personal y por tiempo para cerrar un carrito: un solo uso, solo para ese cliente, vence en X horas
+app.post('/api/carritos-abandonados/:id/cupon', authPerm('stats'), requiereFeature('marketing'), async (req,res)=>{ try{
+  const pct=Math.round(Number(req.body?.porcentaje)*10)/10, horas=Number(req.body?.horas);
+  if(!(pct>0 && pct<=50)) return res.status(400).json({error:'El descuento tiene que ser entre 1% y 50%'});
+  if(![1,2,3,6,12,24,48].includes(horas)) return res.status(400).json({error:'Validez no permitida'});
+  const {rows:cs}=await pool.query('SELECT id, usuario_id FROM carritos_abandonados WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]);
+  if(!cs[0]) return res.status(404).json({error:'Carrito no encontrado'});
+  const ABC='ABCDEFGHJKMNPQRSTUVWXYZ23456789';
+  let codigo='', ok=false;
+  for(let intento=0; intento<5 && !ok; intento++){
+    codigo=Array.from(crypto.randomBytes(8)).map(b=>ABC[b%ABC.length]).join('');
+    try{
+      await pool.query(`INSERT INTO cupones (tenant_id,codigo,tipo,valor,uso_maximo,usos_actuales,activo,vence_at,usuario_id,origen,secciones_ids,categoria,monto_minimo,metodo_pago)
+        VALUES ($1,$2,'porcentaje',$3,1,0,true,NOW() + ($4 || ' hours')::interval,$5,'carrito','','',0,'')`, [req.tenantId, codigo, pct, String(horas), cs[0].usuario_id||null]);
+      ok=true;
+    }catch(e){ if(!/unique|duplicate/i.test(e.message)) throw e; }
+  }
+  if(!ok) return res.status(500).json({error:'No se pudo generar el cupón'});
+  const {rows}=await pool.query("UPDATE carritos_abandonados SET cupon_codigo=$1, cupon_vence=NOW() + ($2 || ' hours')::interval WHERE id=$3 AND tenant_id=$4 RETURNING cupon_codigo, cupon_vence", [codigo, String(horas), req.params.id, req.tenantId]);
+  res.json({ codigo, vence_at: rows[0]?.cupon_vence, porcentaje: pct, horas });
+}catch(e){ res.status(500).json({error:e.message}); } });
+app.post('/api/carritos-abandonados/:id/recuperar', authPerm('stats'), requiereFeature('marketing'), async (req,res)=>{ try{ await pool.query("UPDATE carritos_abandonados SET recuperado=true, recuperado_at=NOW(), recuperado_por='manual' WHERE id=$1 AND tenant_id=$2", [req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 app.delete('/api/carritos-abandonados/:id', authPerm('stats'), requiereFeature('marketing'), async (req,res)=>{ try{ await pool.query('DELETE FROM carritos_abandonados WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 
 // ANDREANI V4 - fix env vars CLIENTE vs NRO_CLIENTE

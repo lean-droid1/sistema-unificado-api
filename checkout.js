@@ -268,6 +268,8 @@ function createCheckout(pool) {
     if (c.uso_maximo > 0 && c.usos_actuales >= c.uso_maximo) throw new CheckoutError('Cupón agotado');
     if (c.fecha_desde && new Date() < new Date(c.fecha_desde)) throw new CheckoutError('El cupón todavía no está vigente');
     if (c.fecha_hasta && new Date(new Date(c.fecha_hasta).getTime() + 86400000) < new Date()) throw new CheckoutError('El cupón está vencido');
+    if (c.vence_at && new Date(c.vence_at) < new Date()) throw new CheckoutError('El cupón venció');
+    if (c.usuario_id && (!ctx.user || Number(ctx.user.id) !== Number(c.usuario_id))) throw new CheckoutError(ctx.user ? 'Este cupón es personal y no corresponde a tu cuenta' : 'Iniciá sesión con tu cuenta para usar este cupón');
     if (c.solo_primera_compra) {
       if (!ctx.user) throw new CheckoutError('Iniciá sesión para usar este cupón');
       const { rows: prev } = await db.query("SELECT COUNT(*)::int AS n FROM pedidos WHERE usuario_id=$1 AND tipo='pedido' AND tenant_id=$2 AND LOWER(COALESCE(estado,'')) NOT IN ('cancelado','anulado')", [ctx.user.id, ctx.tenantId]);
@@ -287,7 +289,7 @@ function createCheckout(pool) {
     if (c.tipo === 'porcentaje') descuento = Math.round(baseDesc * num(c.valor) / 100);
     else if (c.tipo === 'monto_fijo') descuento = num(c.valor);
     else if (c.tipo === 'envio_gratis') envioGratis = true;
-    return { codigo: c.codigo, cupon_id: c.id, tipo: c.tipo, valor: num(c.valor), descuento: Math.min(round2(descuento), subtotal), envio_gratis: envioGratis };
+    return { codigo: c.codigo, cupon_id: c.id, tipo: c.tipo, valor: num(c.valor), descuento: Math.min(round2(descuento), subtotal), envio_gratis: envioGratis, vence_at: c.vence_at || null, todas: c.origen === 'carrito' };
   }
 
   // Cotiza el carrito completo. body = { secciones:[{seccion_id, items, envio_id}], entrega:{tipo, cp}, cupon, metodo_pago }
@@ -323,14 +325,14 @@ function createCheckout(pool) {
       const subtotal = round2(ars.reduce((s, i) => s + i.precio_unitario * i.cantidad, 0));
       const subtotalUsdt = round2(items.filter(i => i.moneda !== 'ARS').reduce((s, i) => s + i.precio_unitario * i.cantidad, 0));
       const requiereEnvio = items.some(i => !i.es_digital);
-      // Cupón: se aplica a la primera tienda donde sea válido
+      // Cupón: se aplica a la primera tienda donde sea válido (el de carrito abandonado, a todo el carrito)
       let descuento = 0, cuponAplicado = null, envioGratisCupon = false;
-      if (cuponInfo && !cuponInfo.ok && subtotal > 0) {
+      if (cuponInfo && subtotal > 0 && (!cuponInfo.ok || cuponInfo.todas)) {
         try {
           const r = await evaluarCupon(db, ctx, cuponCodigo, { seccion_id: secId, items: ars, subtotal, metodo_pago: body?.metodo_pago, final: !opts.cotizacion });
           descuento = r.descuento; envioGratisCupon = r.envio_gratis; cuponAplicado = r.codigo;
-          cuponInfo = { ...cuponInfo, ok: true, error: null, seccion_id: secId, codigo: r.codigo, descuento: r.descuento, tipo: r.tipo };
-        } catch (e) { if (!cuponInfo.error) cuponInfo.error = e.message; }
+          cuponInfo = { ...cuponInfo, ok: true, error: null, seccion_id: cuponInfo.ok ? cuponInfo.seccion_id : secId, codigo: r.codigo, descuento: round2((cuponInfo.ok ? num(cuponInfo.descuento) : 0) + r.descuento), tipo: r.tipo, vence_at: r.vence_at || null, todas: !!r.todas };
+        } catch (e) { if (!cuponInfo.ok && !cuponInfo.error) cuponInfo.error = e.message; }
       }
       // Envío
       let envio = { opciones: [], gratis_seccion: false, umbral: 0, falta_para_gratis: 0 };
