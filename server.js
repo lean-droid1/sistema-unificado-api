@@ -660,6 +660,8 @@ async function migrate(){
     `ALTER TABLE cupones ADD COLUMN IF NOT EXISTS vence_at TIMESTAMP`,
     `ALTER TABLE cupones ADD COLUMN IF NOT EXISTS usuario_id INT`,
     `ALTER TABLE cupones ADD COLUMN IF NOT EXISTS origen VARCHAR(20) DEFAULT ''`,
+    // Estado del bot de dropshipping (latido de cada ciclo). Privado: no hay ruta pública que lo lea.
+    `CREATE TABLE IF NOT EXISTS bot_estado (tenant_id INT PRIMARY KEY, actualizado_at TIMESTAMP DEFAULT NOW(), scraping_activo BOOLEAN DEFAULT false, ciclo_min INT DEFAULT 15, datos TEXT DEFAULT '{}', tg_token TEXT DEFAULT '', tg_chat VARCHAR(50) DEFAULT '', nombre VARCHAR(100) DEFAULT '', alerta_at TIMESTAMP)`,
     // Aviso destacado por tienda/sección (condiciones de compra que se muestran como alerta)
     `ALTER TABLE secciones ADD COLUMN IF NOT EXISTS aviso_titulo VARCHAR(200) DEFAULT ''`,
     `ALTER TABLE secciones ADD COLUMN IF NOT EXISTS aviso TEXT DEFAULT ''`,
@@ -2126,7 +2128,8 @@ app.post('/api/bot/sync', botAuth, async (req, res) => {
       return res.status(400).json({ error: 'No se encontró ninguna sección en la tienda. Creá al menos una sección (ej. DEPOSITO) antes de sincronizar.' });
     }
 
-    let insertados = 0, actualizados = 0, errores = 0;
+    let insertados = 0, actualizados = 0, errores = 0, sinCambios = 0, cambiosPrecio = 0, cambiosStock = 0, cambiosCosto = 0;
+    const sinStock = [], conStock = [];
     const detalles = [];
     let primerError = null;
     const descCfg = await leerDescProveedor(t); // descuentos de la tienda sobre el precio del proveedor
@@ -2151,16 +2154,31 @@ app.post('/api/bot/sync', botAuth, async (req, res) => {
         const envioGratis = !!p.envio_gratis;
         const costo = Math.max(0, Number(p.costo) || 0); // lo que cobra el proveedor → precio de costo (ganancia del dashboard)
 
-        const { rows } = await pool.query('SELECT id,categoria,nombre,marca FROM productos WHERE sku=$1 AND tenant_id=$2 LIMIT 1', [skuT, t]);
+        const { rows } = await pool.query('SELECT id,categoria,nombre,marca,precio_base,precio_oferta,stock,costo_proveedor,precio_original FROM productos WHERE sku=$1 AND tenant_id=$2 LIMIT 1', [skuT, t]);
         let prodId;
         if (rows[0]) {
-          // Existe → actualiza SOLO precio/stock/oferta/envío gratis. NO pisa nombre/imagen/categoría (por si Leandro las editó a mano).
-          prodId = rows[0].id;
-          const costoReal = costo > 0 ? costoConDescuento(costo, pctDescProveedor(descCfg, rows[0])) : 0;
-          await pool.query(
-            `UPDATE productos SET precio_base=$1, precio_oferta=$2, stock=$3, costo_proveedor=CASE WHEN $6>0 THEN $6 ELSE costo_proveedor END, precio_original=CASE WHEN $6>0 THEN $7 ELSE precio_original END WHERE id=$4 AND tenant_id=$5`,
-            [precioBase, precioOferta, stock, prodId, t, costo, costoReal]);
-          actualizados++;
+          // Existe → actualiza SOLO precio/stock/oferta/costo. NO pisa nombre/imagen/categoría (por si Leandro las editó a mano).
+          // Y solo si algo cambió de verdad: así el aviso del bot cuenta cambios reales y no reescribe 459 filas cada 15 min.
+          const ex = rows[0];
+          prodId = ex.id;
+          const costoReal = costo > 0 ? costoConDescuento(costo, pctDescProveedor(descCfg, ex)) : 0;
+          const dif = (a, b) => Math.abs((Number(a) || 0) - (Number(b) || 0)) > 0.005;
+          const stockAntes = parseInt(ex.stock) || 0;
+          const cPrecio = dif(precioBase, ex.precio_base) || dif(precioOferta, ex.precio_oferta);
+          const cStock = stock !== stockAntes;
+          const cCosto = costo > 0 && (dif(costo, ex.costo_proveedor) || dif(costoReal, ex.precio_original));
+          if (cPrecio || cStock || cCosto) {
+            await pool.query(
+              `UPDATE productos SET precio_base=$1, precio_oferta=$2, stock=$3, costo_proveedor=CASE WHEN $6>0 THEN $6 ELSE costo_proveedor END, precio_original=CASE WHEN $6>0 THEN $7 ELSE precio_original END WHERE id=$4 AND tenant_id=$5`,
+              [precioBase, precioOferta, stock, prodId, t, costo, costoReal]);
+            actualizados++;
+            if (cPrecio) cambiosPrecio++;
+            if (cStock) cambiosStock++;
+            if (cCosto && !cPrecio && !cStock) cambiosCosto++;
+            const nom = ex.nombre || nombre;
+            if (stockAntes > 0 && stock <= 0 && sinStock.length < 200) sinStock.push({ sku: skuT, nombre: nom, stock_antes: stockAntes });
+            if (stockAntes <= 0 && stock > 0 && conStock.length < 200) conStock.push({ sku: skuT, nombre: nom, stock });
+          } else sinCambios++;
         } else {
           // Nuevo → inserta completo en la sección destino.
           // Re-hostear la imagen principal en Cloudinary (independiza de rxz/hotlink).
@@ -2211,7 +2229,7 @@ app.post('/api/bot/sync', botAuth, async (req, res) => {
       }
     }
 
-    res.json({ ok: true, seccion_id: secId, total: productos.length, insertados, actualizados, errores, nuevos, ocultos: ocultarNuevos, primer_error: primerError || undefined, detalles: detalles.length ? detalles : undefined });
+    res.json({ ok: true, seccion_id: secId, total: productos.length, insertados, actualizados, sin_cambios: sinCambios, cambios_precio: cambiosPrecio, cambios_stock: cambiosStock, cambios_costo: cambiosCosto, sin_stock: sinStock, con_stock: conStock, errores, nuevos, ocultos: ocultarNuevos, primer_error: primerError || undefined, detalles: detalles.length ? detalles : undefined });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -2404,6 +2422,75 @@ app.post('/api/bot/stock-cero', botAuth, async (req, res) => {
     if (!Array.isArray(skus) || !skus.length) return res.json({ ok: true, afectados: 0 });
     const r = await pool.query("UPDATE productos SET stock=0 WHERE tenant_id=$1 AND sku = ANY($2)", [t, skus]);
     res.json({ ok: true, afectados: r.rowCount });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+// ── Vigilancia del bot ─────────────────────────────────────────────────────────
+// El bot manda un latido en cada vuelta. Si deja de llegar (caído, trabado o sin crédito en Railway),
+// la API avisa por Telegram: el bot no puede avisar de su propia caída.
+async function avisarTelegramBot(t, texto) {
+  try {
+    const { rows } = await pool.query('SELECT tg_token, tg_chat FROM bot_estado WHERE tenant_id=$1', [t]);
+    const r = rows[0];
+    if (!r || !r.tg_token || !r.tg_chat) return false;
+    const resp = await fetch(`${process.env.TELEGRAM_API || 'https://api.telegram.org'}/bot${r.tg_token}/sendMessage`, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: r.tg_chat, text: texto, parse_mode: 'Markdown' }) });
+    return resp.ok;
+  } catch (e) { console.log('avisarTelegramBot', e.message); return false; }
+}
+const minsDesde = (d) => Math.round((Date.now() - new Date(d).getTime()) / 60000);
+const durTxt = (m) => m < 90 ? `${m} min` : `${Math.floor(m / 60)} h ${m % 60} min`;
+app.post('/api/bot/latido', botAuth, async (req, res) => {
+  const t = req.botTenantId;
+  try {
+    const b = req.body || {};
+    const datos = JSON.stringify(b.datos && typeof b.datos === 'object' ? b.datos : {}).slice(0, 20000);
+    const ciclo = Math.min(240, Math.max(1, parseInt(b.ciclo_min) || 15));
+    const nombre = String(b.nombre || '').slice(0, 100);
+    const { rows: prev } = await pool.query('SELECT actualizado_at, alerta_at FROM bot_estado WHERE tenant_id=$1', [t]);
+    await pool.query(`INSERT INTO bot_estado (tenant_id, actualizado_at, scraping_activo, ciclo_min, datos, tg_token, tg_chat, nombre, alerta_at)
+      VALUES ($1, NOW(), $2, $3, $4, $5, $6, $7, NULL)
+      ON CONFLICT (tenant_id) DO UPDATE SET actualizado_at=NOW(), scraping_activo=$2, ciclo_min=$3, datos=$4,
+        tg_token=COALESCE(NULLIF($5,''), bot_estado.tg_token), tg_chat=COALESCE(NULLIF($6,''), bot_estado.tg_chat), nombre=$7, alerta_at=NULL`,
+      [t, !!b.scraping_activo, ciclo, datos, String(b.tg_token || '').slice(0, 200), String(b.tg_chat || '').slice(0, 50), nombre]);
+    if (prev[0] && prev[0].alerta_at) avisarTelegramBot(t, `✅ *[${nombre}] El bot volvió a andar*\nEstuvo ${durTxt(minsDesde(prev[0].actualizado_at))} sin dar señales.`).catch(() => {});
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+async function vigilarBot() {
+  try {
+    const { rows } = await pool.query(`SELECT tenant_id, actualizado_at, ciclo_min, nombre FROM bot_estado
+      WHERE tg_token<>'' AND tg_chat<>'' AND (alerta_at IS NULL OR alerta_at < NOW() - INTERVAL '6 hours')`);
+    for (const r of rows) {
+      const mins = minsDesde(r.actualizado_at);
+      if (mins < Math.max(45, (Number(r.ciclo_min) || 15) * 3 + 15)) continue;
+      const ok = await avisarTelegramBot(r.tenant_id, `🚨 *[${r.nombre}] El bot no da señales hace ${durTxt(mins)}*\nPuede estar caído, trabado o sin crédito en Railway. Revisá el servicio del bot en Railway (Deployments → logs). Si se reinició, mandá /encender.`);
+      if (ok) await pool.query('UPDATE bot_estado SET alerta_at=NOW() WHERE tenant_id=$1', [r.tenant_id]);
+    }
+  } catch (e) { console.log('vigilarBot', e.message); }
+}
+// GET /api/bot/salud — créditos de los servicios que usa la web (hoy: Cloudinary)
+app.get('/api/bot/salud', botAuth, async (req, res) => {
+  const out = { ok: true, cloudinary: null };
+  if (useCloudinary) {
+    try {
+      const u = await cloudinary.api.usage();
+      const c = u.credits || {};
+      out.cloudinary = { plan: u.plan || '', usado: Number(c.usage) || 0, limite: Number(c.limit) || 0, pct: Number(c.used_percent) || 0 };
+    } catch (e) { out.cloudinary = { error: String((e && (e.message || (e.error && e.error.message))) || e).slice(0, 150) }; }
+  }
+  res.json(out);
+});
+// GET /api/bot/vendidos?dias=30 — productos del proveedor (SKU RXZ-) vendidos en la web en los últimos N días
+app.get('/api/bot/vendidos', botAuth, async (req, res) => {
+  const t = req.botTenantId;
+  try {
+    const dias = Math.min(180, Math.max(1, parseInt(req.query.dias) || 30));
+    const { rows } = await pool.query(`SELECT pr.sku, MAX(pr.nombre) AS nombre, SUM(pi.cantidad)::int AS unidades
+      FROM pedido_items pi JOIN pedidos p ON p.id=pi.pedido_id JOIN productos pr ON pr.id=pi.producto_id AND pr.tenant_id=p.tenant_id
+      WHERE p.tenant_id=$1 AND pr.sku LIKE 'RXZ-%' AND p.created_at > NOW() - ($2::int * INTERVAL '1 day')
+        AND COALESCE(p.is_test,false)=false AND COALESCE(p.tipo,'pedido')='pedido' AND LOWER(COALESCE(p.estado,'')) NOT IN ('cancelado','anulado')
+      GROUP BY pr.sku ORDER BY unidades DESC LIMIT 500`, [t, dias]);
+    res.json({ ok: true, dias, productos: rows });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 app.get('/api/productos/buscar', optionalAuth, async (req,res)=>{ try{ const {q}=req.query; if(!q) return res.json([]); const toks=String(q).trim().split(/\s+/).filter(Boolean).slice(0,8); const campos=`(coalesce(p.nombre,'')||' '||coalesce(p.modelo,'')||' '||coalesce(p.categoria,'')||' '||coalesce(p.marca,'')||' '||coalesce(p.sku,'')||' '||coalesce(p.compatibilidad,''))`; const cond=[]; const params=[req.tenantId]; let pi=2; for(const tk of toks){ cond.push(`${SQL_SIN_ACENTOS(campos)} LIKE $${pi}`); params.push(tokenBusqueda(tk)); pi++; } const whereTok=cond.length?(' AND '+cond.join(' AND ')):''; const {rows}=await pool.query(`SELECT p.id,p.nombre,p.modelo,p.categoria,p.precio_base,p.precio_oferta,p.stock,p.imagen,p.sku,p.codigo_barras,p.seccion_id,p.permitir_sin_stock,p.es_digital,p.usa_variantes,(SELECT MIN(CASE WHEN v.precio_oferta>0 AND v.precio_oferta<v.precio THEN v.precio_oferta ELSE v.precio END) FROM variantes v WHERE v.producto_id=p.id AND v.tenant_id=p.tenant_id AND v.precio>0) AS precio_desde,s.nombre as seccion_nombre,s.color as seccion_color FROM productos p LEFT JOIN secciones s ON p.seccion_id=s.id WHERE p.tenant_id=$1${whereTok}${esStaffReq(req)?'':' AND p.visible=true'} ORDER BY p.nombre LIMIT 20`, params); res.json(esStaffReq(req) ? rows : await sinRestringidas(req, rows, { conservarConAcceso: true })); }catch(e){ res.status(500).json({error:e.message}); } });
@@ -3689,4 +3776,4 @@ app.get('/api/andreani/etiqueta/:envio', authPerm('pedidos'), async (req,res)=>{
 
 // START
 const PORT=process.env.PORT||3000;
-migrate().then(()=>{ app.listen(PORT, ()=>console.log(`🚀 V4 running on ${PORT}`)); tareasSeo().catch(e=>console.log('tareas SEO warn', e.message)); }).catch(e=>{ console.error('Migration failed', e); process.exit(1); });
+migrate().then(()=>{ app.listen(PORT, ()=>console.log(`🚀 V4 running on ${PORT}`)); tareasSeo().catch(e=>console.log('tareas SEO warn', e.message)); setInterval(vigilarBot, Number(process.env.VIGILAR_BOT_MS) || 5*60*1000); }).catch(e=>{ console.error('Migration failed', e); process.exit(1); });
