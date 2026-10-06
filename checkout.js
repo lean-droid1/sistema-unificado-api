@@ -38,8 +38,9 @@ function aplicarPromo(base, product, promos, seccionId, moneda) {
     if (prods.length && !prods.includes(String(product.id))) continue;
     if (pr.categoria && pr.categoria !== product.categoria) continue;
     let final = base;
-    if (pr.tipo === 'porcentaje') final = Math.round(base * (1 - num(pr.valor) / 100));
-    else final = Math.max(0, base - num(pr.valor));
+    const val = Math.max(0, num(pr.valor));
+    if (pr.tipo === 'porcentaje') final = Math.max(0, Math.round(base * (1 - Math.min(val, 100) / 100)));
+    else final = Math.max(0, base - val);
     if (final < base && (!mejor || final < mejor.final)) mejor = { final, original: base, nombre: pr.nombre };
   }
   return mejor;
@@ -49,7 +50,7 @@ function aplicarPromo(base, product, promos, seccionId, moneda) {
 function precioVariante(v, base) {
   const pr = num(v.precio), of = num(v.precio_oferta);
   if (pr > 0) return (of > 0 && of < pr) ? of : pr;
-  return num(base) + num(v.precio_extra);
+  return Math.max(0, num(base) + num(v.precio_extra));
 }
 
 // Precio que le corresponde a ESTE cliente por ESTE producto. Devuelve { precio, moneda }.
@@ -90,7 +91,7 @@ const ANDREANI_API = process.env.ANDREANI_API || 'https://apis.andreani.com';
 async function andreaniToken() {
   const user = process.env.ANDREANI_USER, pass = process.env.ANDREANI_PASS;
   if (!user || !pass) return null;
-  const r = await fetch(`${ANDREANI_API}/login`, { headers: { authorization: 'Basic ' + Buffer.from(`${user}:${pass}`).toString('base64') } });
+  const r = await fetch(`${ANDREANI_API}/login`, { headers: { authorization: 'Basic ' + Buffer.from(`${user}:${pass}`).toString('base64') }, signal: AbortSignal.timeout(8000) });
   return r.headers.get('x-authorization-token');
 }
 const PROVEEDORES_ENVIO = [
@@ -98,6 +99,8 @@ const PROVEEDORES_ENVIO = [
     id: 'andreani',
     nombre: 'Andreani',
     configurado: () => !!(process.env.ANDREANI_USER && process.env.ANDREANI_PASS && (process.env.ANDREANI_CLIENTE || process.env.ANDREANI_NRO_CLIENTE)),
+    // El contrato es de la tienda 1: otras tiendas no cotizan con él (ANDREANI_TENANTS="1,5" para habilitar más)
+    habilitado: (tenantId) => String(process.env.ANDREANI_TENANTS || '1').split(',').map(x => x.trim()).includes(String(tenantId)),
     async cotizar({ cpOrigen, cpDestino, pesoKg, volumenCm3, valor }) {
       const token = await andreaniToken();
       if (!token) return [];
@@ -107,7 +110,7 @@ const PROVEEDORES_ENVIO = [
         sucursalOrigen: '', cpOrigen,
         bultos: [{ valorDeclarado: Math.max(1, Math.round(valor)), volumen: Math.max(1, Math.round(volumenCm3)), kilos: Math.max(0.1, pesoKg) }],
       };
-      const r = await fetch(`${ANDREANI_API}/v1/tarifas`, { method: 'POST', headers: { 'x-authorization-token': token, 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+      const r = await fetch(`${ANDREANI_API}/v1/tarifas`, { method: 'POST', headers: { 'x-authorization-token': token, 'Content-Type': 'application/json' }, body: JSON.stringify(body), signal: AbortSignal.timeout(10000) });
       if (!r.ok) return [];
       const d = await r.json();
       const total = num(d?.tarifaConIva?.total ?? d?.tarifaConIva ?? d?.total);
@@ -140,6 +143,17 @@ async function cotizacionDolar(db, tenantId) {
   return resp > 0 ? { valor: resp, fuente: 'respaldo' } : { valor: 0, fuente: 'sin_datos' };
 }
 
+// Descuento por medio de pago: config "descuento_<nombre del medio>" (ej. descuento_transferencia = 10).
+// Solo vale si el medio está activo para esa tienda (sección). Entre 0 y 100.
+function pctDescuentoPago(ctx, metodo, seccionId) {
+  const nombre = String(metodo || '').trim();
+  if (!nombre) return 0;
+  const activo = (ctx.metodos || []).some(m => m.nombre === nombre && (m.seccion_id == null || String(m.seccion_id) === String(seccionId)));
+  if (!activo) return 0;
+  const pct = parseFloat(String(ctx.config[`descuento_${nombre.toLowerCase().replace(/\s+/g, '_')}`] || '').trim());
+  return Number.isFinite(pct) && pct > 0 ? Math.min(pct, 100) : 0;
+}
+
 function createCheckout(pool) {
   // Todo lo que depende del cliente y de la tienda (una sola vez por cotización)
   async function contexto(db, tenantId, userId) {
@@ -147,8 +161,9 @@ function createCheckout(pool) {
       userId ? db.query('SELECT id, rol, permisos, lista_precio_id, es_revendedor, descuento_revendedor, mayorista, activo FROM usuarios WHERE id=$1 AND tenant_id=$2', [userId, tenantId]) : { rows: [] },
       db.query('SELECT * FROM promociones WHERE tenant_id=$1 AND activo=true AND (fecha_desde IS NULL OR fecha_desde<=CURRENT_DATE) AND (fecha_hasta IS NULL OR fecha_hasta>=CURRENT_DATE)', [tenantId]),
       db.query('SELECT id, nombre, slug, cp_origen, ignorar_stock, permitir_sin_stock, requiere_aprobacion FROM secciones WHERE tenant_id=$1', [tenantId]),
-      db.query("SELECT clave, valor FROM configuracion WHERE tenant_id=$1 AND (clave LIKE 'envio_gratis_desde_%' OR clave LIKE 'compra_minima_%' OR clave LIKE 'min_aplica_retiro_%')", [tenantId]),
+      db.query("SELECT clave, valor FROM configuracion WHERE tenant_id=$1 AND (clave LIKE 'envio_gratis_desde_%' OR clave LIKE 'compra_minima_%' OR clave LIKE 'min_aplica_retiro_%' OR clave LIKE 'descuento\\_%')", [tenantId]),
     ]);
+    const { rows: metodos } = await db.query('SELECT nombre, seccion_id FROM metodos_pago WHERE tenant_id=$1 AND activo=true', [tenantId]).catch(() => ({ rows: [] }));
     const user = u.rows[0] || null;
     let lista = null; const pf = {};
     if (user && user.lista_precio_id) {
@@ -164,7 +179,7 @@ function createCheckout(pool) {
     const esStaff = !!user && (user.rol === 'admin' || (user.rol === 'subadmin' && String(user.permisos || '').split(',').includes('pedidos')));
     // Tiendas con aprobación (mayorista): solo clientes autorizados o el equipo
     const accesoMayorista = !!user && user.activo !== false && (user.rol === 'admin' || user.rol === 'subadmin' || !!user.mayorista);
-    return { tenantId, user, lista, pf, promos: promos.rows, secciones, config, esStaff, accesoMayorista };
+    return { tenantId, user, lista, pf, promos: promos.rows, secciones, config, esStaff, accesoMayorista, metodos };
   }
 
   // Normaliza los ítems que manda la web y les pone el precio del servidor
@@ -250,7 +265,7 @@ function createCheckout(pool) {
       const pesoKg = fisicos.reduce((s, i) => s + (i.peso > 0 ? i.peso : 0.5) * i.cantidad, 0) || 0.5;
       const volumenCm3 = fisicos.reduce((s, i) => s + ((i.alto * i.ancho * i.largo) > 0 ? i.alto * i.ancho * i.largo : 1000) * i.cantidad, 0) || 1000;
       for (const prov of PROVEEDORES_ENVIO) {
-        if (!prov.configurado()) continue;
+        if (!prov.configurado() || (prov.habilitado && !prov.habilitado(ctx.tenantId))) continue;
         try {
           const cot = await prov.cotizar({ cpOrigen: sec.cp_origen || '1888', cpDestino: cpLimpio, pesoKg, volumenCm3, valor: subtotal });
           for (const c of cot) opciones.push({ id: c.id, nombre: c.nombre, descripcion: '', tiempo_estimado: c.tiempo_estimado || '', icono: 'truck', costo: gratisSeccion ? 0 : num(c.costo), costo_original: num(c.costo), gratis: gratisSeccion, proveedor: prov.id });
@@ -286,8 +301,8 @@ function createCheckout(pool) {
     if (num(c.monto_minimo) > 0 && subtotal < num(c.monto_minimo)) throw new CheckoutError(`El cupón pide una compra mínima de $${num(c.monto_minimo).toLocaleString('es-AR')}`);
     const baseDesc = (pids.length || c.categoria) ? elegibles.reduce((s, i) => s + i.precio_unitario * i.cantidad, 0) : subtotal;
     let descuento = 0, envioGratis = false;
-    if (c.tipo === 'porcentaje') descuento = Math.round(baseDesc * num(c.valor) / 100);
-    else if (c.tipo === 'monto_fijo') descuento = num(c.valor);
+    if (c.tipo === 'porcentaje') descuento = Math.round(baseDesc * Math.min(100, Math.max(0, num(c.valor))) / 100);
+    else if (c.tipo === 'monto_fijo') descuento = Math.max(0, num(c.valor));
     else if (c.tipo === 'envio_gratis') envioGratis = true;
     return { codigo: c.codigo, cupon_id: c.id, tipo: c.tipo, valor: num(c.valor), descuento: Math.min(round2(descuento), subtotal), envio_gratis: envioGratis, vence_at: c.vence_at || null, todas: c.origen === 'carrito' };
   }
@@ -304,8 +319,10 @@ function createCheckout(pool) {
     // Agrupar por la sección REAL de cada producto (la web puede mandar todo junto o separado)
     const todos = [];
     const envioElegido = {};
+    const metodoSec = {};
     for (const s of (Array.isArray(body?.secciones) ? body.secciones : [])) {
       for (const it of (s.items || [])) todos.push(it);
+      if (s.metodo_pago && s.seccion_id != null) metodoSec[String(s.seccion_id)] = String(s.metodo_pago).slice(0, 100);
       if (s.envio_id && s.seccion_id != null) envioElegido[String(s.seccion_id)] = String(s.envio_id);
       if (s.metodo_envio && s.seccion_id != null && !s.envio_id) envioElegido[`nombre:${s.seccion_id}`] = String(s.metodo_envio);
     }
@@ -325,11 +342,12 @@ function createCheckout(pool) {
       const subtotal = round2(ars.reduce((s, i) => s + i.precio_unitario * i.cantidad, 0));
       const subtotalUsdt = round2(items.filter(i => i.moneda !== 'ARS').reduce((s, i) => s + i.precio_unitario * i.cantidad, 0));
       const requiereEnvio = items.some(i => !i.es_digital);
+      const metodoPago = metodoSec[String(secId)] || (body?.metodo_pago ? String(body.metodo_pago).slice(0, 100) : '');
       // Cupón: se aplica a la primera tienda donde sea válido (el de carrito abandonado, a todo el carrito)
       let descuento = 0, cuponAplicado = null, envioGratisCupon = false;
       if (cuponInfo && subtotal > 0 && (!cuponInfo.ok || cuponInfo.todas)) {
         try {
-          const r = await evaluarCupon(db, ctx, cuponCodigo, { seccion_id: secId, items: ars, subtotal, metodo_pago: body?.metodo_pago, final: !opts.cotizacion });
+          const r = await evaluarCupon(db, ctx, cuponCodigo, { seccion_id: secId, items: ars, subtotal, metodo_pago: metodoPago, final: !opts.cotizacion });
           descuento = r.descuento; envioGratisCupon = r.envio_gratis; cuponAplicado = r.codigo;
           cuponInfo = { ...cuponInfo, ok: true, error: null, seccion_id: cuponInfo.ok ? cuponInfo.seccion_id : secId, codigo: r.codigo, descuento: round2((cuponInfo.ok ? num(cuponInfo.descuento) : 0) + r.descuento), tipo: r.tipo, vence_at: r.vence_at || null, todas: !!r.todas };
         } catch (e) { if (!cuponInfo.ok && !cuponInfo.error) cuponInfo.error = e.message; }
@@ -347,11 +365,20 @@ function createCheckout(pool) {
           costoEnvio = elegido ? elegido.costo : 0;
         }
       }
-      const total = round2(Math.max(0, subtotal - descuento) + costoEnvio);
+      const pctPago = pctDescuentoPago(ctx, metodoPago, secId);
+      let descuentoPago = 0;
+      if (pctPago > 0) {
+        const baseElegible = round2(ars.filter(i => !i._preventa).reduce((s, i) => s + i.precio_unitario * i.cantidad, 0));
+        const base = Math.max(0, Math.min(baseElegible, subtotal - descuento));
+        descuentoPago = Math.round(base * pctPago / 100);
+      }
+      const total = round2(Math.max(0, subtotal - descuento - descuentoPago) + costoEnvio);
       // Compra mínima en pesos o en dólares (en USD se cotiza al momento de cerrar el carrito)
       const minUsd = ctx.config[`compra_minima_moneda_${secId}`] === 'USD';
       const minBase = num(ctx.config[`compra_minima_${secId}`]);
+      const sinCotizacion = minUsd && minBase > 0 && !(usd && usd.valor > 0);
       const min = minUsd ? (usd && usd.valor > 0 ? Math.round(minBase * usd.valor) : 0) : minBase;
+      if (sinCotizacion && (entregaTipo === 'envio' || ctx.config[`min_aplica_retiro_${secId}`] === 'true')) errores.push({ seccion_id: secId, tipo: 'minimo', mensaje: `${sec.nombre}: no pudimos obtener la cotización del dólar para controlar la compra mínima. Probá de nuevo en unos minutos.` });
       const minAplica = min > 0 && (entregaTipo === 'envio' || ctx.config[`min_aplica_retiro_${secId}`] === 'true');
       const faltaMinimo = minAplica && subtotal < min ? round2(min - subtotal) : 0;
       if (faltaMinimo > 0) errores.push({ seccion_id: secId, tipo: 'minimo', mensaje: minUsd
@@ -362,6 +389,7 @@ function createCheckout(pool) {
         seccion_id: secId, nombre: sec.nombre, slug: sec.slug,
         items: items.map(({ _prod, _var, peso, alto, ancho, largo, ...rest }) => rest),
         subtotal, subtotal_usdt: subtotalUsdt, descuento, cupon: cuponAplicado,
+        metodo_pago: metodoPago || null, descuento_pago: descuentoPago, descuento_pago_pct: descuentoPago > 0 ? pctPago : 0,
         requiere_envio: requiereEnvio, envio: { ...envio, elegido, costo: costoEnvio, a_cotizar: !!(elegido && elegido.a_cotizar), a_coordinar: entregaTipo === 'envio' && requiereEnvio && !envio.opciones.length },
         total, compra_minima: min, compra_minima_usd: minUsd ? minBase : null, falta_minimo: faltaMinimo,
         _items: items,
@@ -371,6 +399,7 @@ function createCheckout(pool) {
     const totales = {
       subtotal: round2(resultado.reduce((s, r) => s + r.subtotal, 0)),
       descuento: round2(resultado.reduce((s, r) => s + r.descuento, 0)),
+      descuento_pago: round2(resultado.reduce((s, r) => s + r.descuento_pago, 0)),
       envio: round2(resultado.reduce((s, r) => s + r.envio.costo, 0)),
       envio_a_cotizar: resultado.some(r => r.envio.a_cotizar),
       total: round2(resultado.reduce((s, r) => s + r.total, 0)),

@@ -3024,24 +3024,34 @@ app.get('/api/pedidos/:id', auth(), async (req,res)=>{ try{ const {rows}=await p
 // ═══ PEDIDOS ═══
 // Helpers compartidos: stock (siempre filtrado por tienda) e inserción de ítems.
 const TXT = (v, max) => String(v == null ? '' : v).slice(0, max);
+const round2srv = (n) => Math.round((Number(n) || 0) * 100) / 100;
 async function validarStockItems(client, tenantId, items){
+  // Se suma la cantidad por producto (dos líneas del mismo producto se controlan juntas) y las filas se bloquean
+  // hasta el final de la compra (FOR UPDATE, en orden de id): dos compras al mismo tiempo ya no se llevan la última unidad.
+  const porProd=new Map();
   for(const item of items){
     const pid=parseInt(item.producto_id,10); if(!pid) continue;
-    const {rows:prod}=await client.query('SELECT stock, permitir_sin_stock, es_digital, seccion_id, es_preventa, preventa_cupo, preventa_reservado FROM productos WHERE id=$1 AND tenant_id=$2', [pid, tenantId]);
-    if(!prod[0]) continue;
-    const cant=Number(item.cantidad)||1;
-    if(item.variante_id){
-      // Variantes: las digitales/licencias suelen tener stock 0 y no deben frenar la venta
+    if(item.variante_id) continue; // Variantes: las digitales/licencias suelen tener stock 0 y no deben frenar la venta
+    const cant=Math.max(1, parseInt(item.cantidad,10)||1);
+    const e=porProd.get(pid)||{cant:0, nombre:item.nombre_producto||'', preventa:false};
+    e.cant+=cant; if(item._preventa) e.preventa=true; porProd.set(pid, e);
+  }
+  const ids=[...porProd.keys()].sort((x,y)=>x-y);
+  if(!ids.length) return;
+  const {rows:prods}=await client.query('SELECT id, nombre, stock, permitir_sin_stock, es_digital, seccion_id, es_preventa, preventa_cupo, preventa_reservado FROM productos WHERE id = ANY($1::int[]) AND tenant_id=$2 ORDER BY id FOR UPDATE', [ids, tenantId]);
+  const secIds=[...new Set(prods.map(r=>r.seccion_id).filter(Boolean))];
+  const {rows:secs}=secIds.length ? await client.query('SELECT id, ignorar_stock, permitir_sin_stock FROM secciones WHERE id = ANY($1::int[]) AND tenant_id=$2', [secIds, tenantId]) : {rows:[]};
+  const secMap={}; secs.forEach(x=>{ secMap[x.id]=x; });
+  for(const pr of prods){
+    const e=porProd.get(pr.id); const nombre=e.nombre||pr.nombre||'';
+    if(e.preventa || pr.es_preventa){
+      const cupo=Number(pr.preventa_cupo)||0, reservado=Number(pr.preventa_reservado)||0;
+      if(cupo>0 && reservado+e.cant>cupo) throw new CheckoutError(`Preventa agotada: ${nombre} (quedan ${Math.max(0,cupo-reservado)} de ${cupo})`);
       continue;
     }
-    if(item._preventa || prod[0].es_preventa){
-      const cupo=Number(prod[0].preventa_cupo)||0, reservado=Number(prod[0].preventa_reservado)||0;
-      if(cupo>0 && reservado+cant>cupo) throw new CheckoutError(`Preventa agotada: ${item.nombre_producto||''} (quedan ${Math.max(0,cupo-reservado)} de ${cupo})`);
-      continue;
-    }
-    const {rows:sec}=await client.query('SELECT ignorar_stock, permitir_sin_stock FROM secciones WHERE id=$1 AND tenant_id=$2', [prod[0].seccion_id, tenantId]);
-    const puedeSinStock = prod[0].permitir_sin_stock || prod[0].es_digital || sec[0]?.permitir_sin_stock || sec[0]?.ignorar_stock;
-    if(!puedeSinStock && Number(prod[0].stock) < cant) throw new CheckoutError(`Sin stock suficiente: ${item.nombre_producto||''} (disponible: ${prod[0].stock})`);
+    const sec=secMap[pr.seccion_id]||{};
+    const puedeSinStock = pr.permitir_sin_stock || pr.es_digital || sec.permitir_sin_stock || sec.ignorar_stock;
+    if(!puedeSinStock && Number(pr.stock) < e.cant) throw new CheckoutError(`Sin stock suficiente: ${nombre} (disponible: ${Math.max(0, Number(pr.stock)||0)})`);
   }
 }
 async function insertarItems(client, tenantId, pedidoId, items, descontarStock){
@@ -3049,7 +3059,7 @@ async function insertarItems(client, tenantId, pedidoId, items, descontarStock){
   for(const item of items){
     // Un producto de otra tienda queda como línea de texto (sin id): no toca su stock ni sus datos
     const pid0=parseInt(item.producto_id,10)||null; const pid=pid0 && propios.has(pid0) ? pid0 : null;
-    const cant=Number(item.cantidad)||1;
+    const cant=Math.max(1, parseInt(item.cantidad,10)||1); // nunca negativa ni con decimales (una cantidad negativa sumaba stock)
     await client.query("INSERT INTO pedido_items (tenant_id,pedido_id,producto_id,categoria,modelo,nombre_producto,cantidad,precio_unitario,precio_base,variante_id,variante_combinacion,imagen,costo_unitario) VALUES ($9,$1,$2,$3,$4,$5,$6,$7,$8,$10,$11,COALESCE((SELECT imagen FROM productos WHERE id=$2 AND tenant_id=$9),''),(SELECT NULLIF(precio_original,0) FROM productos WHERE id=$2 AND tenant_id=$9))",
       [pedidoId, pid, TXT(item.categoria,200), TXT(item.modelo,200), TXT(item.nombre_producto,300), cant, Number(item.precio_unitario)||0, Number(item.precio_base)||0, tenantId, item.variante_id||null, TXT(item.variante_label||item.variante_combinacion,500)]);
     if(!descontarStock || !pid) continue;
@@ -3067,7 +3077,8 @@ async function insertarItems(client, tenantId, pedidoId, items, descontarStock){
   }
 }
 async function etiquetarMoneda(client, pedidoId){
-  await client.query(`UPDATE pedidos SET moneda = CASE WHEN EXISTS(SELECT 1 FROM pedido_items pi LEFT JOIN productos pr ON pr.id=pi.producto_id AND pr.tenant_id=(SELECT tenant_id FROM pedidos WHERE id=pi.pedido_id) LEFT JOIN variantes v ON v.id=pi.variante_id WHERE pi.pedido_id=$1 AND COALESCE(v.moneda, pr.moneda,'ARS')='USDT') THEN 'USDT' ELSE 'ARS' END WHERE id=$1`, [pedidoId]).catch(()=>{});
+  // Sin .catch: corre dentro de la transacción del pedido; si fallara, tiene que fallar todo (no responder OK sin guardar)
+  await client.query(`UPDATE pedidos SET moneda = CASE WHEN EXISTS(SELECT 1 FROM pedido_items pi LEFT JOIN productos pr ON pr.id=pi.producto_id AND pr.tenant_id=(SELECT tenant_id FROM pedidos WHERE id=pi.pedido_id) LEFT JOIN variantes v ON v.id=pi.variante_id WHERE pi.pedido_id=$1 AND COALESCE(v.moneda, pr.moneda,'ARS')='USDT') THEN 'USDT' ELSE 'ARS' END WHERE id=$1`, [pedidoId]);
 }
 // Lee {tipo, cp} de la entrega: del body nuevo o, si la web es vieja, del JSON datos_envio
 function leerEntrega(body, peds){
@@ -3123,17 +3134,18 @@ app.post('/api/pedidos', auth(), async (req,res)=>{
       pedido=rows[0];
       await insertarItems(client, req.tenantId, pedido.id, items, !esPresupuesto);
       await etiquetarMoneda(client, pedido.id);
-      if(b.cupon_codigo) await client.query("UPDATE cupones SET usos_actuales = usos_actuales + 1 WHERE codigo=$1 AND tenant_id=$2", [b.cupon_codigo, req.tenantId]).catch(()=>{});
+      if(b.cupon_codigo) await client.query("UPDATE cupones SET usos_actuales = COALESCE(usos_actuales,0) + 1 WHERE UPPER(codigo)=UPPER($1) AND tenant_id=$2", [String(b.cupon_codigo), req.tenantId]);
       // Cuenta corriente automática: SOLO si el pedido se marca como "debe" (fiado)
       const ep=String(b.estado_pago||'impago');
       if(pedidoUserId && ep==='debe'){
         const deuda = Number(b.total||0) - (Number(b.sena)||0);
-        if(deuda>0) await client.query('INSERT INTO cuenta_corriente (tenant_id,usuario_id,tipo,monto,concepto,pedido_id) VALUES ($6,$1,$2,$3,$4,$5)', [pedidoUserId, 'cargo', deuda, `Pedido #${String(pedido.id).padStart(4,'0')}`, pedido.id, req.tenantId]).catch(()=>{});
+        if(deuda>0) await client.query('INSERT INTO cuenta_corriente (tenant_id,usuario_id,tipo,monto,concepto,pedido_id) VALUES ($6,$1,$2,$3,$4,$5)', [pedidoUserId, 'cargo', deuda, `Pedido #${String(pedido.id).padStart(4,'0')}`, pedido.id, req.tenantId]);
       }
       // Pagos iniciales (venta de mostrador con pagos mixtos)
       if(Array.isArray(b.pagos)){
         for(const pg of b.pagos){
           const rec=Number(pg.recibido)||0, cta=Number(pg.cuenta_como)||0;
+          if(rec<0 || cta<0) throw new CheckoutError('Los montos de los pagos no pueden ser negativos');
           if(rec>0 || cta>0) await client.query('INSERT INTO pedido_pagos (tenant_id,pedido_id,metodo,monto,recibido,cuenta_como,ajuste_pct,ajuste_monto,nota) VALUES ($9,$1,$2,$3,$4,$5,$6,$7,$8)', [pedido.id, TXT(pg.metodo,100), rec, rec, cta, Number(pg.ajuste_pct)||0, cta-rec, TXT(pg.nota,500), req.tenantId]);
         }
       }
@@ -3158,7 +3170,7 @@ app.post('/api/pedidos', auth(), async (req,res)=>{
 // Compra desde la tienda: crea un pedido por cada tienda (sección) del carrito.
 // Precios, cupón, envío y totales los calcula el servidor; lo que mande el navegador no cuenta.
 app.post('/api/pedidos/multi', auth(), async (req,res)=>{
-  const client=await pool.connect();
+  let client=null;
   try{
     const b=req.body||{};
     const peds=Array.isArray(b.pedidos)?b.pedidos:[];
@@ -3166,25 +3178,29 @@ app.post('/api/pedidos/multi', auth(), async (req,res)=>{
     const staff=await esStaffPedidos(req);
     const entrega=leerEntrega(b, peds);
     const cuponCodigo = b.cupon !== undefined ? b.cupon : ((peds.find(p=>p.cupon_codigo)||{}).cupon_codigo || '');
-    await client.query('BEGIN');
-    const cot=await checkout.cotizarCarrito(client, req.tenantId, req.user.id, {
+    // El cálculo (puede consultar Andreani y el dólar) usa el pool: no retiene una conexión mientras espera
+    const cot=await checkout.cotizarCarrito(pool, req.tenantId, req.user.id, {
       entrega, cupon: cuponCodigo, metodo_pago: peds[0].metodo_pago,
-      secciones: peds.map(p=>({ seccion_id:p.seccion_id, items:p.items, envio_id:p.envio_id, metodo_envio:p.metodo_envio })),
+      secciones: peds.map(p=>({ seccion_id:p.seccion_id, items:p.items, envio_id:p.envio_id, metodo_envio:p.metodo_envio, metodo_pago:p.metodo_pago })),
     });
     if(!cot.secciones.length) throw new CheckoutError('El carrito está vacío');
     if(cot.errores.length) throw new CheckoutError(cot.errores[0].mensaje);
     if(cuponCodigo && cot.cupon && !cot.cupon.ok) throw new CheckoutError(cot.cupon.error || 'Cupón no válido');
+    client=await pool.connect();
+    await client.query('BEGIN');
+    // Stock de todo el carrito junto (bloquea los productos en orden de id: sin cruces con otras compras o ediciones)
+    await validarStockItems(client, req.tenantId, cot.secciones.flatMap(x=>x._items));
     const creados=[];
     for(const s of cot.secciones){
       const ped=peds.find(p=>String(p.seccion_id)===String(s.seccion_id)) || peds[0];
-      await validarStockItems(client, req.tenantId, s._items);
       const soloUsdt = s.subtotal===0 && s.subtotal_usdt>0;
       let notas=TXT(ped.notas,4000);
       if(s._items.some(i=>i._preventa)) notas=`${notas} [RESERVA/PREVENTA — requiere seña]`.trim();
       if(!soloUsdt && s.subtotal_usdt>0) notas=`${notas} [Además: USDT ${s.subtotal_usdt} a pagar aparte]`.trim();
+      if(s.descuento_pago>0) notas=`${notas} [Descuento ${s.descuento_pago_pct}% por pagar con ${s.metodo_pago}: -$${Number(s.descuento_pago).toLocaleString('es-AR')}]`.trim();
       const metodoEnvio = (entrega.tipo==='retiro' ? 'Retiro en el local' : (s.envio.elegido ? (s.envio.elegido.a_cotizar ? `${s.envio.elegido.nombre} (envío a cotizar)` : s.envio.elegido.nombre) : (s.requiere_envio ? 'A coordinar' : ''))).slice(0,100);
       const {rows}=await client.query('INSERT INTO pedidos (tenant_id,usuario_id,seccion_id,tipo,metodo_pago,notas,cupon_codigo,subtotal,descuento,total,datos_envio,costo_envio,metodo_envio,cp_destino,is_test,datos_facturacion,estado_pago,es_reserva) VALUES ($17,$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$18) RETURNING *',
-        [req.user.id, s.seccion_id, 'pedido', TXT(ped.metodo_pago,100), notas, s.cupon||'', soloUsdt ? s.subtotal_usdt : s.subtotal, s.descuento, soloUsdt ? s.subtotal_usdt : s.total, TXT(ped.datos_envio,8000), s.envio.costo, metodoEnvio, TXT(entrega.cp,20), staff ? !!b.is_test : false, TXT(ped.datos_facturacion,4000), 'impago', req.tenantId, s._items.some(i=>i._preventa)]);
+        [req.user.id, s.seccion_id, 'pedido', TXT(s.metodo_pago||ped.metodo_pago,100), notas, s.cupon||'', soloUsdt ? s.subtotal_usdt : s.subtotal, round2srv((s.descuento||0)+(s.descuento_pago||0)), soloUsdt ? s.subtotal_usdt : s.total, TXT(ped.datos_envio,8000), s.envio.costo, metodoEnvio, TXT(entrega.cp,20), staff ? !!b.is_test : false, TXT(ped.datos_facturacion,4000), 'impago', req.tenantId, s._items.some(i=>i._preventa)]);
       await insertarItems(client, req.tenantId, rows[0].id, s._items, true);
       await etiquetarMoneda(client, rows[0].id);
       const {rows:fin}=await client.query('SELECT * FROM pedidos WHERE id=$1', [rows[0].id]);
@@ -3200,8 +3216,8 @@ app.post('/api/pedidos/multi', auth(), async (req,res)=>{
     notificarVentaAdmin(creados, req.user).catch(()=>{});
     emailCompraCliente(req.tenantId, creados, req.user).catch(()=>{});
     res.json({ok:true, pedidos: creados, totales: cot.totales});
-  }catch(e){ await client.query('ROLLBACK').catch(()=>{}); errorPedido(res, e); }
-  finally{ client.release(); }
+  }catch(e){ if(client) await client.query('ROLLBACK').catch(()=>{}); errorPedido(res, e); }
+  finally{ if(client) client.release(); }
 });
 
 // Carrito abandonado → recuperado cuando el cliente compra. Si se lo contactó, cuenta como recuperado por contacto.
@@ -3226,6 +3242,8 @@ async function recalcularEstadoPago(pedidoId){
   else if(saldado>=total-0.01) estado='pagado';
   else estado='senado';
   await pool.query('UPDATE pedidos SET estado_pago=$1, sena=$2, updated_at=NOW() WHERE id=$3',[estado, saldado>=total?0:saldado, pedidoId]);
+  // Pagado completo: el cargo automático de "debe" de este pedido ya no corresponde
+  if(estado==='pagado') await pool.query("DELETE FROM cuenta_corriente WHERE pedido_id=$1 AND tipo='cargo' AND concepto LIKE 'Pedido #%'", [pedidoId]).catch(()=>{});
   return {estado, saldado, total, recibido:Number(pg[0].recibido)||0};
 }
 app.get('/api/pedidos/:id/pagos', auth(), async (req,res)=>{
@@ -3246,6 +3264,7 @@ app.post('/api/pedidos/:id/pagos', authPerm('pedidos'), async (req,res)=>{
     const {metodo,recibido,cuenta_como,ajuste_pct,nota}=req.body;
     const rec=Number(recibido)||0, cta=Number(cuenta_como)||0;
     if(!(rec>0) && !(cta>0)) return res.status(400).json({error:'El monto debe ser mayor a 0'});
+    if(rec<0 || cta<0) return res.status(400).json({error:'Los montos no pueden ser negativos'});
     const ajusteMonto=cta-rec;
     const {rows:own}=await pool.query('SELECT 1 FROM pedidos WHERE id=$1 AND tenant_id=$2',[req.params.id, req.tenantId]);
     if(!own[0]) return res.status(404).json({error:'No encontrado'});
@@ -3265,134 +3284,171 @@ app.delete('/api/pedidos/:id/pagos/:pagoId', authPerm('pedidos'), async (req,res
   }catch(e){ res.status(500).json({error:e.message}); }
 });
 
-app.put('/api/pedidos/:id', authPerm('pedidos'), async (req,res)=>{  try{
-    const p=req.body; const sets=[]; const params=[]; let pi=1;
-    // Capturar estado + tipo + items ANTES de cambios
-    const {rows:oldItemsRows}=await pool.query('SELECT producto_id, cantidad FROM pedido_items WHERE pedido_id=$1', [req.params.id]);
-    const oldMap={}; for(const it of oldItemsRows){ if(it.producto_id) oldMap[it.producto_id]=(oldMap[it.producto_id]||0)+(it.cantidad||0); }
-    const {rows:oldPedRows}=await pool.query('SELECT estado, tipo, estado_pago, usuario_id, total, sena FROM pedidos WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]);
-    if(!oldPedRows[0]) return res.status(404).json({error:'No encontrado'});
-    const oldEstado=String((oldPedRows[0]||{}).estado||'').toLowerCase();
-    const oldTipo=String((oldPedRows[0]||{}).tipo||'');
-    const oldEstadoPago=String((oldPedRows[0]||{}).estado_pago||'');
-    const pedUsuarioId=(oldPedRows[0]||{}).usuario_id;
+// Editar un pedido (estado, pago, ítems). Todo en UNA transacción y con el pedido bloqueado:
+// un doble clic en "Cancelar" ya no devuelve el stock dos veces, y si algo falla no queda a medias.
+app.put('/api/pedidos/:id', authPerm('pedidos'), async (req,res)=>{
+  const p=req.body||{};
+  if(!/^\d{1,9}$/.test(String(req.params.id))) return res.status(404).json({error:'No encontrado'});
+  let client;
+  const preventaTocados=new Set(); let historial=null;
+  try{
+    client=await pool.connect();
+    await client.query('BEGIN');
+    const {rows:oldPedRows}=await client.query('SELECT estado, tipo, estado_pago, usuario_id, total, sena, descuento, costo_envio, metodo_pago FROM pedidos WHERE id=$1 AND tenant_id=$2 FOR UPDATE', [req.params.id, req.tenantId]);
+    if(!oldPedRows[0]){ await client.query('ROLLBACK'); return res.status(404).json({error:'No encontrado'}); }
+    const old=oldPedRows[0];
+    // Ítems ANTES del cambio (con la variante: el stock de una variante es de la variante, no del producto)
+    const {rows:oldItemsRows}=await client.query('SELECT producto_id, variante_id, cantidad FROM pedido_items WHERE pedido_id=$1', [req.params.id]);
+    const claveStock=(pid,vid)=> vid ? `v${vid}` : `p${pid}`;
+    const sumar=(map, pid, vid, q)=>{ if(!pid && !vid) return; const k=claveStock(pid,vid); if(!map[k]) map[k]={pid:pid?parseInt(pid,10):null, vid:vid?parseInt(vid,10):null, q:0}; map[k].q+=q; };
+    const oldMap={}; for(const it of oldItemsRows) sumar(oldMap, it.producto_id, it.variante_id, Number(it.cantidad)||0);
+    const oldEstado=String(old.estado||'').toLowerCase();
+    const oldTipo=String(old.tipo||'');
+    const oldEstadoPago=String(old.estado_pago||'');
+    const pedUsuarioId=old.usuario_id;
+    const sets=[]; const params=[]; let pi=1;
     const fields=['estado','tipo','metodo_pago','notas','total','subtotal','descuento','datos_envio','usuario_id','notificar_wa','is_test','costo_envio','metodo_envio','cp_destino','estado_pago','sena','codigo_seguimiento'];
     for(const f of fields){ if(p[f]!==undefined){ sets.push(`${f}=$${pi++}`); params.push(p[f]); } }
     sets.push(`updated_at=NOW()`);
-    if(sets.length<=1) return res.json({ok:true});
-    params.push(req.params.id);
-    params.push(req.tenantId); await pool.query(`UPDATE pedidos SET ${sets.join(',')} WHERE id=$${pi} AND tenant_id=$${pi+1}`, params);
+    if(sets.length<=1){ await client.query('ROLLBACK'); return res.json({ok:true}); }
+    params.push(req.params.id); params.push(req.tenantId);
+    await client.query(`UPDATE pedidos SET ${sets.join(',')} WHERE id=$${pi} AND tenant_id=$${pi+1}`, params);
+    // Total vigente del pedido (ya con el cambio): es lo que se cobra (incluye descuento y envío)
+    const {rows:act}=await client.query('SELECT total, sena, metodo_pago FROM pedidos WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]);
+    const totalPedido=Number(act[0]?.total)||0;
 
-    // ── CUENTA CORRIENTE automática al cambiar estado de pago ──
+    // ── CUENTA CORRIENTE y CAJA al cambiar el estado de pago ──
     const nuevoEstadoPago = (p.estado_pago!==undefined) ? String(p.estado_pago) : oldEstadoPago;
-    // (antes esto solo corría si el pedido tenía cliente asignado, y usaba una conexión inexistente:
-    //  marcar "pagado" no registraba el cobro en la caja y marcar "debe" daba error)
     if(nuevoEstadoPago !== oldEstadoPago){
-      // ── HISTORIAL: registrar quién cambió el estado y cuándo ──
-      try {
-        const labels = { impago:'Impago', senado:'Señado', pagado:'Pagado', debe:'Debe', pendiente:'Impago' };
-        const de = labels[oldEstadoPago] || oldEstadoPago || 'Impago';
-        const a = labels[nuevoEstadoPago] || nuevoEstadoPago;
-        const rolLabel = req.user?.rol === 'admin' ? 'dueño' : (req.user?.rol === 'subadmin' ? 'empleado' : (req.user?.rol || ''));
-        const quien = (req.user?.usuario || 'sistema') + (rolLabel ? ` (${rolLabel})` : '');
-        await pool.query(
-          'INSERT INTO pedido_historial (tenant_id,pedido_id,tipo,detalle,usuario_id,usuario_nombre) VALUES ($1,$2,$3,$4,$5,$6)',
-          [req.tenantId, req.params.id, 'estado_pago', `Estado de pago: ${de} → ${a}`, req.user?.id || null, quien]
-        );
-      } catch(e){}
-      // ── AUTO-PAGO: si pasa a "pagado", registrar un pago por el total (si no hay pagos ya) ──
-      if(nuevoEstadoPago==='pagado'){
-        try {
-          const {rows:pagosYa}=await pool.query('SELECT COALESCE(SUM(cuenta_como),0) as saldado FROM pedido_pagos WHERE pedido_id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]);
-          const yaSaldado=Number(pagosYa[0]?.saldado||0);
-          const {rows:itPed}=await pool.query('SELECT precio_unitario, cantidad FROM pedido_items WHERE pedido_id=$1 AND tenant_id=$2',[req.params.id, req.tenantId]);
-          const totItems=itPed.reduce((a,it)=>a+Number(it.precio_unitario||0)*Number(it.cantidad||1),0);
-          const totalPed=totItems>0 ? (totItems - Number((oldPedRows[0]||{}).descuento||0) + Number((oldPedRows[0]||{}).costo_envio||0)) : ((p.total!==undefined)?Number(p.total):Number((oldPedRows[0]||{}).total||0));
-          let falta=totalPed-yaSaldado;
-          if(falta>totalPed) falta=totalPed; // nunca registrar un pago mayor al total del pedido
-          if(falta>0.01 && totalPed>0){
-            await pool.query(
-              'INSERT INTO pedido_pagos (tenant_id,pedido_id,metodo,monto,recibido,cuenta_como,ajuste_pct,ajuste_monto,nota) VALUES ($1,$2,$3,$4,$5,$6,0,0,$7)',
-              [req.tenantId, req.params.id, (p.metodo_pago||(oldPedRows[0]||{}).metodo_pago||'Efectivo'), falta, falta, falta, 'Marcado como pagado']
-            ).catch(e=>console.log('[auto-pago]', e.message));
-            await pool.query('UPDATE pedidos SET sena=0 WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]).catch(()=>{});
-          }
-        } catch(e){ console.log('[auto-pago]', e.message); }
+      const labels = { impago:'Impago', senado:'Señado', pagado:'Pagado', debe:'Debe', pendiente:'Impago' };
+      const rolLabel = req._rol === 'admin' ? 'dueño' : (req._rol === 'subadmin' ? 'empleado' : (req._rol || ''));
+      historial = { detalle:`Estado de pago: ${labels[oldEstadoPago] || oldEstadoPago || 'Impago'} → ${labels[nuevoEstadoPago] || nuevoEstadoPago}`, quien:(req.user?.usuario || 'sistema') + (rolLabel ? ` (${rolLabel})` : '') };
+      // Pasa a "pagado": registrar un pago por lo que falte (con el total real y el medio de pago del pedido)
+      if(nuevoEstadoPago==='pagado' && totalPedido>0){
+        const {rows:pagosYa}=await client.query('SELECT COALESCE(SUM(cuenta_como),0) as saldado FROM pedido_pagos WHERE pedido_id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]);
+        const falta=Math.min(totalPedido, totalPedido-Number(pagosYa[0]?.saldado||0));
+        if(falta>0.01){
+          await client.query('INSERT INTO pedido_pagos (tenant_id,pedido_id,metodo,monto,recibido,cuenta_como,ajuste_pct,ajuste_monto,nota) VALUES ($1,$2,$3,$4,$5,$6,0,0,$7)',
+            [req.tenantId, req.params.id, String(act[0]?.metodo_pago||old.metodo_pago||'Efectivo').slice(0,100), falta, falta, falta, 'Marcado como pagado']);
+          await client.query('UPDATE pedidos SET sena=0 WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]);
+        }
       }
       if(pedUsuarioId && nuevoEstadoPago==='debe' && oldEstadoPago!=='debe'){
-        // Pasó a "debe" (fiado): registrar cargo si no existe ya para este pedido
-        const {rows:ya}=await pool.query("SELECT id FROM cuenta_corriente WHERE pedido_id=$1 AND tipo='cargo' AND tenant_id=$2", [req.params.id, req.tenantId]);
-        if(!ya.length){
-          const {rows:itPed}=await pool.query('SELECT precio_unitario, cantidad FROM pedido_items WHERE pedido_id=$1 AND tenant_id=$2',[req.params.id, req.tenantId]);
-          const totItems=itPed.reduce((a,it)=>a+Number(it.precio_unitario||0)*Number(it.cantidad||1),0);
-          const totalPed=totItems>0 ? (totItems - Number((oldPedRows[0]||{}).descuento||0) + Number((oldPedRows[0]||{}).costo_envio||0)) : ((p.total!==undefined)?Number(p.total):Number((oldPedRows[0]||{}).total||0));
-          const senaPed=(p.sena!==undefined)?Number(p.sena):Number((oldPedRows[0]||{}).sena||0);
-          const deuda=totalPed-senaPed;
-          if(deuda>0) await pool.query('INSERT INTO cuenta_corriente (tenant_id,usuario_id,tipo,monto,concepto,pedido_id) VALUES ($6,$1,$2,$3,$4,$5)', [pedUsuarioId,'cargo',deuda,`Pedido #${String(req.params.id).padStart(4,'0')}`,req.params.id, req.tenantId]).catch(()=>{});
-        }
+        // Pasó a "debe" (fiado): registrar el cargo (una sola vez por pedido)
+        const {rows:ya}=await client.query("SELECT id FROM cuenta_corriente WHERE pedido_id=$1 AND tipo='cargo' AND tenant_id=$2", [req.params.id, req.tenantId]);
+        const deuda=totalPedido-(Number(act[0]?.sena)||0);
+        if(!ya.length && deuda>0) await client.query('INSERT INTO cuenta_corriente (tenant_id,usuario_id,tipo,monto,concepto,pedido_id) VALUES ($6,$1,$2,$3,$4,$5)', [pedUsuarioId,'cargo',deuda,`Pedido #${String(req.params.id).padStart(4,'0')}`,req.params.id, req.tenantId]);
       } else if(oldEstadoPago==='debe' && nuevoEstadoPago!=='debe'){
         // Salió de "debe" (se pagó): quitar el cargo automático de este pedido
-        await pool.query("DELETE FROM cuenta_corriente WHERE pedido_id=$1 AND tipo='cargo' AND tenant_id=$2", [req.params.id, req.tenantId]).catch(()=>{});
+        await client.query("DELETE FROM cuenta_corriente WHERE pedido_id=$1 AND tipo='cargo' AND tenant_id=$2", [req.params.id, req.tenantId]);
       }
     }
-    if(p.items){
-      // Capturar productos afectados (viejos + nuevos) para recalcular preventa
-      const {rows:viejos}=await pool.query('SELECT DISTINCT producto_id FROM pedido_items WHERE pedido_id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]);
-      const {rows:costosViejos}=await pool.query('SELECT producto_id, MAX(costo_unitario) AS c FROM pedido_items WHERE pedido_id=$1 AND tenant_id=$2 AND costo_unitario IS NOT NULL GROUP BY producto_id', [req.params.id, req.tenantId]);
+
+    // ── ÍTEMS editados ──
+    let nuevosItems=null;
+    if(Array.isArray(p.items)){
+      const {rows:costosViejos}=await client.query('SELECT producto_id, MAX(costo_unitario) AS c FROM pedido_items WHERE pedido_id=$1 AND costo_unitario IS NOT NULL GROUP BY producto_id', [req.params.id]);
       const costoGuardado={}; costosViejos.forEach(r=>{ if(r.producto_id) costoGuardado[r.producto_id]=r.c; });
-      await pool.query('DELETE FROM pedido_items WHERE pedido_id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]);
-      // tenant_id explícito (antes quedaba en 1 por defecto y en otras tiendas el pedido editado se quedaba sin productos) + foto del producto
+      for(const it of oldItemsRows) if(it.producto_id) preventaTocados.add(it.producto_id);
+      await client.query('DELETE FROM pedido_items WHERE pedido_id=$1', [req.params.id]);
       // Solo productos de esta tienda: uno ajeno queda como línea de texto y no toca su stock
-      const propios=await idsProductosDeTienda(pool, req.tenantId, p.items.map(it=>it.producto_id||it.id));
-      p.items=p.items.map(it=>{ const id=parseInt(it.producto_id||it.id,10); return propios.has(id) ? it : { ...it, producto_id:null, id:null }; });
-      for(const item of p.items){ const pidI=item.producto_id||item.id||null; await pool.query("INSERT INTO pedido_items (tenant_id,pedido_id,producto_id,categoria,modelo,nombre_producto,cantidad,precio_unitario,precio_base,variante_id,variante_combinacion,imagen,costo_unitario) VALUES ($11,$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,COALESCE((SELECT imagen FROM productos WHERE id=$2 AND tenant_id=$11),''),COALESCE($12::numeric,(SELECT NULLIF(precio_original,0) FROM productos WHERE id=$2 AND tenant_id=$11)))", [req.params.id, pidI, item.categoria||'', item.modelo||'', item.nombre_producto||`${item.categoria} - ${item.modelo}`, item.cantidad||item.qty||1, item.precio_unitario||0, item.precio_base||0, item.variante_id||null, item.variante_label||item.variante_combinacion||'', req.tenantId, (pidI && costoGuardado[pidI]!=null) ? costoGuardado[pidI] : null]); }
-      // Recalcular reservado de preventa para todos los productos tocados
-      const afectados=new Set([...viejos.map(v=>v.producto_id), ...p.items.map(it=>it.producto_id||it.id)].filter(Boolean));
-      for(const pid of afectados) await recalcReservado(pid, req.tenantId);
+      const propios=await idsProductosDeTienda(client, req.tenantId, p.items.map(it=>it.producto_id||it.id));
+      nuevosItems=p.items.map(it=>{ const id=parseInt(it.producto_id||it.id,10); return propios.has(id) ? it : { ...it, producto_id:null, id:null, variante_id:null }; });
+      for(const item of nuevosItems){
+        const pidI=parseInt(item.producto_id||item.id,10)||null;
+        const cant=Math.max(1, parseInt(item.cantidad||item.qty,10)||1); // nunca negativa (sumaba stock)
+        await client.query("INSERT INTO pedido_items (tenant_id,pedido_id,producto_id,categoria,modelo,nombre_producto,cantidad,precio_unitario,precio_base,variante_id,variante_combinacion,imagen,costo_unitario) VALUES ($11,$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,COALESCE((SELECT imagen FROM productos WHERE id=$2 AND tenant_id=$11),''),COALESCE($12::numeric,(SELECT NULLIF(precio_original,0) FROM productos WHERE id=$2 AND tenant_id=$11)))",
+          [req.params.id, pidI, item.categoria||'', item.modelo||'', item.nombre_producto||`${item.categoria} - ${item.modelo}`, cant, item.precio_unitario||0, item.precio_base||0, item.variante_id||null, item.variante_label||item.variante_combinacion||'', req.tenantId, (pidI && costoGuardado[pidI]!=null) ? costoGuardado[pidI] : null]);
+        item._cant=cant; item._pid=pidI;
+        if(pidI) preventaTocados.add(pidI);
+      }
     }
 
     // ── RECONCILIACIÓN DE STOCK ──
-    // Regla: el stock SOLO lo afectan PEDIDOS reales activos (no presupuestos, no cancelados).
-    // "afectaStock" = es pedido Y no está cancelado. Comparamos estado ANTES vs DESPUÉS.
+    // El stock SOLO lo afectan PEDIDOS reales activos (no presupuestos, no cancelados). Se compara antes vs después.
     const nuevoEstado=(p.estado!==undefined)?String(p.estado).toLowerCase():oldEstado;
     const nuevoTipo=(p.tipo!==undefined)?String(p.tipo):oldTipo;
     const cancelSt=['cancelado','anulado','rechazado'];
-    const afectabaStock = oldTipo==='pedido' && !cancelSt.includes(oldEstado);   // antes descontaba
-    const afectaStock   = nuevoTipo==='pedido' && !cancelSt.includes(nuevoEstado); // ahora descuenta
-    // items nuevos (si se editaron) o los viejos
-    const itemsNuevos = p.items ? p.items.map(it=>({pid:it.producto_id||it.id, qty:it.cantidad||it.qty||0})) : oldItemsRows.map(it=>({pid:it.producto_id, qty:it.cantidad||0}));
-    const newMap={}; for(const it of itemsNuevos){ if(it.pid) newMap[it.pid]=(newMap[it.pid]||0)+it.qty; }
-    const stockAdd={};
-    if(!afectabaStock && afectaStock){
-      // Pasó a descontar (presupuesto→pedido, o reactivación de cancelado): restar todo el nuevo
-      for(const pid in newMap) stockAdd[pid]=(stockAdd[pid]||0)-newMap[pid];
-    } else if(afectabaStock && !afectaStock){
-      // Dejó de descontar (pedido→presupuesto, o se canceló): devolver todo lo viejo
-      for(const pid in oldMap) stockAdd[pid]=(stockAdd[pid]||0)+oldMap[pid];
-    } else if(afectabaStock && afectaStock && p.items){
-      // Sigue siendo pedido activo pero cambiaron items: ajustar delta (viejo - nuevo)
-      const pids=new Set([...Object.keys(oldMap),...Object.keys(newMap)]);
-      for(const pid of pids){ const d=(oldMap[pid]||0)-(newMap[pid]||0); if(d!==0) stockAdd[pid]=(stockAdd[pid]||0)+d; }
-    }
-    // Si no afectaba ni afecta (presupuesto→presupuesto), no se toca nada.
-    for(const pid in stockAdd){
-      const q=stockAdd[pid]; if(!q) continue;
-      // No tocar stock de productos en preventa (su cupo se maneja aparte con preventa_reservado)
-      const {rows:esPre}=await pool.query('SELECT es_preventa FROM productos WHERE id=$1 AND tenant_id=$2', [pid, req.tenantId]);
+    const afectabaStock = oldTipo==='pedido' && !cancelSt.includes(oldEstado);
+    const afectaStock   = nuevoTipo==='pedido' && !cancelSt.includes(nuevoEstado);
+    const newMap={};
+    if(nuevosItems) for(const it of nuevosItems) sumar(newMap, it._pid, it._pid ? it.variante_id : null, it._cant);
+    else Object.assign(newMap, JSON.parse(JSON.stringify(oldMap)));
+    const delta={}; // clave → {pid, vid, q} (q>0 devuelve stock, q<0 descuenta)
+    const mover=(src, signo)=>{ for(const k in src){ if(!delta[k]) delta[k]={...src[k], q:0}; delta[k].q+=signo*src[k].q; } };
+    if(!afectabaStock && afectaStock) mover(newMap, -1);
+    else if(afectabaStock && !afectaStock) mover(oldMap, +1);
+    else if(afectabaStock && afectaStock && nuevosItems){ mover(oldMap, +1); mover(newMap, -1); }
+    const ordenDelta=Object.values(delta).sort((x,y)=> (x.vid?1:0)-(y.vid?1:0) || (x.pid||0)-(y.pid||0) || (x.vid||0)-(y.vid||0));
+    for(const {pid, vid, q} of ordenDelta){
+      if(!q) continue;
+      if(vid){ await client.query('UPDATE variantes SET stock=GREATEST(0, stock + $1) WHERE id=$2 AND tenant_id=$3', [q, vid, req.tenantId]); continue; }
+      const {rows:esPre}=await client.query('SELECT es_preventa FROM productos WHERE id=$1 AND tenant_id=$2', [pid, req.tenantId]);
       if(!esPre[0]) continue; // producto de otra tienda o borrado: no se toca
-      if(esPre[0].es_preventa){ await recalcReservado(pid, req.tenantId); continue; }
-      await pool.query('UPDATE productos SET stock=GREATEST(0, stock + $1) WHERE id=$2 AND tenant_id=$3 AND permitir_sin_stock=false AND es_digital=false', [q, pid, req.tenantId]);
+      if(esPre[0].es_preventa){ preventaTocados.add(pid); continue; } // su cupo se recalcula con los pedidos reales
+      await client.query('UPDATE productos SET stock=GREATEST(0, stock + $1) WHERE id=$2 AND tenant_id=$3 AND permitir_sin_stock=false AND es_digital=false', [q, pid, req.tenantId]);
     }
-    // Recalcular reservado si cambió el estado (cancelación/reactivación) para productos del pedido
-    if(p.estado!==undefined && !p.items){
-      for(const it of oldItemsRows){ if(it.producto_id) await recalcReservado(it.producto_id, req.tenantId); }
+    if(p.estado!==undefined) for(const it of oldItemsRows) if(it.producto_id) preventaTocados.add(it.producto_id);
+    // Cancelado: el cargo automático de "debe" deja de corresponder. Reactivado en "debe": vuelve.
+    if(afectabaStock && !afectaStock && cancelSt.includes(nuevoEstado)){
+      await client.query("DELETE FROM cuenta_corriente WHERE pedido_id=$1 AND tipo='cargo' AND tenant_id=$2", [req.params.id, req.tenantId]);
+    } else if(!afectabaStock && afectaStock && cancelSt.includes(oldEstado) && pedUsuarioId && nuevoEstadoPago==='debe'){
+      const {rows:ya}=await client.query("SELECT id FROM cuenta_corriente WHERE pedido_id=$1 AND tipo='cargo' AND tenant_id=$2", [req.params.id, req.tenantId]);
+      const deuda=totalPedido-(Number(act[0]?.sena)||0);
+      if(!ya.length && deuda>0) await client.query('INSERT INTO cuenta_corriente (tenant_id,usuario_id,tipo,monto,concepto,pedido_id) VALUES ($6,$1,$2,$3,$4,$5)', [pedUsuarioId,'cargo',deuda,`Pedido #${String(req.params.id).padStart(4,'0')}`,req.params.id, req.tenantId]);
     }
-    res.json({ok:true});
-  }catch(e){ res.status(500).json({error:e.message}); }
+    await client.query('COMMIT');
+  }catch(e){
+    if(client) await client.query('ROLLBACK').catch(()=>{});
+    if(client){ client.release(); client=null; }
+    console.log('[editar pedido]', e.message);
+    return res.status(500).json({error:'No se pudo guardar el pedido: '+e.message});
+  }finally{ if(client) client.release(); }
+  // Después de confirmar: historial y cupos de preventa (leen lo ya guardado)
+  if(historial) pool.query('INSERT INTO pedido_historial (tenant_id,pedido_id,tipo,detalle,usuario_id,usuario_nombre) VALUES ($1,$2,$3,$4,$5,$6)', [req.tenantId, req.params.id, 'estado_pago', historial.detalle, req.user?.id || null, historial.quien]).catch(()=>{});
+  for(const pid of preventaTocados) await recalcReservado(pid, req.tenantId);
+  res.json({ok:true});
 });
 app.post('/api/pedidos/:id/archivar', authPerm('pedidos'), async (req,res)=>{ try{ await pool.query('UPDATE pedidos SET archivado=true WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 app.post('/api/pedidos/:id/desarchivar', authPerm('pedidos'), async (req,res)=>{ try{ await pool.query('UPDATE pedidos SET archivado=false WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
-app.delete('/api/pedidos/:id', authPerm('pedidos'), async (req,res)=>{ try{ const {rows:oep}=await pool.query('SELECT estado, tipo FROM pedidos WHERE id=$1 AND tenant_id=$2',[req.params.id, req.tenantId]); if(!oep[0]) return res.status(404).json({error:'No encontrado'}); const oe=String((oep[0]||{}).estado||'').toLowerCase(); const ot=String((oep[0]||{}).tipo||''); const afectabaStock = ot==='pedido' && !['cancelado','anulado','rechazado'].includes(oe); const {rows:its}=await pool.query('SELECT producto_id, cantidad, variante_id FROM pedido_items WHERE pedido_id=$1',[req.params.id]); const preIds=[]; if(afectabaStock){ for(const it of its){ if(it.variante_id){ await pool.query('UPDATE variantes SET stock=GREATEST(0, stock + $1) WHERE id=$2 AND tenant_id=$3',[it.cantidad||0, it.variante_id, req.tenantId]); continue; } if(!it.producto_id) continue; const {rows:pp}=await pool.query('SELECT es_preventa FROM productos WHERE id=$1 AND tenant_id=$2',[it.producto_id, req.tenantId]); if(!pp[0]) continue; if(pp[0].es_preventa){ preIds.push(it.producto_id); } else { await pool.query('UPDATE productos SET stock=GREATEST(0, stock + $1) WHERE id=$2 AND tenant_id=$3 AND permitir_sin_stock=false AND es_digital=false',[it.cantidad||0, it.producto_id, req.tenantId]); } } } await pool.query('DELETE FROM pedido_items WHERE pedido_id=$1', [req.params.id]); await pool.query('DELETE FROM pedidos WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); for(const pid of preIds) await recalcReservado(pid, req.tenantId); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+// Borrar un pedido: devuelve el stock si lo había descontado, quita el cargo de cuenta corriente y el historial.
+// Si tiene pagos registrados no se borra (la plata ya entró a la caja): hay que borrar los pagos primero o cancelarlo.
+app.delete('/api/pedidos/:id', authPerm('pedidos'), async (req,res)=>{
+  if(!/^\d{1,9}$/.test(String(req.params.id))) return res.status(404).json({error:'No encontrado'});
+  let client; const preIds=[];
+  try{
+    client=await pool.connect();
+    await client.query('BEGIN');
+    const {rows:oep}=await client.query('SELECT estado, tipo, is_test FROM pedidos WHERE id=$1 AND tenant_id=$2 FOR UPDATE',[req.params.id, req.tenantId]);
+    if(!oep[0]){ await client.query('ROLLBACK'); return res.status(404).json({error:'No encontrado'}); }
+    const {rows:pg}=await client.query('SELECT COUNT(*)::int AS n FROM pedido_pagos WHERE pedido_id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]);
+    if(pg[0].n>0 && !oep[0].is_test){ await client.query('ROLLBACK'); return res.status(400).json({error:'Este pedido tiene pagos registrados. Borrá los pagos primero (o cancelalo en vez de borrarlo).'}); }
+    const oe=String(oep[0].estado||'').toLowerCase(); const ot=String(oep[0].tipo||'');
+    const afectabaStock = ot==='pedido' && !['cancelado','anulado','rechazado'].includes(oe);
+    const {rows:its}=await client.query('SELECT producto_id, cantidad, variante_id FROM pedido_items WHERE pedido_id=$1 ORDER BY (variante_id IS NOT NULL), producto_id, variante_id',[req.params.id]);
+    if(afectabaStock){
+      for(const it of its){
+        if(it.variante_id){ await client.query('UPDATE variantes SET stock=GREATEST(0, stock + $1) WHERE id=$2 AND tenant_id=$3',[it.cantidad||0, it.variante_id, req.tenantId]); continue; }
+        if(!it.producto_id) continue;
+        const {rows:pp}=await client.query('SELECT es_preventa FROM productos WHERE id=$1 AND tenant_id=$2',[it.producto_id, req.tenantId]);
+        if(!pp[0]) continue;
+        if(pp[0].es_preventa) preIds.push(it.producto_id);
+        else await client.query('UPDATE productos SET stock=GREATEST(0, stock + $1) WHERE id=$2 AND tenant_id=$3 AND permitir_sin_stock=false AND es_digital=false',[it.cantidad||0, it.producto_id, req.tenantId]);
+      }
+    }
+    await client.query('DELETE FROM pedido_pagos WHERE pedido_id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]);
+    await client.query("DELETE FROM cuenta_corriente WHERE pedido_id=$1 AND tipo='cargo' AND tenant_id=$2", [req.params.id, req.tenantId]);
+    await client.query('DELETE FROM pedido_historial WHERE pedido_id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]);
+    await client.query('DELETE FROM pedido_items WHERE pedido_id=$1', [req.params.id]);
+    await client.query('DELETE FROM pedidos WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]);
+    await client.query('COMMIT');
+  }catch(e){
+    if(client){ await client.query('ROLLBACK').catch(()=>{}); client.release(); client=null; }
+    return res.status(500).json({error:'No se pudo borrar el pedido: '+e.message});
+  }finally{ if(client) client.release(); }
+  for(const pid of preIds) await recalcReservado(pid, req.tenantId);
+  res.json({ok:true});
+});
 
 // STATS
 // COSTO PROVEEDOR: descuentos sobre el precio del proveedor (por marca / categoría) → costo real y ganancia
@@ -3931,12 +3987,13 @@ app.post('/api/carritos-abandonados/:id/contactado', authPerm('stats'), requiere
   const {rows}=await pool.query('UPDATE carritos_abandonados SET contactado_at=NOW(), contactos=COALESCE(contactos,0)+1 WHERE id=$1 AND tenant_id=$2 RETURNING contactado_at, contactos', [req.params.id, req.tenantId]);
   res.json(rows[0]||{}); }catch(e){ res.status(500).json({error:e.message}); } });
 // Cupón personal y por tiempo para cerrar un carrito: un solo uso, solo para ese cliente, vence en X horas
-app.post('/api/carritos-abandonados/:id/cupon', authPerm('stats'), requiereFeature('marketing'), async (req,res)=>{ try{
+app.post('/api/carritos-abandonados/:id/cupon', authPerm('config'), requiereFeature('marketing'), async (req,res)=>{ try{
   const pct=Math.round(Number(req.body?.porcentaje)*10)/10, horas=Number(req.body?.horas);
   if(!(pct>0 && pct<=50)) return res.status(400).json({error:'El descuento tiene que ser entre 1% y 50%'});
   if(![1,2,3,6,12,24,48].includes(horas)) return res.status(400).json({error:'Validez no permitida'});
-  const {rows:cs}=await pool.query('SELECT id, usuario_id FROM carritos_abandonados WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]);
+  const {rows:cs}=await pool.query('SELECT id, usuario_id, cupon_codigo FROM carritos_abandonados WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]);
   if(!cs[0]) return res.status(404).json({error:'Carrito no encontrado'});
+
   const ABC='ABCDEFGHJKMNPQRSTUVWXYZ23456789';
   let codigo='', ok=false;
   for(let intento=0; intento<5 && !ok; intento++){
@@ -3948,6 +4005,8 @@ app.post('/api/carritos-abandonados/:id/cupon', authPerm('stats'), requiereFeatu
     }catch(e){ if(!/unique|duplicate/i.test(e.message)) throw e; }
   }
   if(!ok) return res.status(500).json({error:'No se pudo generar el cupón'});
+  // Un solo cupón vigente por carrito: el anterior (si no se usó) se desactiva
+  if(cs[0].cupon_codigo && String(cs[0].cupon_codigo).toUpperCase()!==codigo) await pool.query("UPDATE cupones SET activo=false WHERE tenant_id=$1 AND UPPER(codigo)=UPPER($2) AND origen='carrito' AND COALESCE(usos_actuales,0)=0", [req.tenantId, cs[0].cupon_codigo]).catch(()=>{});
   const {rows}=await pool.query("UPDATE carritos_abandonados SET cupon_codigo=$1, cupon_vence=NOW() + ($2 || ' hours')::interval WHERE id=$3 AND tenant_id=$4 RETURNING cupon_codigo, cupon_vence", [codigo, String(horas), req.params.id, req.tenantId]);
   res.json({ codigo, vence_at: rows[0]?.cupon_vence, porcentaje: pct, horas });
 }catch(e){ res.status(500).json({error:e.message}); } });
@@ -3960,12 +4019,15 @@ const andreaniLogin = async ()=>{
   const user=process.env.ANDREANI_USER; const pass=process.env.ANDREANI_PASS;
   if(!user||!pass) return null;
   try{
-    const r=await fetch(`${ANDREANI_API}/login`, {method:'GET', headers:{authorization:'Basic '+Buffer.from(`${user}:${pass}`).toString('base64')}});
+    const r=await fetch(`${ANDREANI_API}/login`, {method:'GET', headers:{authorization:'Basic '+Buffer.from(`${user}:${pass}`).toString('base64')}, signal: AbortSignal.timeout(8000)});
     return r.headers.get('x-authorization-token');
   }catch{ return null; }
 };
-app.post('/api/andreani/cotizar', async (req,res)=>{
+// Cotizar y sucursales usan el contrato de la tienda 1: solo ahí, y con límite por conexión
+const andreaniLimiter = rateLimit({ windowMs: 60*1000, max: 20, standardHeaders: true, legacyHeaders: false, message: { error: 'Demasiadas consultas de envío seguidas. Esperá un minuto.' } });
+app.post('/api/andreani/cotizar', andreaniLimiter, async (req,res)=>{
   try{
+    if(Number(req.tenantId)!==1) return res.status(403).json({error:'Andreani todavía no está disponible para esta tienda'});
     const {cp_destino,peso,volumen,seccion_id,cp_origen} = req.body;
     const token=await andreaniLogin(); if(!token) return res.status(503).json({error:'Andreani no configurado'});
     let origen=cp_origen || process.env.ANDREANI_CP_ORIGEN || '1888';
@@ -3978,16 +4040,16 @@ app.post('/api/andreani/cotizar', async (req,res)=>{
     const cliente=process.env.ANDREANI_CLIENTE || process.env.ANDREANI_NRO_CLIENTE || '';
     const contrato=process.env.ANDREANI_CONTRATO || 'AND00EST';
     const body={ cpDestino: cp_destino, contrato, cliente, sucursalOrigen:'', bultos:[{valorDeclarado:1000, volumen: volumen||5000, kilos: peso||1}] };
-    const r=await fetch(`${ANDREANI_API}/v1/tarifas`, {method:'POST', headers:{'x-authorization-token':token, 'Content-Type':'application/json'}, body:JSON.stringify(body)});
+    const r=await fetch(`${ANDREANI_API}/v1/tarifas`, {method:'POST', headers:{'x-authorization-token':token, 'Content-Type':'application/json'}, body:JSON.stringify(body), signal: AbortSignal.timeout(10000)});
     const data=await r.json();
     // Normalizar respuesta para frontend tipo imagen ejemplo
     // Andreani devuelve array de tarifas - lo mapeamos a domicilio y sucursal
     res.json({origen, destino: cp_destino, tarifas: data, domicilio: data?.tarifas?.[0]||data, sucursal: data?.tarifas?.[1]||null, raw:data});
   }catch(e){ res.status(500).json({error:e.message}); }
 });
-app.get('/api/andreani/sucursales', async (req,res)=>{ try{ const {cp}=req.query; const token=await andreaniLogin(); if(!token) return res.status(503).json({error:'Andreani no configurado'}); const r=await fetch(`${ANDREANI_API}/v1/sucursales?codigoPostal=${encodeURIComponent(String(cp||'').replace(/\D/g,'').slice(0,8))}`, {headers:{'x-authorization-token':token}}); res.json(await r.json()); }catch(e){ res.status(500).json({error:e.message}); } });
+app.get('/api/andreani/sucursales', andreaniLimiter, async (req,res)=>{ try{ if(Number(req.tenantId)!==1) return res.status(403).json({error:'Andreani todavía no está disponible para esta tienda'}); const {cp}=req.query; const token=await andreaniLogin(); if(!token) return res.status(503).json({error:'Andreani no configurado'}); const r=await fetch(`${ANDREANI_API}/v1/sucursales?codigoPostal=${encodeURIComponent(String(cp||'').replace(/\D/g,'').slice(0,8))}`, {headers:{'x-authorization-token':token}, signal: AbortSignal.timeout(10000)}); res.json(await r.json()); }catch(e){ res.status(500).json({error:e.message}); } });
 app.post('/api/andreani/orden', authPerm('pedidos'), async (req,res)=>{ try{ if(Number(req.tenantId)!==1) return res.status(403).json({error:'Andreani todavía no está disponible para esta tienda'}); const token=await andreaniLogin(); if(!token) return res.status(503).json({error:'Andreani no configurado'}); const r=await fetch(`${ANDREANI_API}/v1/ordenes-de-envio`, {method:'POST', headers:{'x-authorization-token':token, 'Content-Type':'application/json'}, body:JSON.stringify(req.body)}); res.json(await r.json()); }catch(e){ res.status(500).json({error:e.message}); } });
-app.get('/api/andreani/tracking/:envio', auth(), async (req,res)=>{ try{ if(Number(req.tenantId)!==1) return res.status(403).json({error:'Andreani todavía no está disponible para esta tienda'}); const token=await andreaniLogin(); if(!token) return res.status(503).json({error:'Andreani no configurado'}); const r=await fetch(`${ANDREANI_API}/v1/envios/${encodeURIComponent(req.params.envio)}/trazas`, {headers:{'x-authorization-token':token}}); res.json(await r.json()); }catch(e){ res.status(500).json({error:e.message}); } });
+app.get('/api/andreani/tracking/:envio', auth(), async (req,res)=>{ try{ if(Number(req.tenantId)!==1) return res.status(403).json({error:'Andreani todavía no está disponible para esta tienda'}); if(!(await esStaffPedidos(req))){ const {rows:mio}=await pool.query('SELECT 1 FROM pedidos WHERE tenant_id=$1 AND usuario_id=$2 AND codigo_seguimiento=$3 LIMIT 1', [req.tenantId, req.user.id, String(req.params.envio)]); if(!mio[0]) return res.status(404).json({error:'No encontramos ese envío en tus pedidos'}); } const token=await andreaniLogin(); if(!token) return res.status(503).json({error:'Andreani no configurado'}); const r=await fetch(`${ANDREANI_API}/v1/envios/${encodeURIComponent(req.params.envio)}/trazas`, {headers:{'x-authorization-token':token}}); res.json(await r.json()); }catch(e){ res.status(500).json({error:e.message}); } });
 app.get('/api/andreani/etiqueta/:envio', authPerm('pedidos'), async (req,res)=>{ try{ if(Number(req.tenantId)!==1) return res.status(403).json({error:'Andreani todavía no está disponible para esta tienda'}); const token=await andreaniLogin(); if(!token) return res.status(503).json({error:'Andreani no configurado'}); const r=await fetch(`${ANDREANI_API}/v1/ordenes-de-envio/${encodeURIComponent(req.params.envio)}/etiquetas`, {headers:{'x-authorization-token':token, Accept:'application/pdf'}}); res.set('Content-Type','application/pdf'); const buffer=await r.arrayBuffer(); res.send(Buffer.from(buffer)); }catch(e){ res.status(500).json({error:e.message}); } });
 
 // START
