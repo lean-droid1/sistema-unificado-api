@@ -62,6 +62,17 @@ app.use('/api/', rateLimit({ windowMs: 1 * 60 * 1000, max: 1500, standardHeaders
 app.use('/api/', (req,res,next)=>resolveTenant(req,res,next));
 // El id de sección que llega por la URL tiene que ser un número común. Postgres acepta "0x3" o "1_3" como 3,
 // pero el control de tiendas mayoristas no los reconocía: así un cliente minorista veía precios mayoristas.
+const RUTAS_CON_TIENDA_SUSPENDIDA = new Set(['GET /mi-plan','GET /config','GET /design','GET /health','GET /maintenance-status','POST /login','POST /logout','POST /refresh-token','GET /me','GET /redes-sociales','POST /forgot-password','POST /reset-password','POST /registro-tienda','GET /planes-publicos']);
+app.use('/api/', async (req,res,next)=>{
+  if(Number(req.tenantId)===1 || req.method==='OPTIONS') return next();
+  if(req.path.startsWith('/plataforma') || req.path.startsWith('/tenants')) return next(); // panel del dueño (authOwner)
+  try{
+    const d=await getTenantData(req.tenantId);
+    if(!['suspendido','vencido'].includes(d.estado)) return next();
+    if(RUTAS_CON_TIENDA_SUSPENDIDA.has(`${req.method} ${req.path.replace(/\/+$/,'')}`)) return next();
+    return res.status(403).json({error:'Esta tienda no está disponible por el momento.', tienda_suspendida:true, estado:d.estado});
+  }catch{ next(); }
+});
 app.use('/api/', (req,res,next)=>{
   const s = req.query ? req.query.seccion_id : undefined;
   if(s===undefined || s==='' || s==='all' || s==='null' || s==='undefined' || (typeof s==='string' && /^\d{1,9}$/.test(s))) return next();
@@ -164,6 +175,16 @@ const authPerm = (permiso) => async (req,res,next)=>{
     }
     return res.status(403).json({error:'Sin permiso'});
   }catch{ res.status(401).json({error:'Token inválido'}); }
+};
+// Igual que authPerm pero alcanza con tener uno de los permisos
+const authPermAlguno = (permisos) => async (req,res,next)=>{
+  let ultimo=null;
+  for(const p of permisos){
+    let paso=false; const fake={ status:(c)=>({ json:(o)=>{ ultimo={c,o}; } }) };
+    await authPerm(p)(req, fake, ()=>{ paso=true; });
+    if(paso) return next();
+  }
+  return res.status(ultimo?.c||403).json(ultimo?.o||{error:'Sin permiso'});
 };
 // ═══ PLANES en el backend: las llaves del plan se validan acá (no solo ocultando pestañas en el panel) ═══
 const featureActiva = (feats, f) => { const v = feats && feats[f]; return !(v === false || v === 'no' || v === undefined || v === null); };
@@ -295,6 +316,13 @@ async function getTenantData(tenantId){
   return data;
 }
 
+async function tenantExiste(id){
+  const k='#'+id; if(tenantCache.has(k)) return true;
+  let rows;
+  try{ ({rows}=await pool.query('SELECT 1 FROM tenants WHERE id=$1', [id])); }catch{ return true; } // ante error de base no se bloquea (ni se guarda)
+  if(rows[0]) tenantCache.set(k, id);
+  return !!rows[0];
+}
 async function slugToTenantId(slug){
   if(!slug) return null;
   if(tenantCache.has(slug)) return tenantCache.get(slug);
@@ -309,8 +337,16 @@ const resolveTenant = async (req,res,next)=>{
     // 1) header explícito del frontend (según subdominio de la tienda)
     const h = req.headers['x-tenant'];
     if(h){
-      if(/^\d+$/.test(h)) tid = Number(h);
-      else tid = await slugToTenantId(String(h).toLowerCase().trim());
+      const hs = String(h).toLowerCase().trim();
+      if(/^\d{1,9}$/.test(hs)){
+        tid = Number(hs);
+        if(tid!==1 && !(await tenantExiste(tid)) && !['/registro-tienda','/planes-publicos'].includes(req.path)) return res.status(404).json({error:'Tienda no encontrada', tienda_inexistente:true});
+      } else {
+        tid = await slugToTenantId(hs);
+        // Un subdominio (sin punto) que no existe ya no muestra la tienda principal. Los dominios propios no cambian.
+        // (Crear tienda y ver planes son de la plataforma: no dependen de la tienda.)
+        if(!tid && !hs.includes('.') && !['/registro-tienda','/planes-publicos'].includes(req.path)) return res.status(404).json({error:'Tienda no encontrada', tienda_inexistente:true});
+      }
     }
     // 2) tenant del usuario logueado (si el token lo trae)
     if(!tid){
@@ -951,14 +987,17 @@ app.get('/api/planes-publicos', async (req,res)=>{
   }catch(e){ res.json({ ...PLAN_PRECIOS, descuento_pct:25, meses:3 }); }
 });
 // Registro self-service (público, con rate limit): crea una tienda nueva con 15 días gratis Full + su admin
+const SLUGS_RESERVADOS = new Set(['www','api','admin','panel','app','mail','smtp','ftp','comerciapp','principal','tienda','tiendas','soporte','ayuda','help','login','static','assets','cdn','img','blog','status']);
 app.post('/api/registro-tienda', authLimiter, async (req,res)=>{
-  const client=await pool.connect();
+  let client;
   try{
+    client=await pool.connect();
     const {nombre_tienda, slug, nombre, usuario, password, email, telefono}=req.body;
     if(!nombre_tienda || !slug || !usuario || !password) return res.status(400).json({error:'Faltan datos obligatorios'});
     const pwErr=validatePassword(String(password)); if(pwErr) return res.status(400).json({error:'Contraseña: '+pwErr});
     const slugClean=String(slug).toLowerCase().trim().replace(/[^a-z0-9-]/g,'');
     if(!slugClean || slugClean.length<3) return res.status(400).json({error:'La dirección web debe tener al menos 3 letras (solo letras, números y guiones)'});
+    if(/^\d+$/.test(slugClean) || SLUGS_RESERVADOS.has(slugClean)) return res.status(400).json({error:'Esa dirección web no está disponible, probá con otra'});
     const admUser=String(usuario).toLowerCase().trim();
     if(admUser.length<3) return res.status(400).json({error:'El usuario debe tener al menos 3 letras'});
     await client.query('BEGIN');
@@ -982,8 +1021,8 @@ app.post('/api/registro-tienda', authLimiter, async (req,res)=>{
     await client.query('COMMIT');
     tenantCache.clear(); tenantDataCache.clear();
     res.json({ ok:true, slug:slugClean, usuario:admUser, dias });
-  }catch(e){ await client.query('ROLLBACK').catch(()=>{}); res.status(500).json({error:e.message}); }
-  finally{ client.release(); }
+  }catch(e){ if(client) await client.query('ROLLBACK').catch(()=>{}); res.status(500).json({error:e.message}); }
+  finally{ if(client) client.release(); }
 });
 app.get('/api/plataforma/precios', authOwner, async (req,res)=>{
   try{ res.json(await getPlanPrecios()); }catch(e){ res.status(500).json({error:e.message}); }
@@ -1056,12 +1095,13 @@ app.get('/api/tenants/:id', authOwner, async (req,res)=>{
 });
 // Crear tenant nuevo (+ su admin + seed de diseño mínimo)
 app.post('/api/tenants', authOwner, async (req,res)=>{
-  const client=await pool.connect();
+  let client;
   try{
+    client=await pool.connect();
     const {nombre, slug, plan, admin_usuario, admin_password, dias_trial}=req.body;
     if(!nombre || !slug) return res.status(400).json({error:'Falta nombre o slug'});
     const slugClean=String(slug).toLowerCase().trim().replace(/[^a-z0-9-]/g,'');
-    if(!slugClean) return res.status(400).json({error:'Slug inválido'});
+    if(!slugClean || /^\d+$/.test(slugClean) || SLUGS_RESERVADOS.has(slugClean)) return res.status(400).json({error:'Slug inválido (no puede ser solo números ni una dirección reservada)'});
     await client.query('BEGIN');
     // slug único
     const {rows:ex}=await client.query('SELECT id FROM tenants WHERE slug=$1', [slugClean]);
@@ -1087,14 +1127,20 @@ app.post('/api/tenants', authOwner, async (req,res)=>{
     await client.query('COMMIT');
     tenantCache.clear(); tenantDataCache.clear(); // refrescar caches del tenant
     res.json({ ...tRows[0], admin_usuario:admUser, admin_password:admPass });
-  }catch(e){ await client.query('ROLLBACK').catch(()=>{}); res.status(500).json({error:e.message}); }
-  finally{ client.release(); }
+  }catch(e){ if(client) await client.query('ROLLBACK').catch(()=>{}); res.status(500).json({error:e.message}); }
+  finally{ if(client) client.release(); }
 });
 // Actualizar tenant (plan, estado, fechas, dominio, notas)
 app.put('/api/tenants/:id', authOwner, async (req,res)=>{
   try{
     const campos=['nombre','slug','plan','estado','dominio_propio','notas'];
     const sets=[]; const params=[]; let pi=1;
+    if(req.body.slug!==undefined){
+      const sl=String(req.body.slug||'').toLowerCase().trim().replace(/[^a-z0-9-]/g,'');
+      const {rows:act}=await pool.query('SELECT slug FROM tenants WHERE id=$1', [req.params.id]);
+      if(!(act[0] && act[0].slug===sl) && (!sl || /^\d+$/.test(sl) || SLUGS_RESERVADOS.has(sl))) return res.status(400).json({error:'Slug inválido (no puede ser solo números ni una dirección reservada)'});
+      req.body.slug=sl;
+    }
     for(const k of campos){ if(req.body[k]!==undefined){ sets.push(`${k}=$${pi}`); params.push(req.body[k]); pi++; } }
     if(req.body.fecha_fin_trial!==undefined){ sets.push(`fecha_fin_trial=$${pi}`); params.push(req.body.fecha_fin_trial||null); pi++; }
     if(req.body.descuento_hasta!==undefined){ sets.push(`descuento_hasta=$${pi}`); params.push(req.body.descuento_hasta||null); pi++; }
@@ -1117,19 +1163,34 @@ app.post('/api/tenants/:id/estado', authOwner, async (req,res)=>{
 });
 // Borrar tenant (y TODOS sus datos) — peligroso, nunca el 1
 app.delete('/api/tenants/:id', authOwner, async (req,res)=>{
-  const client=await pool.connect();
+  const tid=Number(req.params.id);
+  if(!Number.isInteger(tid) || tid<=1) return res.status(400).json({error:'No se puede borrar la tienda principal'});
+  let client;
   try{
-    const tid=Number(req.params.id);
-    if(tid===1) return res.status(400).json({error:'No se puede borrar la tienda principal'});
+    client=await pool.connect();
     await client.query('BEGIN');
-    const tablas=['productos','pedidos','pedido_items','pedido_pagos','usuarios','secciones','categorias_meta','configuracion','design_config','cupones','cupon_productos','promociones','listas_precio','precios_fijos','ordenes_compra','orden_compra_items','cuenta_corriente','leads','carritos_abandonados','badges','barras_texto','menu_items','metodos_pago','metodos_envio_custom','config_envio','notificaciones_stock','paginas_info','popups','redes_sociales','slider_banners','contactos','favoritos','historial_precios','producto_imagenes','variantes'];
-    for(const t of tablas){ await client.query(`DELETE FROM ${t} WHERE tenant_id=$1`, [tid]).catch(()=>{}); }
+    // Tablas sin tenant_id: se borran por sus dueños
+    await client.query('DELETE FROM otp_codes WHERE usuario_id IN (SELECT id FROM usuarios WHERE tenant_id=$1)', [tid]);
+    await client.query('DELETE FROM cupon_productos WHERE cupon_id IN (SELECT id FROM cupones WHERE tenant_id=$1)', [tid]);
+    // Todas las tablas con tenant_id, en varias pasadas: si una tiene filas que otra referencia, se reintenta después
+    const {rows:ts}=await client.query("SELECT table_name FROM information_schema.columns WHERE column_name='tenant_id' AND table_schema='public' AND table_name NOT IN ('tenants','pagos_suscripcion')");
+    let pendientes=ts.map(r=>r.table_name);
+    for(let pasada=0; pasada<6 && pendientes.length; pasada++){
+      const siguen=[];
+      for(const t of pendientes){
+        await client.query('SAVEPOINT bt');
+        try{ await client.query(`DELETE FROM "${t.replace(/"/g,'')}" WHERE tenant_id=$1`, [tid]); await client.query('RELEASE SAVEPOINT bt'); }
+        catch(e){ await client.query('ROLLBACK TO SAVEPOINT bt'); siguen.push(t); }
+      }
+      pendientes=siguen;
+    }
+    if(pendientes.length) throw new Error('No se pudieron borrar datos de: '+pendientes.join(', '));
     await client.query('DELETE FROM tenants WHERE id=$1', [tid]);
     await client.query('COMMIT');
     tenantCache.clear(); tenantDataCache.clear();
     res.json({ok:true});
-  }catch(e){ await client.query('ROLLBACK').catch(()=>{}); res.status(500).json({error:e.message}); }
-  finally{ client.release(); }
+  }catch(e){ if(client) await client.query('ROLLBACK').catch(()=>{}); res.status(500).json({error:e.message}); }
+  finally{ if(client) client.release(); }
 });
 
 
@@ -1214,7 +1275,9 @@ async function _itemsPedidoHtml(pedidoId){
 async function _sendMail(to, subject, html, opts={}){
   if(!resend || !to) return;
   const addr = process.env.RESEND_FROM || 'onboarding@resend.dev';
-  const from = opts.fromName ? `${opts.fromName} <${addr}>` : addr;
+  const nombre = String(opts.fromName||'').replace(/[<>"\\\u0000-\u001f\u007f]/g,' ').replace(/\s+/g,' ').trim().slice(0,60);
+  const from = nombre ? `"${nombre}" <${addr}>` : addr;
+  subject = String(subject||'').replace(/[\u0000-\u001f\u007f]/g,' ').slice(0,200);
   const payload = { from, to, subject, html };
   if(opts.replyTo) payload.reply_to = opts.replyTo;
   try{ const r=await resend.emails.send(payload); if(r&&r.error) console.log('[mail] error:', JSON.stringify(r.error)); else console.log('[mail] enviado a', to); }catch(e){ console.log('[mail] exc:', e.message); }
@@ -1222,7 +1285,8 @@ async function _sendMail(to, subject, html, opts={}){
 async function _tiendaInfo(tenantId){
   const {rows:dc}=await pool.query("SELECT valor FROM design_config WHERE clave='nombre_tienda' AND tenant_id=$1", [tenantId]).catch(()=>({rows:[]}));
   const {rows:ev}=await pool.query("SELECT valor FROM configuracion WHERE clave='email_ventas' AND tenant_id=$1", [tenantId]).catch(()=>({rows:[]}));
-  return { tienda:(dc[0]&&dc[0].valor)||'Tu tienda', baseUrl: process.env.PUBLIC_URL||process.env.FRONTEND_URL||'', email:(ev[0]&&ev[0].valor)||'' };
+  const tienda = String((dc[0]&&dc[0].valor)||'').replace(/[<>"\\\u0000-\u001f\u007f]/g,' ').replace(/\s+/g,' ').trim().slice(0,60) || 'Tu tienda';
+  return { tienda, baseUrl: process.env.PUBLIC_URL||process.env.FRONTEND_URL||'', email:(ev[0]&&ev[0].valor)||'' };
 }
 async function emailBienvenida(tenantId, email, nombre){
   if(!email) return;
@@ -1496,7 +1560,13 @@ const CONFIG_PRIVADA=/^(_|email_|smtp|resend)|token|secret|password|clave_api|ap
 app.get('/api/config', optionalAuth, async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM configuracion WHERE tenant_id=$1', [req.tenantId]); let staff=false; if(req.user){ const {rows:u}=await pool.query('SELECT rol FROM usuarios WHERE id=$1 AND tenant_id=$2', [req.user.id, req.tenantId]).catch(()=>({rows:[]})); staff=!!(u[0] && (u[0].rol==='admin'||u[0].rol==='subadmin')); } const cfg={}; rows.forEach(r=>{ if(staff || !CONFIG_PRIVADA.test(r.clave)) cfg[r.clave]=r.valor; }); res.json(cfg); }catch(e){ res.status(500).json({error:e.message}); } });
 // Plan y funciones habilitadas del tenant actual (para que el frontend muestre/oculte)
 app.get('/api/mi-plan', async (req,res)=>{
-  try{ const d=await getTenantData(req.tenantId); res.json({ plan:d.plan, estado:d.estado, features:d.features, dias_restantes:d.dias_restantes }); }
+  try{ const d=await getTenantData(req.tenantId);
+    let soporte=process.env.COMERCIAPP_WHATSAPP||'';
+    if(!soporte && Number(req.tenantId)!==1 && d.estado!=='activo'){
+      const {rows}=await pool.query("SELECT clave, valor FROM configuracion WHERE tenant_id=1 AND clave IN ('comerciapp_whatsapp','whatsapp','whatsapp_flotante') UNION ALL SELECT clave, valor FROM design_config WHERE tenant_id=1 AND clave='whatsapp_numero'").catch(()=>({rows:[]}));
+      const m={}; rows.forEach(r=>{ if(r.valor) m[r.clave]=r.valor; }); soporte=m.comerciapp_whatsapp||m.whatsapp_numero||m.whatsapp||m.whatsapp_flotante||'';
+    }
+    res.json({ plan:d.plan, estado:d.estado, features:d.features, dias_restantes:d.dias_restantes, soporte_whatsapp: soporte||undefined }); }
   catch(e){ res.status(500).json({error:e.message}); }
 });
 // Claves que no se tocan desde la config de una tienda: las internas ("_...") y, en la tienda 1, los precios y
@@ -1628,7 +1698,7 @@ function extImagenReal(buf){
   if(buf.slice(4,12).toString('latin1')==='ftypavif') return '.avif';
   return null;
 }
-app.post('/api/upload', authPerm('config'), upload.single('imagen'), async (req,res)=>{
+app.post('/api/upload', authPermAlguno(['config','productos']), upload.single('imagen'), async (req,res)=>{
   try{
     if(!req.file) return res.status(400).json({error:'No file'});
     if(useCloudinary){
@@ -1643,7 +1713,7 @@ app.post('/api/upload', authPerm('config'), upload.single('imagen'), async (req,
     return res.json({url:`/uploads/${name}`});
   }catch(e){ res.status(500).json({error:e.message}); }
 });
-app.post('/api/upload-base64', authPerm('config'), async (req,res)=>{
+app.post('/api/upload-base64', authPermAlguno(['config','productos']), async (req,res)=>{
   try{
     const {data} = req.body;
     if(!data) return res.status(400).json({error:'No data'});
@@ -2087,7 +2157,9 @@ app.post('/api/productos/bulk', authPerm('productos'), async (req,res)=>{
     const lista = (Array.isArray(productos) ? productos : []).slice(0, 5000);
     const secDest = parseInt(seccion_id, 10) || null;
     if(secDest){ const {rows}=await pool.query('SELECT 1 FROM secciones WHERE id=$1 AND tenant_id=$2', [secDest, t]); if(!rows[0]) return res.status(400).json({error:'La sección elegida no es de esta tienda'}); }
-    const secDe = (p) => secDest || parseInt(p.seccion_id, 10) || null;
+    const {rows:secsT}=await pool.query('SELECT id FROM secciones WHERE tenant_id=$1 ORDER BY orden, id', [t]);
+    const secsPropias=new Set(secsT.map(x=>x.id)); const secDefecto=secsT[0]?.id||null;
+    const secDe = (p) => { if(secDest) return secDest; const x=parseInt(p.seccion_id, 10); return (x && secsPropias.has(x)) ? x : null; };
     const buscar = async (p) => {
       const sec = secDe(p); const sku = S(p.sku, 100); const nom = S(p.nombre || p.modelo);
       if(sku){ const {rows}=await pool.query('SELECT id FROM productos WHERE sku=$1 AND tenant_id=$2 AND ($3::int IS NULL OR seccion_id=$3) LIMIT 1', [sku, t, sec]); if(rows[0]) return rows[0]; }
@@ -2096,7 +2168,7 @@ app.post('/api/productos/bulk', authPerm('productos'), async (req,res)=>{
     };
     const insertar = (p) => pool.query(`INSERT INTO productos (tenant_id,seccion_id,categoria,modelo,nombre,precio_base,precio_oferta,precio_original,stock,imagen,sku,descripcion,compatibilidad,peso,alto,ancho,largo,visible,permitir_sin_stock,posicion)
         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,true,$18,$19)`,
-      [t, secDe(p) || 1, S(p.categoria,200), S(p.modelo,200), S(p.nombre || p.modelo), N(p.precio_base), N(p.precio_oferta), N(p.precio_original), I(p.stock) ?? 0,
+      [t, secDe(p) || secDefecto, S(p.categoria,200), S(p.modelo,200), S(p.nombre || p.modelo), N(p.precio_base), N(p.precio_oferta), N(p.precio_original), I(p.stock) ?? 0,
        S(p.imagen,2000), S(p.sku,100), S(p.descripcion,8000), S(p.compatibilidad,2000), N(p.peso), N(p.alto), N(p.ancho), N(p.largo), !!p.permitir_sin_stock, I(p.posicion) ?? 0]);
     const actualizar = (id, p) => pool.query(`UPDATE productos SET
         categoria=CASE WHEN $1<>'' THEN $1 ELSE categoria END, precio_base=$2, precio_oferta=$3,
@@ -2776,19 +2848,21 @@ app.put('/api/productos/:id/variantes-full', authPerm('productos'), async (req,r
 // PRECIOS
 app.post('/api/precios/ajustar', authPerm('productos'), async (req,res)=>{
   try{
-    const {porcentaje,categoria}=req.body;
-    // Capturar precios anteriores para el historial
+    const {categoria}=req.body||{};
+    const porcentaje=Number(req.body && req.body.porcentaje);
+    if(!Number.isFinite(porcentaje) || porcentaje<=-90 || porcentaje>500 || porcentaje===0) return res.status(400).json({error:'El porcentaje tiene que estar entre -89 y 500 (y no puede ser 0)'});
+    const factor=1+porcentaje/100;
     const selQ = categoria ? 'SELECT id, precio_base FROM productos WHERE categoria=$1 AND tenant_id=$2' : 'SELECT id, precio_base FROM productos WHERE tenant_id=$1';
     const {rows:antes} = await pool.query(selQ, categoria ? [categoria, req.tenantId] : [req.tenantId]);
-    if(categoria) await pool.query('UPDATE productos SET precio_base = precio_base * $1 WHERE categoria=$2 AND tenant_id=$3', [1+porcentaje/100, categoria, req.tenantId]);
-    else await pool.query('UPDATE productos SET precio_base = precio_base * (1+$1/100) WHERE tenant_id=$2', [porcentaje, req.tenantId]);
-    // Registrar historial (masivo)
+    if(categoria) await pool.query('UPDATE productos SET precio_base = ROUND(precio_base * $1::numeric, 2) WHERE categoria=$2 AND tenant_id=$3', [factor, categoria, req.tenantId]);
+    else await pool.query('UPDATE productos SET precio_base = ROUND(precio_base * $1::numeric, 2) WHERE tenant_id=$2', [factor, req.tenantId]);
+    // Historial (masivo), con la tienda correcta
     const usr = (req.user.usuario||'admin') + ' (ajuste masivo ' + (porcentaje>0?'+':'') + porcentaje + '%' + (categoria?' '+categoria:'') + ')';
-    for(const a of antes){ const nuevo = Number(a.precio_base) * (1+porcentaje/100); if(Number(a.precio_base)!==nuevo) await pool.query('INSERT INTO historial_precios (producto_id,precio_anterior,precio_nuevo,usuario) VALUES ($1,$2,$3,$4)', [a.id, a.precio_base, nuevo.toFixed(2), usr]).catch(()=>{}); }
+    for(const a of antes){ const nuevo = Math.round(Number(a.precio_base) * factor * 100)/100; if(Number(a.precio_base)!==nuevo) await pool.query('INSERT INTO historial_precios (tenant_id,producto_id,precio_anterior,precio_nuevo,usuario) VALUES ($5,$1,$2,$3,$4)', [a.id, a.precio_base, nuevo.toFixed(2), usr, req.tenantId]).catch(()=>{}); }
     res.json({ok:true, ajustados:antes.length});
   }catch(e){ res.status(500).json({error:e.message}); }
 });
-app.post('/api/precios/reset', authPerm('productos'), async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM historial_precios ORDER BY created_at DESC'); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.post('/api/precios/reset', authPerm('productos'), (req,res)=>{ res.status(410).json({error:'Esta opción ya no está disponible. Usá el historial de precios del producto.'}); });
 app.get('/api/historial-precios', authPerm('productos'), async (req,res)=>{ try{ const {rows}=await pool.query('SELECT h.*, p.nombre, p.modelo, p.categoria FROM historial_precios h LEFT JOIN productos p ON h.producto_id=p.id AND p.tenant_id=h.tenant_id WHERE h.tenant_id=$1 ORDER BY h.created_at DESC LIMIT 200', [req.tenantId]); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
 
 // ── ÓRDENES DE COMPRA (compras a proveedores) ──
@@ -3591,7 +3665,7 @@ app.post('/api/track', rateLimit({ windowMs: 60*1000, max: 120, standardHeaders:
     res.status(204).end();
   }catch(e){ res.status(204).end(); }
 });
-app.get('/api/analytics/visitas', authPerm('stats'), async (req,res)=>{
+app.get('/api/analytics/visitas', authPerm('stats'), requiereFeature('analytics'), async (req,res)=>{
   try{
     const t=req.tenantId; const params=[t]; let w='tenant_id=$1';
     const hoy=new Date(); const d0=new Date(hoy.getTime()-29*86400000);
@@ -3888,7 +3962,13 @@ app.post('/api/contactos', authPerm('config'), async (req,res)=>{ try{ const c=r
 app.put('/api/contactos/:id', authPerm('config'), async (req,res)=>{ try{ const c=req.body; await pool.query('UPDATE contactos SET nombre=$1,rol=$2,telefono=$3,avatar=$4,seccion_id=$5,online=$6,mensaje_default=$7,orden=$8,activo=$9 WHERE id=$10 AND tenant_id=$11', [c.nombre||'',c.rol||'',c.telefono||'',c.avatar||'',c.seccion_id||null,c.online!==false,c.mensaje_default||'',c.orden||0,c.activo!==false,req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 app.delete('/api/contactos/:id', authPerm('config'), async (req,res)=>{ try{ await pool.query('DELETE FROM contactos WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 // ── LEADS (capturados por el widget de contacto) ──
-app.post('/api/leads', async (req,res)=>{ try{ const l=req.body; const {rows}=await pool.query('INSERT INTO leads (nombre,telefono,contacto_id,contacto_nombre,usuario_id,tenant_id) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *', [l.nombre||'',l.telefono||'',l.contacto_id||null,l.contacto_nombre||'',l.usuario_id||null, req.tenantId]); res.json(rows[0]); }catch(e){ res.status(500).json({error:e.message}); } });
+const formLimiter = rateLimit({ windowMs: 10*60*1000, max: 15, standardHeaders: true, legacyHeaders: false, message: { error: 'Demasiados envíos seguidos. Probá en unos minutos.' } });
+app.post('/api/leads', formLimiter, optionalAuth, async (req,res)=>{ try{ const l=req.body||{};
+  // El contacto tiene que ser de esta tienda y el cliente sale de la sesión (no del navegador)
+  let contactoId=parseInt(l.contacto_id,10)||null;
+  if(contactoId){ const {rows:c}=await pool.query('SELECT 1 FROM contactos WHERE id=$1 AND tenant_id=$2', [contactoId, req.tenantId]); if(!c[0]) contactoId=null; }
+  const {rows}=await pool.query('INSERT INTO leads (nombre,telefono,contacto_id,contacto_nombre,usuario_id,tenant_id) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id', [String(l.nombre||'').slice(0,160), String(l.telefono||'').slice(0,40), contactoId, String(l.contacto_nombre||'').slice(0,120), req.user?.id||null, req.tenantId]);
+  res.json(rows[0]); }catch(e){ res.status(500).json({error:'No se pudo guardar'}); } });
 app.get('/api/leads', authPerm('stats'), requiereFeature('marketing'), async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM leads WHERE tenant_id=$1 ORDER BY created_at DESC LIMIT 500', [req.tenantId]); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
 app.put('/api/leads/:id', authPerm('stats'), requiereFeature('marketing'), async (req,res)=>{ try{ await pool.query('UPDATE leads SET contactado=$1 WHERE id=$2 AND tenant_id=$3', [req.body.contactado!==false, req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 app.delete('/api/leads/:id', authPerm('stats'), requiereFeature('marketing'), async (req,res)=>{ try{ await pool.query('DELETE FROM leads WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
@@ -3897,7 +3977,7 @@ app.get('/api/favoritos', auth(), async (req,res)=>{ try{ const {rows}=await poo
 app.post('/api/favoritos/:producto_id', auth(), async (req,res)=>{ try{ const b=await bloqueoProductoPublico(req, req.params.producto_id); if(b) return res.status(b.status).json({error:b.error}); await pool.query('INSERT INTO favoritos (usuario_id,producto_id,tenant_id) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING', [req.user.id, req.params.producto_id, req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 app.delete('/api/favoritos/:producto_id', auth(), async (req,res)=>{ try{ await pool.query('DELETE FROM favoritos WHERE usuario_id=$1 AND producto_id=$2 AND tenant_id=$3', [req.user.id, req.params.producto_id, req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 
-app.post('/api/notificar-stock', async (req,res)=>{ try{ const {producto_id,email,telefono,canal}=req.body; if(!producto_id||(!email&&!telefono)) return res.status(400).json({error:'Falta email o teléfono'}); if(!(await productoDeTienda(pool, req.tenantId, producto_id))) return res.status(404).json({error:'Producto no encontrado'}); await pool.query('INSERT INTO notificaciones_stock (producto_id,email,telefono,canal,tenant_id) VALUES ($1,$2,$3,$4,$5)', [producto_id,email||'',telefono||'',canal||(telefono?'whatsapp':'email'), req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.post('/api/notificar-stock', formLimiter, async (req,res)=>{ try{ const {producto_id,canal}=req.body||{}; const email=String((req.body||{}).email||'').trim().slice(0,200); const telefono=String((req.body||{}).telefono||'').trim().slice(0,50); if(!producto_id||(!email&&!telefono)) return res.status(400).json({error:'Falta email o teléfono'}); if(!(await productoDeTienda(pool, req.tenantId, producto_id))) return res.status(404).json({error:'Producto no encontrado'}); await pool.query('INSERT INTO notificaciones_stock (producto_id,email,telefono,canal,tenant_id) VALUES ($1,$2,$3,$4,$5)', [producto_id,email||'',telefono||'',['whatsapp','email'].includes(canal)?canal:(telefono?'whatsapp':'email'), req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 // Admin: ver quién espera stock de qué producto
 app.get('/api/notificaciones-stock', authPerm('productos'), async (req,res)=>{
   try{ const {rows}=await pool.query(`SELECT n.*, p.nombre, p.modelo, p.stock FROM notificaciones_stock n LEFT JOIN productos p ON n.producto_id=p.id AND p.tenant_id=n.tenant_id WHERE n.notificado=false AND n.tenant_id=$1 ORDER BY n.created_at DESC LIMIT 200`, [req.tenantId]); res.json(rows); }
