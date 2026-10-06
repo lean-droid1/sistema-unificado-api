@@ -60,6 +60,13 @@ app.use('/api/register', rateLimit({ windowMs: 15 * 60 * 1000, max: 30, message:
 // Límite general por conexión: holgado porque una sola página hace ~20 pedidos y muchos clientes pueden compartir IP
 app.use('/api/', rateLimit({ windowMs: 1 * 60 * 1000, max: 1500, standardHeaders: true, legacyHeaders: false, message: { error: 'Demasiados pedidos seguidos. Esperá unos segundos.' } }));
 app.use('/api/', (req,res,next)=>resolveTenant(req,res,next));
+// El id de sección que llega por la URL tiene que ser un número común. Postgres acepta "0x3" o "1_3" como 3,
+// pero el control de tiendas mayoristas no los reconocía: así un cliente minorista veía precios mayoristas.
+app.use('/api/', (req,res,next)=>{
+  const s = req.query ? req.query.seccion_id : undefined;
+  if(s===undefined || s==='' || s==='all' || s==='null' || s==='undefined' || (typeof s==='string' && /^\d{1,9}$/.test(s))) return next();
+  return res.status(400).json({error:'Sección inválida'});
+});
 app.set('trust proxy', 1);
 
 const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
@@ -117,6 +124,8 @@ app.use('/uploads', express.static(uploadsDir));
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 }, fileFilter: (req,file,cb)=>{ if(file.mimetype.startsWith('image/')) cb(null,true); else cb(new Error('Solo imagenes'), false);} });
 
 const hashToken = (t) => crypto.createHash('sha256').update(t).digest('hex').slice(0,64);
+// Token emitido antes del último cambio/recuperación de contraseña → ya no vale
+const sesionVencida = (u, d) => !!(u && u.sesiones_desde && Number(d && d.iat || 0) < Math.floor(new Date(u.sesiones_desde).getTime()/1000));
 
 const auth = (role) => async (req,res,next)=>{
   try{
@@ -127,8 +136,9 @@ const auth = (role) => async (req,res,next)=>{
     const d = jwt.verify(t, JWT_SECRET);
     if(!tokenDeEstaTienda(d, req)) return res.status(401).json({error:'Tu sesión es de otra tienda. Iniciá sesión de nuevo.'});
     // Siempre se revisa en la base: un usuario borrado o suspendido no sigue entrando con un token viejo
-    const {rows} = await pool.query('SELECT rol, activo FROM usuarios WHERE id=$1 AND tenant_id=$2', [d.id, req.tenantId]).catch(()=>({rows:[]}));
-    if(!rows[0] || rows[0].activo===false) return res.status(401).json({error:'Cuenta desactivada'});
+    const {rows} = await pool.query('SELECT rol, activo, sesiones_desde FROM usuarios WHERE id=$1 AND tenant_id=$2', [d.id, req.tenantId]).catch(()=>({rows:[]}));
+    if(!rows[0] || !rows[0].activo) return res.status(401).json({error:'Cuenta desactivada'});
+    if(sesionVencida(rows[0], d)) return res.status(401).json({error:'Tu sesión venció porque cambió la contraseña. Iniciá sesión de nuevo.'});
     if(role==='admin' && rows[0].rol!=='admin') return res.status(403).json({error:'Sin permiso'});
     req._rol = rows[0].rol;
     req.user=d; req._token=t; next();
@@ -142,8 +152,9 @@ const authPerm = (permiso) => async (req,res,next)=>{
     const revoked = await pool.query('SELECT 1 FROM tokens_revocados WHERE token_hash=$1', [hashToken(t)]).catch(()=>({rows:[]}));
     if(revoked.rows.length) return res.status(401).json({error:'Sesión cerrada'});
     const d = jwt.verify(t, JWT_SECRET);
-    const {rows} = await pool.query('SELECT rol, activo, permisos FROM usuarios WHERE id=$1 AND tenant_id=$2', [d.id, req.tenantId]).catch(()=>({rows:[]}));
+    const {rows} = await pool.query('SELECT rol, activo, permisos, sesiones_desde FROM usuarios WHERE id=$1 AND tenant_id=$2', [d.id, req.tenantId]).catch(()=>({rows:[]}));
     if(!rows[0] || !rows[0].activo) return res.status(401).json({error:'Cuenta desactivada'});
+    if(sesionVencida(rows[0], d)) return res.status(401).json({error:'Tu sesión venció porque cambió la contraseña. Iniciá sesión de nuevo.'});
     const rol = rows[0].rol;
     if(rol === 'admin'){ req.user=d; req._token=t; req._rol=rol; return next(); }
     if(rol === 'subadmin'){
@@ -170,7 +181,7 @@ const limitePlan = async (req, clave) => {
   if(Number(req.tenantId)===1) return Infinity;
   try{ const d=await getTenantData(req.tenantId); const n=Number(d.features && d.features[clave]); return Number.isFinite(n) && n>=0 ? n : Infinity; }catch{ return Infinity; }
 };
-const optionalAuth = async (req,res,next)=>{ try{ const t=req.headers.authorization?.split(' ')[1]; if(t){ const d=jwt.verify(t,JWT_SECRET); if(tokenDeEstaTienda(d, req)){ const revoked=await pool.query('SELECT 1 FROM tokens_revocados WHERE token_hash=$1', [hashToken(t)]).catch(()=>({rows:[]})); const {rows}=revoked.rows.length?{rows:[]}:await pool.query('SELECT activo FROM usuarios WHERE id=$1 AND tenant_id=$2', [d.id, req.tenantId]).catch(()=>({rows:[]})); if(rows[0] && rows[0].activo!==false) req.user=d; } } }catch{} next(); };
+const optionalAuth = async (req,res,next)=>{ try{ const t=req.headers.authorization?.split(' ')[1]; if(t){ const d=jwt.verify(t,JWT_SECRET); if(tokenDeEstaTienda(d, req)){ const revoked=await pool.query('SELECT 1 FROM tokens_revocados WHERE token_hash=$1', [hashToken(t)]).catch(()=>({rows:[]})); const {rows}=revoked.rows.length?{rows:[]}:await pool.query('SELECT activo, rol, sesiones_desde FROM usuarios WHERE id=$1 AND tenant_id=$2', [d.id, req.tenantId]).catch(()=>({rows:[]})); if(rows[0] && rows[0].activo && !sesionVencida(rows[0], d)){ req.user=d; req._rol=rows[0].rol; } } } }catch{} next(); };
 
 // Middleware DUEÑO de la plataforma: solo el owner (Leandro) puede administrar tenants. NO filtra por tenant.
 const authOwner = async (req,res,next)=>{
@@ -180,7 +191,8 @@ const authOwner = async (req,res,next)=>{
     const revoked = await pool.query('SELECT 1 FROM tokens_revocados WHERE token_hash=$1', [hashToken(t)]).catch(()=>({rows:[]}));
     if(revoked.rows.length) return res.status(401).json({error:'Sesión cerrada'});
     const d = jwt.verify(t, JWT_SECRET);
-    const {rows} = await pool.query('SELECT es_owner, activo FROM usuarios WHERE id=$1', [d.id]).catch(()=>({rows:[]}));
+    const {rows} = await pool.query('SELECT es_owner, activo, sesiones_desde FROM usuarios WHERE id=$1', [d.id]).catch(()=>({rows:[]}));
+    if(rows[0] && sesionVencida(rows[0], d)) return res.status(401).json({error:'Tu sesión venció porque cambió la contraseña. Iniciá sesión de nuevo.'});
     if(!rows[0] || !rows[0].activo || !rows[0].es_owner) return res.status(403).json({error:'Solo el dueño de la plataforma'});
     req.user=d; req._token=t; next();
   }catch{ res.status(401).json({error:'Token inválido'}); }
@@ -811,7 +823,16 @@ async function migrate(){
   await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS uq_usuarios_tenant_usuario ON usuarios(tenant_id, usuario)`).catch(e=>console.log('uq usuarios warn', e.message.slice(0,80)));
   // Dueño de la plataforma (Leandro): puede administrar TODOS los tenants. El admin de tenant 1 es el dueño.
   await pool.query(`ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS es_owner BOOLEAN DEFAULT false`).catch(()=>{});
-  await pool.query(`UPDATE usuarios SET es_owner=true WHERE tenant_id=1 AND rol='admin' AND usuario='admin'`).catch(()=>{});
+  // Solo la primera vez (cuando todavía no hay dueño). Antes corría en cada arranque: si el dueño se cambiaba
+  // el nombre de usuario, otro admin de la tienda 1 que se llamara "admin" pasaba a ser dueño de la plataforma.
+  await pool.query(`UPDATE usuarios SET es_owner=true WHERE tenant_id=1 AND rol='admin' AND usuario='admin' AND NOT EXISTS (SELECT 1 FROM usuarios WHERE es_owner=true)`).catch(()=>{});
+  // Sesiones: al cambiar o recuperar la contraseña se cierran las sesiones abiertas antes de ese momento
+  await pool.query(`ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS sesiones_desde TIMESTAMPTZ`); // sin catch: los logins dependen de esta columna
+  // Código de verificación (2FA): intentos fallidos por código
+  await pool.query(`ALTER TABLE otp_codes ADD COLUMN IF NOT EXISTS intentos INT DEFAULT 0`).catch(()=>{});
+  // Sin valor por defecto al agregarla (si no, todos los códigos viejos quedarían con la hora del deploy y contarían como recientes)
+  await pool.query(`ALTER TABLE otp_codes ADD COLUMN IF NOT EXISTS created_at TIMESTAMP`).catch(()=>{});
+  await pool.query(`ALTER TABLE otp_codes ALTER COLUMN created_at SET DEFAULT NOW()`).catch(()=>{});
   // Design defaults
   const defs = {nombre_tienda:'Mi Tienda',logo_url:'',favicon_url:'',color_primario:'#4A69E2',color_secundario:'#232321',color_acento:'#FFA52F',fuente:'Archivo',footer_texto:'',css_custom:'',hero_titulo:'',hero_subtitulo:'',promo_banner:'',whatsapp_numero:'',whatsapp_mensaje:'Hola, quiero consultar sobre un producto',confianza_1_icono:'truck',confianza_1_titulo:'Envío a todo el país',confianza_1_sub:'Andreani y más',confianza_2_icono:'shield',confianza_2_titulo:'Compra segura',confianza_2_sub:'Garantía incluida',confianza_3_icono:'message-circle',confianza_3_titulo:'Atención directa',confianza_3_sub:'WhatsApp'};
   for(const [k,v] of Object.entries(defs)){ await pool.query("INSERT INTO design_config (tenant_id,clave,valor) VALUES (1,$1,$2) ON CONFLICT (tenant_id,clave) DO NOTHING", [k,v]).catch(()=>{}); }
@@ -819,7 +840,9 @@ async function migrate(){
   try{
     const {rows:admins}=await pool.query("SELECT id FROM usuarios WHERE rol='admin' AND tenant_id=1 LIMIT 1");
     if(!admins.length){
-      const adminPass=process.env.ADMIN_PASSWORD||'Admin1234';
+      // Sin ADMIN_PASSWORD se genera una al azar (antes quedaba "Admin1234", conocida por cualquiera)
+      const adminPass=process.env.ADMIN_PASSWORD||('Adm-'+crypto.randomBytes(6).toString('hex'));
+      if(!process.env.ADMIN_PASSWORD) console.log('Contraseña inicial del admin:', adminPass);
       const hash=await bcrypt.hash(adminPass,12);
       await pool.query("INSERT INTO usuarios (tenant_id,nombre,usuario,password,rol,aprobado,activo) VALUES (1,'Administrador','admin',$1,'admin',true,true) ON CONFLICT (tenant_id,usuario) DO NOTHING", [hash]);
       console.log('Admin inicial creado -> usuario: admin (contraseña: la de ADMIN_PASSWORD). Cambiala en Mi Cuenta.');
@@ -1318,11 +1341,13 @@ app.put('/api/arrepentimientos/:id', authPerm('pedidos'), async (req,res)=>{
   }catch(e){ res.status(500).json({error:e.message}); }
 });
 const loginAttempts={};
+// Limpieza: los intentos viejos se borran (antes el mapa crecía sin fin con usuarios inventados → memoria)
+setInterval(()=>{ const lim=Date.now()-15*60*1000; for(const k of Object.keys(loginAttempts)){ if(loginAttempts[k].last<lim) delete loginAttempts[k]; } }, 5*60*1000).unref();
 app.post('/api/login', async (req,res)=>{
   try{
     const {usuario,password,otp_code}=req.body;
     if(!usuario||!password) return res.status(400).json({error:'Usuario y contraseña requeridos'});
-    const ip=req.ip; const key=`${ip}_${usuario.toLowerCase()}`;
+    const ip=req.ip; const key=`${ip}_${String(usuario).toLowerCase().slice(0,100)}`; if(Object.keys(loginAttempts).length>50000) for(const k of Object.keys(loginAttempts)) delete loginAttempts[k];
     if(loginAttempts[key] && loginAttempts[key].count>=5 && Date.now()-loginAttempts[key].last<15*60*1000) return res.status(429).json({error:'Bloqueado 15min'});
     const {rows}=await pool.query('SELECT * FROM usuarios WHERE LOWER(usuario)=LOWER($1) AND activo=true AND tenant_id=$2', [usuario, req.tenantId]);
     if(!rows[0]){ const {rows:pend}=await pool.query('SELECT * FROM usuarios WHERE LOWER(usuario)=LOWER($1) AND aprobado=false AND tenant_id=$2', [usuario, req.tenantId]); if(pend[0]) return res.status(403).json({error:'Pendiente aprobación'}); loginAttempts[key]={count:(loginAttempts[key]?.count||0)+1, last:Date.now()}; return res.status(401).json({error:'Usuario o contraseña incorrectos'}); }
@@ -1330,13 +1355,21 @@ app.post('/api/login', async (req,res)=>{
     if(!valid){ loginAttempts[key]={count:(loginAttempts[key]?.count||0)+1, last:Date.now()}; return res.status(401).json({error:'Usuario o contraseña incorrectos'}); }
     if(rows[0].otp_activo && resend){
       if(!otp_code){
-        const code=Math.floor(100000+Math.random()*900000).toString();
+        // Máximo 8 códigos por hora; cada código nuevo anula los anteriores
+        const {rows:rec}=await pool.query("SELECT COUNT(*)::int AS n FROM otp_codes WHERE usuario_id=$1 AND created_at>NOW()-INTERVAL '1 hour'", [rows[0].id]);
+        if((rec[0]?.n||0)>=8) return res.status(429).json({error:'Pediste muchos códigos seguidos. Esperá una hora e intentá de nuevo.'});
+        await pool.query('UPDATE otp_codes SET usado=true WHERE usuario_id=$1 AND usado=false', [rows[0].id]);
+        const code=String(crypto.randomInt(100000, 1000000));
         await pool.query('INSERT INTO otp_codes (usuario_id,codigo,expira) VALUES ($1,$2,NOW()+INTERVAL \'10 minutes\')', [rows[0].id, code]);
         if(rows[0].email) await resend.emails.send({from:process.env.RESEND_FROM||'noreply@resend.dev', to:rows[0].email, subject:'Código verificación', html:`<h2>Código: <strong>${code}</strong></h2>`}).catch(()=>{});
         return res.json({requires_otp:true, message:'Código enviado'});
       }
-      const {rows:otps}=await pool.query('SELECT * FROM otp_codes WHERE usuario_id=$1 AND codigo=$2 AND expira>NOW() AND usado=false ORDER BY id DESC LIMIT 1', [rows[0].id, otp_code]);
-      if(!otps[0]) return res.status(401).json({error:'Código incorrecto o expirado'});
+      const {rows:otps}=await pool.query('SELECT * FROM otp_codes WHERE usuario_id=$1 AND codigo=$2 AND expira>NOW() AND usado=false ORDER BY id DESC LIMIT 1', [rows[0].id, String(otp_code).trim()]);
+      if(!otps[0]){
+        // Cada error suma un intento al código vigente; con 5 errores se anula y hay que pedir otro
+        await pool.query("UPDATE otp_codes SET intentos=COALESCE(intentos,0)+1, usado=(COALESCE(intentos,0)+1>=5) WHERE usuario_id=$1 AND usado=false AND expira>NOW()", [rows[0].id]).catch(()=>{});
+        return res.status(401).json({error:'Código incorrecto o expirado'});
+      }
       await pool.query('UPDATE otp_codes SET usado=true WHERE id=$1', [otps[0].id]);
     }
     delete loginAttempts[key];
@@ -1381,7 +1414,7 @@ app.post('/api/reset-password', authLimiter, async (req,res)=>{
     const {rows}=await pool.query("SELECT id FROM usuarios WHERE reset_codigo<>'' AND UPPER(reset_codigo)=$1 AND reset_expira>NOW() AND tenant_id=$2", [codigo, req.tenantId]);
     if(!rows[0]) return res.status(400).json({error:'Código inválido o vencido. Pedí uno nuevo.'});
     const hash=await bcrypt.hash(nueva_password,12);
-    await pool.query("UPDATE usuarios SET password=$1, reset_codigo='', reset_expira=NULL WHERE id=$2 AND tenant_id=$3", [hash, rows[0].id, req.tenantId]);
+    await pool.query("UPDATE usuarios SET password=$1, reset_codigo='', reset_expira=NULL, sesiones_desde=NOW() WHERE id=$2 AND tenant_id=$3", [hash, rows[0].id, req.tenantId]);
     res.json({ok:true});
   }catch(e){ res.status(500).json({error:'No se pudo cambiar la contraseña'}); }
 });
@@ -1431,18 +1464,29 @@ app.post('/api/usuarios/rapido', authPerm('usuarios'), async (req,res)=>{
 });
 app.put('/api/me', auth(), async (req,res)=>{
   try{
-    const {nombre,telefono,email,direccion,nombre_fantasia,password,password_actual}=req.body;
-    if(password){
+    const b=req.body||{};
+    // Solo se actualiza lo que llega (antes, un campo que no se mandaba quedaba vacío)
+    const sets=[]; const params=[];
+    for(const f of ['nombre','telefono','email','direccion','nombre_fantasia']){ if(b[f]!==undefined){ params.push(f==='nombre_fantasia' ? (b[f]||'') : b[f]); sets.push(`${f}=$${params.length}`); } }
+    let nuevoToken=null;
+    if(b.password){
       // Cambiar la contraseña exige la actual y una nueva segura
-      const pwError=validatePassword(password); if(pwError) return res.status(400).json({error:pwError});
+      const pwError=validatePassword(b.password); if(pwError) return res.status(400).json({error:pwError});
       const {rows:cur}=await pool.query('SELECT password FROM usuarios WHERE id=$1 AND tenant_id=$2', [req.user.id, req.tenantId]);
-      if(!cur[0] || !password_actual || !(await bcrypt.compare(String(password_actual), cur[0].password))) return res.status(400).json({error:'La contraseña actual no es correcta'});
-      const hash=await bcrypt.hash(password,12);
-      await pool.query('UPDATE usuarios SET nombre=$1,telefono=$2,email=$3,direccion=$4,nombre_fantasia=$5,password=$6 WHERE id=$7 AND tenant_id=$8', [nombre,telefono,email,direccion,nombre_fantasia||'',hash,req.user.id, req.tenantId]);
+      if(!cur[0] || !b.password_actual || !(await bcrypt.compare(String(b.password_actual), cur[0].password))) return res.status(400).json({error:'La contraseña actual no es correcta'});
+      params.push(await bcrypt.hash(b.password,12)); sets.push(`password=$${params.length}`);
+      // Se cierran las demás sesiones abiertas; esta sigue con un token nuevo
+      sets.push('sesiones_desde=NOW()');
     }
-    else{ await pool.query('UPDATE usuarios SET nombre=$1,telefono=$2,email=$3,direccion=$4,nombre_fantasia=$5 WHERE id=$6 AND tenant_id=$7', [nombre,telefono,email,direccion,nombre_fantasia||'',req.user.id, req.tenantId]); }
+    if(sets.length){ params.push(req.user.id, req.tenantId); await pool.query(`UPDATE usuarios SET ${sets.join(',')} WHERE id=$${params.length-1} AND tenant_id=$${params.length}`, params); }
     const {rows}=await pool.query('SELECT * FROM usuarios WHERE id=$1 AND tenant_id=$2', [req.user.id, req.tenantId]);
-    res.json(sanitizeUser(rows[0]));
+    if(b.password && rows[0]){
+      const u=rows[0];
+      // iat un segundo después de sesiones_desde, para que el token nuevo no quede del lado de los cerrados
+      const iat=Math.floor(new Date(u.sesiones_desde||Date.now()).getTime()/1000)+1;
+      nuevoToken=jwt.sign({id:u.id, rol:u.rol, usuario:u.usuario, tenant_id:u.tenant_id||1, es_owner:u.es_owner||false, iat}, JWT_SECRET, {expiresIn:'7d'});
+    }
+    res.json(nuevoToken ? {...sanitizeUser(rows[0]), token:nuevoToken} : sanitizeUser(rows[0]));
   }catch(e){ res.status(500).json({error:e.message}); }
 });
 
@@ -1455,7 +1499,22 @@ app.get('/api/mi-plan', async (req,res)=>{
   try{ const d=await getTenantData(req.tenantId); res.json({ plan:d.plan, estado:d.estado, features:d.features, dias_restantes:d.dias_restantes }); }
   catch(e){ res.status(500).json({error:e.message}); }
 });
-app.put('/api/config', authPerm('config'), async (req,res)=>{ try{ for(const [k,v] of Object.entries(req.body)){ await pool.query("INSERT INTO configuracion (tenant_id,clave,valor) VALUES ($1,$2,$3) ON CONFLICT (tenant_id,clave) DO UPDATE SET valor=$3", [req.tenantId,k,v]); } res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+// Claves que no se tocan desde la config de una tienda: las internas ("_...") y, en la tienda 1, los precios y
+// ofertas de los planes de ComerciApp (esas se cambian solo desde el panel de la plataforma, por el dueño).
+const CONFIG_PLATAFORMA = /^(precio_(basic|pro|full)|oferta_descuento_pct|oferta_meses)$/;
+app.put('/api/config', authPerm('config'), async (req,res)=>{ try{
+  const body = (req.body && typeof req.body === 'object' && !Array.isArray(req.body)) ? req.body : {};
+  let esOwner = false;
+  if(Number(req.tenantId)===1 && Object.keys(body).some(k=>CONFIG_PLATAFORMA.test(k))){
+    const {rows}=await pool.query('SELECT es_owner FROM usuarios WHERE id=$1', [req.user.id]).catch(()=>({rows:[]}));
+    esOwner = !!(rows[0] && rows[0].es_owner);
+  }
+  for(const [k,v] of Object.entries(body)){
+    if(typeof k!=='string' || !k || k.length>100 || k.startsWith('_')) continue;
+    if(Number(req.tenantId)===1 && CONFIG_PLATAFORMA.test(k) && !esOwner) continue;
+    await pool.query("INSERT INTO configuracion (tenant_id,clave,valor) VALUES ($1,$2,$3) ON CONFLICT (tenant_id,clave) DO UPDATE SET valor=$3", [req.tenantId,k,v]);
+  }
+  res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 
 // LISTAS
 app.get('/api/listas', async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM listas_precio WHERE tenant_id=$1 ORDER BY multiplicador', [req.tenantId]); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
@@ -1679,7 +1738,7 @@ app.post('/api/productos/:id/recibir-preventa', authPerm('productos'), async (re
     // RESERVADO REAL: cuenta las unidades pedidas de este producto en pedidos activos (no cancelados)
     const {rows:resv}=await pool.query(`SELECT COALESCE(SUM(pi.cantidad),0)::int as reservado
       FROM pedido_items pi JOIN pedidos p ON pi.pedido_id=p.id
-      WHERE pi.producto_id=$1 AND p.tipo='pedido' AND LOWER(COALESCE(p.estado,'')) NOT IN ('cancelado','anulado','rechazado')`, [req.params.id]);
+      WHERE pi.producto_id=$1 AND p.tenant_id=$2 AND p.tipo='pedido' AND LOWER(COALESCE(p.estado,'')) NOT IN ('cancelado','anulado','rechazado')`, [req.params.id, req.tenantId]);
     const reservado=Number(resv[0].reservado)||0;
     const cantidadRecibida = req.body.cantidad!==undefined ? Number(req.body.cantidad) : cupo;
     // stock nuevo = stock actual + (recibido - reservado). Lo reservado ya se vendió.
@@ -1693,7 +1752,7 @@ app.get('/api/productos/:id/reservado-real', authPerm('productos'), async (req,r
   try{
     const {rows}=await pool.query(`SELECT COALESCE(SUM(pi.cantidad),0)::int as reservado
       FROM pedido_items pi JOIN pedidos p ON pi.pedido_id=p.id
-      WHERE pi.producto_id=$1 AND p.tipo='pedido' AND LOWER(COALESCE(p.estado,'')) NOT IN ('cancelado','anulado','rechazado')`, [req.params.id]);
+      WHERE pi.producto_id=$1 AND p.tenant_id=$2 AND p.tipo='pedido' AND LOWER(COALESCE(p.estado,'')) NOT IN ('cancelado','anulado','rechazado')`, [req.params.id, req.tenantId]);
     res.json({ reservado: Number(rows[0].reservado)||0 });
   }catch(e){ res.status(500).json({error:e.message}); }
 });
@@ -1705,8 +1764,10 @@ const tokenBusqueda = (tk) => '%' + String(tk).toLowerCase().normalize('NFD').re
 // El precio de costo (ahora lo carga el bot con lo que cobra el proveedor) y las notas internas
 // NO salen nunca al público: solo admin/sub-admin los reciben.
 const CAMPOS_PRIVADOS_PROD = ['precio_original', 'costo_proveedor', 'notas', 'pendiente_aprobacion'];
-const esStaffReq = (req) => !!(req.user && ['admin', 'subadmin'].includes(req.user.rol));
-const limpiarProducto = (r) => { if (!r) return r; const o = { ...r }; for (const k of CAMPOS_PRIVADOS_PROD) delete o[k]; return o; };
+// Rol leído de la base por auth/authPerm/optionalAuth (req._rol): un empleado al que le sacan el rol deja de ver costos al instante
+const esStaffReq = (req) => !!(req.user && ['admin', 'subadmin'].includes(req._rol !== undefined ? req._rol : req.user.rol));
+// El SKU del bot ("RXZ-<id del proveedor>") delata al proveedor y su precio: tampoco sale al público
+const limpiarProducto = (r) => { if (!r) return r; const o = { ...r }; for (const k of CAMPOS_PRIVADOS_PROD) delete o[k]; if (typeof o.sku === 'string' && /^RXZ-/i.test(o.sku)) delete o.sku; return o; };
 const limpiarSiPublico = (req, rows) => esStaffReq(req) ? rows : rows.map(limpiarProducto);
 // Tiendas con aprobación (mayorista): sin sesión no se ven precios (igual que en /api/productos)
 // ── Tiendas con aprobación (mayorista): solo las ven y compran los clientes autorizados ──
@@ -1789,8 +1850,8 @@ app.get('/api/productos/novedades', optionalAuth, async (req,res)=>{
 });
 app.get('/api/productos', optionalAuth, async (req,res)=>{
   try{
-    const {q,categoria,page=1,limit=50,seccion_id,marca}=req.query;
-    const esAdminReq = req.user && ['admin', 'subadmin'].includes(req.user.rol);
+    const {q,categoria,page=1,limit=50,marca}=req.query; const seccion_id = req.query.seccion_id==='all' ? '' : req.query.seccion_id;
+    const esAdminReq = esStaffReq(req);
     const incluirOcultos = esAdminReq && (req.query.incluir_ocultos === '1' || req.query.incluir_ocultos === 'true');
     let where = [`tenant_id=$1`]; if (!incluirOcultos) where.push('visible=true');
     const params = [req.tenantId]; let pi = 2;
@@ -1827,7 +1888,7 @@ app.get('/api/productos', optionalAuth, async (req,res)=>{
     res.json({productos:result, total, page:pagN, totalPages:Math.ceil(total/limN)});
   }catch(e){ res.status(500).json({error:e.message}); }
 });
-app.get('/api/categorias', optionalAuth, async (req,res)=>{ try{ const {seccion_id}=req.query; if(seccion_id && (await seccionesRestringidas(req.tenantId)).includes(parseInt(seccion_id,10)) && !(await accesoMayorista(req))) return res.json([]); let q='SELECT DISTINCT categoria FROM productos WHERE visible=true AND tenant_id=$1'; const params=[req.tenantId]; if(seccion_id){ q+=' AND seccion_id=$2'; params.push(seccion_id); } q+=' ORDER BY categoria'; const {rows}=await pool.query(q, params); res.json(rows.map(r=>r.categoria).filter(Boolean)); }catch(e){ res.status(500).json({error:e.message}); } });
+app.get('/api/categorias', optionalAuth, async (req,res)=>{ try{ const {seccion_id}=req.query; if(seccion_id && (await seccionesRestringidas(req.tenantId)).includes(parseInt(seccion_id,10)) && !(await accesoMayorista(req))) return res.json([]); let q='SELECT DISTINCT categoria FROM productos WHERE visible=true AND tenant_id=$1'; const params=[req.tenantId]; if(seccion_id){ q+=' AND seccion_id=$2'; params.push(seccion_id); } else { const restr=await seccionesRestringidas(req.tenantId); if(restr.length && !(await accesoMayorista(req))){ q+=' AND NOT (seccion_id = ANY($2::int[]))'; params.push(restr); } } q+=' ORDER BY categoria'; const {rows}=await pool.query(q, params); res.json(rows.map(r=>r.categoria).filter(Boolean)); }catch(e){ res.status(500).json({error:e.message}); } });
 
 // Categorías con metadata (orden, visible, conteo) — para el ABM del panel
 app.get('/api/categorias/admin', authPerm('productos'), async (req,res)=>{
@@ -2587,7 +2648,7 @@ app.get('/api/bot/vendidos', botAuth, async (req, res) => {
     res.json({ ok: true, dias, productos: rows });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
-app.get('/api/productos/buscar', optionalAuth, async (req,res)=>{ try{ const {q}=req.query; if(!q) return res.json([]); const toks=String(q).trim().split(/\s+/).filter(Boolean).slice(0,8); const campos=`(coalesce(p.nombre,'')||' '||coalesce(p.modelo,'')||' '||coalesce(p.categoria,'')||' '||coalesce(p.marca,'')||' '||coalesce(p.sku,'')||' '||coalesce(p.compatibilidad,''))`; const cond=[]; const params=[req.tenantId]; let pi=2; for(const tk of toks){ cond.push(`${SQL_SIN_ACENTOS(campos)} LIKE $${pi}`); params.push(tokenBusqueda(tk)); pi++; } const whereTok=cond.length?(' AND '+cond.join(' AND ')):''; const {rows}=await pool.query(`SELECT p.id,p.nombre,p.modelo,p.categoria,p.precio_base,p.precio_oferta,p.stock,p.imagen,p.sku,p.codigo_barras,p.seccion_id,p.permitir_sin_stock,p.es_digital,p.usa_variantes,(SELECT MIN(CASE WHEN v.precio_oferta>0 AND v.precio_oferta<v.precio THEN v.precio_oferta ELSE v.precio END) FROM variantes v WHERE v.producto_id=p.id AND v.tenant_id=p.tenant_id AND v.precio>0) AS precio_desde,s.nombre as seccion_nombre,s.color as seccion_color FROM productos p LEFT JOIN secciones s ON p.seccion_id=s.id WHERE p.tenant_id=$1${whereTok}${esStaffReq(req)?'':' AND p.visible=true'} ORDER BY p.nombre LIMIT 20`, params); res.json(esStaffReq(req) ? rows : await sinRestringidas(req, rows, { conservarConAcceso: true })); }catch(e){ res.status(500).json({error:e.message}); } });
+app.get('/api/productos/buscar', optionalAuth, async (req,res)=>{ try{ const {q}=req.query; if(!q) return res.json([]); const toks=String(q).trim().split(/\s+/).filter(Boolean).slice(0,8); const campos=`(coalesce(p.nombre,'')||' '||coalesce(p.modelo,'')||' '||coalesce(p.categoria,'')||' '||coalesce(p.marca,'')||' '||coalesce(p.sku,'')||' '||coalesce(p.compatibilidad,''))`; const cond=[]; const params=[req.tenantId]; let pi=2; for(const tk of toks){ cond.push(`${SQL_SIN_ACENTOS(campos)} LIKE $${pi}`); params.push(tokenBusqueda(tk)); pi++; } const whereTok=cond.length?(' AND '+cond.join(' AND ')):''; const {rows}=await pool.query(`SELECT p.id,p.nombre,p.modelo,p.categoria,p.precio_base,p.precio_oferta,p.stock,p.imagen,p.sku,p.codigo_barras,p.seccion_id,p.permitir_sin_stock,p.es_digital,p.usa_variantes,(SELECT MIN(CASE WHEN v.precio_oferta>0 AND v.precio_oferta<v.precio THEN v.precio_oferta ELSE v.precio END) FROM variantes v WHERE v.producto_id=p.id AND v.tenant_id=p.tenant_id AND v.precio>0) AS precio_desde,s.nombre as seccion_nombre,s.color as seccion_color FROM productos p LEFT JOIN secciones s ON p.seccion_id=s.id WHERE p.tenant_id=$1${whereTok}${esStaffReq(req)?'':' AND p.visible=true'} ORDER BY p.nombre LIMIT 20`, params); res.json(esStaffReq(req) ? rows : (await sinRestringidas(req, rows, { conservarConAcceso: true })).map(limpiarProducto)); }catch(e){ res.status(500).json({error:e.message}); } });
 // Buscar producto por código de barras/SKU exacto (para el escáner). Devuelve 1 producto.
 app.get('/api/productos/por-codigo/:codigo', optionalAuth, async (req,res)=>{
   try{
@@ -2645,7 +2706,7 @@ async function syncImagenPrincipal(productoId, tenantId){
     await pool.query(`UPDATE productos SET imagen = COALESCE((SELECT url FROM producto_imagenes WHERE producto_id=$1 AND tenant_id=$2 ORDER BY orden ASC, id ASC LIMIT 1), imagen) WHERE id=$1 AND tenant_id=$2`, [productoId, tenantId]);
   }catch(e){ console.log('sync img principal warn', e.message.slice(0,80)); }
 }
-app.get('/api/producto-imagenes/:producto_id', async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM producto_imagenes WHERE producto_id=$1 AND tenant_id=$2 ORDER BY orden', [req.params.producto_id, req.tenantId]); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
+app.get('/api/producto-imagenes/:producto_id', optionalAuth, async (req,res)=>{ try{ const b=await bloqueoProductoPublico(req, req.params.producto_id); if(b) return res.status(b.status).json({error:b.error}); const {rows}=await pool.query('SELECT * FROM producto_imagenes WHERE producto_id=$1 AND tenant_id=$2 ORDER BY orden', [req.params.producto_id, req.tenantId]); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
 app.post('/api/producto-imagenes', authPerm('productos'), async (req,res)=>{ try{ const {producto_id,url,orden}=req.body; if(!url||!String(url).trim()) return res.status(400).json({error:'Falta la URL de la imagen'}); const {rows:pp}=await pool.query('SELECT 1 FROM productos WHERE id=$1 AND tenant_id=$2', [producto_id, req.tenantId]); if(!pp[0]) return res.status(404).json({error:'Producto no encontrado'}); const {rows}=await pool.query('INSERT INTO producto_imagenes (tenant_id,producto_id,url,orden) VALUES ($4,$1,$2,$3) RETURNING *', [producto_id,url,orden||0, req.tenantId]); await syncImagenPrincipal(producto_id, req.tenantId); res.json(rows[0]); }catch(e){ res.status(500).json({error:e.message}); } });
 app.delete('/api/producto-imagenes/:id', authPerm('productos'), async (req,res)=>{ try{ const {rows:pv}=await pool.query('SELECT producto_id FROM producto_imagenes WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); await pool.query('DELETE FROM producto_imagenes WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); if(pv[0]) await syncImagenPrincipal(pv[0].producto_id, req.tenantId); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 app.put('/api/producto-imagenes/reorder', authPerm('productos'), async (req,res)=>{ try{ const {items}=req.body; for(const it of items){ await pool.query('UPDATE producto_imagenes SET orden=$1 WHERE id=$2 AND tenant_id=$3', [it.orden,it.id, req.tenantId]); } if(items&&items[0]){ const {rows:pv}=await pool.query('SELECT producto_id FROM producto_imagenes WHERE id=$1 AND tenant_id=$2', [items[0].id, req.tenantId]); if(pv[0]) await syncImagenPrincipal(pv[0].producto_id, req.tenantId); } res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
@@ -2833,6 +2894,7 @@ app.get('/api/usuarios/pendientes/count', authPerm('usuarios'), async (req,res)=
 // Un sub-admin con permiso "usuarios" puede gestionar clientes, pero NO al equipo (admin/sub-admins):
 // si no, podría resetear la clave del dueño o darse rol admin.
 async function staffProtegido(req, targetId){
+  if(!/^\d{1,9}$/.test(String(targetId))) return 'Usuario inválido';
   const {rows}=await pool.query('SELECT rol, es_owner FROM usuarios WHERE id=$1 AND tenant_id=$2', [targetId, req.tenantId]);
   const t=rows[0]; if(!t) return null;
   if(t.es_owner && String(targetId)!==String(req.user?.id)) return 'No se puede modificar la cuenta del dueño de la plataforma';
@@ -2868,30 +2930,75 @@ app.put('/api/usuarios/:id', authPerm('usuarios'), async (req,res)=>{
       if(lp===false) return res.status(400).json({error:'Esa lista de precios no existe más. Elegí otra o "Sin lista".'});
       u.lista_precio_id=lp;
     }
+    // Descuento de revendedor entre 0 y 100 (con más de 100 el precio quedaba negativo y bajaba el total del carrito)
+    if(u.descuento_revendedor!==undefined && u.descuento_revendedor!==null && u.descuento_revendedor!==''){
+      const dr=Number(u.descuento_revendedor);
+      if(!Number.isFinite(dr) || dr<0 || dr>100) return res.status(400).json({error:'El descuento de revendedor tiene que estar entre 0 y 100'});
+      u.descuento_revendedor=dr;
+    }
+    if(u.activo!==undefined) u.activo = (u.activo===true || u.activo==='true');
+    // "ADMIN" y "admin" son el mismo usuario para el login
+    if(u.usuario!==undefined){
+      const {rows:act}=await pool.query('SELECT usuario FROM usuarios WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]);
+      if(act[0] && String(act[0].usuario)===String(u.usuario)) delete u.usuario; // no cambió: no se toca
+      else {
+        u.usuario=String(u.usuario||'').trim();
+        if(u.usuario.length<3) return res.status(400).json({error:'El usuario necesita al menos 3 caracteres'});
+        const {rows:dup}=await pool.query('SELECT 1 FROM usuarios WHERE LOWER(usuario)=LOWER($1) AND tenant_id=$2 AND id<>$3', [u.usuario, req.tenantId, req.params.id]);
+        if(dup[0]) return res.status(400).json({error:'Ese usuario ya existe. Elegí otro.'});
+      }
+    }
+    if(u.password){ const pwError=validatePassword(u.password); if(pwError) return res.status(400).json({error:pwError}); }
     if(u.mayorista===true){ sets.push(`mayorista_solicitado_at=NULL`); }
     for(const f of fields){ if(u[f]!==undefined){ sets.push(`${f}=$${pi++}`); params.push(u[f]); } }
-    if(u.password){ const hash=await bcrypt.hash(u.password,10); sets.push(`password=$${pi++}`); params.push(hash); }
+    if(u.password){ const hash=await bcrypt.hash(u.password,10); sets.push(`password=$${pi++}`); params.push(hash); if(String(req.params.id)!==String(req.user?.id)) sets.push('sesiones_desde=NOW()'); }
     if(!sets.length) return res.json({ok:true});
     params.push(req.params.id); params.push(req.tenantId);
     await pool.query(`UPDATE usuarios SET ${sets.join(',')} WHERE id=$${pi} AND tenant_id=$${pi+1}`, params);
     res.json({ok:true});
   }catch(e){ res.status(500).json({error:e.message}); }
 });
-app.post('/api/usuarios/:id/aprobar', authPerm('usuarios'), async (req,res)=>{ try{ const bloqueo=await staffProtegido(req, req.params.id); if(bloqueo) return res.status(403).json({error:bloqueo}); const lp=await listaPrecioValida(req.tenantId, req.body && req.body.lista_precio_id); await pool.query('UPDATE usuarios SET aprobado=true, activo=true, lista_precio_id=$1 WHERE id=$2 AND tenant_id=$3', [lp||null, req.params.id, req.tenantId]); const {rows}=await pool.query('SELECT * FROM usuarios WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); res.json({ok:true, user:{...rows[0], password:undefined}}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.post('/api/usuarios/:id/aprobar', authPerm('usuarios'), async (req,res)=>{ try{ const bloqueo=await staffProtegido(req, req.params.id); if(bloqueo) return res.status(403).json({error:bloqueo}); const lp=await listaPrecioValida(req.tenantId, req.body && req.body.lista_precio_id); await pool.query('UPDATE usuarios SET aprobado=true, activo=true, lista_precio_id=$1 WHERE id=$2 AND tenant_id=$3', [lp||null, req.params.id, req.tenantId]); const {rows}=await pool.query('SELECT * FROM usuarios WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); res.json({ok:true, user:sanitizeUser(rows[0])}); }catch(e){ res.status(500).json({error:e.message}); } });
 app.post('/api/usuarios/:id/rechazar', authPerm('usuarios'), async (req,res)=>{ try{ const bloqueo=await staffProtegido(req, req.params.id); if(bloqueo) return res.status(403).json({error:bloqueo}); await pool.query('UPDATE usuarios SET activo=false WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
-app.post('/api/usuarios/:id/suspender', authPerm('usuarios'), async (req,res)=>{ try{ const bloqueo=await staffProtegido(req, req.params.id); if(bloqueo) return res.status(403).json({error:bloqueo}); if(String(req.params.id)===String(req.user?.id)) return res.status(400).json({error:'No podés suspender tu propia cuenta'}); const {activo}=req.body; await pool.query('UPDATE usuarios SET activo=$1 WHERE id=$2 AND tenant_id=$3', [activo, req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.post('/api/usuarios/:id/suspender', authPerm('usuarios'), async (req,res)=>{ try{ const bloqueo=await staffProtegido(req, req.params.id); if(bloqueo) return res.status(403).json({error:bloqueo}); if(String(req.params.id)===String(req.user?.id)) return res.status(400).json({error:'No podés suspender tu propia cuenta'}); const activo=req.body && (req.body.activo===true || req.body.activo==='true'); await pool.query('UPDATE usuarios SET activo=$1 WHERE id=$2 AND tenant_id=$3', [activo, req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 // RESET MEJORADO - codigo largo
 app.post('/api/usuarios/:id/reset-password', authPerm('usuarios'), async (req,res)=>{
   try{
     const bloqueo=await staffProtegido(req, req.params.id); if(bloqueo) return res.status(403).json({error:bloqueo});
     const codigo='KICKS-'+crypto.randomBytes(4).toString('hex').toUpperCase();
     const hash=await bcrypt.hash(codigo,10);
-    await pool.query('UPDATE usuarios SET password=$1, reset_codigo=$2, reset_expira=NOW()+INTERVAL \'24 hours\' WHERE id=$3 AND tenant_id=$4', [hash, codigo, req.params.id, req.tenantId]);
+    await pool.query('UPDATE usuarios SET password=$1, reset_codigo=$2, reset_expira=NOW()+INTERVAL \'24 hours\', sesiones_desde=CASE WHEN id=$5 THEN sesiones_desde ELSE NOW() END WHERE id=$3 AND tenant_id=$4', [hash, codigo, req.params.id, req.tenantId, req.user?.id||0]);
     const {rows}=await pool.query('SELECT nombre,telefono,email FROM usuarios WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]);
     res.json({ok:true, codigo, nombre:rows[0]?.nombre, telefono:rows[0]?.telefono, email:rows[0]?.email});
   }catch(e){ res.status(500).json({error:e.message}); }
 });
-app.delete('/api/usuarios/:id', authPerm('usuarios'), async (req,res)=>{ try{ { const bloqueo=await staffProtegido(req, req.params.id); if(bloqueo) return res.status(403).json({error:bloqueo}); if(String(req.params.id)===String(req.user?.id)) return res.status(400).json({error:'No podés borrar tu propia cuenta'}); } await pool.query('DELETE FROM pedido_items WHERE pedido_id IN (SELECT id FROM pedidos WHERE usuario_id=$1 AND tenant_id=$2)', [req.params.id, req.tenantId]); await pool.query('DELETE FROM pedidos WHERE usuario_id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); await pool.query('DELETE FROM usuarios WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+// Borrar un cliente: si tiene pedidos reales NO se borra (antes se borraban sus pedidos y se perdía el historial de ventas).
+// Para esos casos está "Suspender". Los pedidos de prueba sí se borran con él. Todo en una transacción.
+app.delete('/api/usuarios/:id', authPerm('usuarios'), async (req,res)=>{
+  const bloqueo=await staffProtegido(req, req.params.id).catch(()=>'No se pudo verificar la cuenta. Probá de nuevo.'); if(bloqueo) return res.status(403).json({error:bloqueo});
+  if(String(req.params.id)===String(req.user?.id)) return res.status(400).json({error:'No podés borrar tu propia cuenta'});
+  let client;
+  try{
+    client=await pool.connect();
+    const {rows:ped}=await client.query('SELECT COUNT(*)::int AS n FROM pedidos WHERE usuario_id=$1 AND tenant_id=$2 AND COALESCE(is_test,false)=false', [req.params.id, req.tenantId]);
+    if(ped[0].n>0) return res.status(400).json({error:`Este cliente tiene ${ped[0].n} pedido(s). Para no perder el historial de ventas, suspendelo en vez de borrarlo.`});
+    const {rows:cc}=await client.query('SELECT COUNT(*)::int AS n FROM cuenta_corriente WHERE usuario_id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]);
+    if(cc[0].n>0) return res.status(400).json({error:'Este cliente tiene movimientos en su cuenta corriente. Suspendelo en vez de borrarlo.'});
+    await client.query('BEGIN');
+    await client.query('DELETE FROM pedido_items WHERE pedido_id IN (SELECT id FROM pedidos WHERE usuario_id=$1 AND tenant_id=$2)', [req.params.id, req.tenantId]);
+    await client.query('DELETE FROM pedido_pagos WHERE pedido_id IN (SELECT id FROM pedidos WHERE usuario_id=$1 AND tenant_id=$2)', [req.params.id, req.tenantId]);
+    await client.query('DELETE FROM pedidos WHERE usuario_id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]);
+    await client.query('DELETE FROM otp_codes WHERE usuario_id=$1', [req.params.id]);
+    const r=await client.query('DELETE FROM usuarios WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]);
+    await client.query('COMMIT');
+    if(!r.rowCount) return res.status(404).json({error:'No encontrado'});
+    res.json({ok:true});
+  }catch(e){
+    if(client) await client.query('ROLLBACK').catch(()=>{});
+    if(e && e.code==='23503') return res.status(400).json({error:'No se pudo borrar el cliente (tiene datos asociados). Suspendelo en vez de borrarlo.'});
+    console.log('[borrar usuario]', e && e.message); res.status(500).json({error:'No se pudo borrar el cliente. Probá de nuevo.'});
+  }finally{ if(client) client.release(); }
+});
 
 // PEDIDOS V4 - transaccion + is_test + costo_envio
 app.get('/api/pedidos', auth(), async (req,res)=>{
@@ -2912,7 +3019,7 @@ app.get('/api/pedidos', auth(), async (req,res)=>{
     res.json(rows);
   }catch(e){ res.status(500).json({error:e.message}); }
 });
-app.get('/api/pedidos/:id', auth(), async (req,res)=>{ try{ const {rows}=await pool.query('SELECT p.*, u.nombre as usuario_nombre, u.telefono as usuario_telefono, u.email as usuario_email, u.nombre_fantasia, u.direccion as usuario_direccion, s.nombre as seccion_nombre, s.color as seccion_color FROM pedidos p LEFT JOIN usuarios u ON p.usuario_id=u.id LEFT JOIN secciones s ON p.seccion_id=s.id WHERE p.id=$1 AND p.tenant_id=$2', [req.params.id, req.tenantId]); if(!rows[0]) return res.status(404).json({error:'No encontrado'}); if(Number(rows[0].usuario_id)!==Number(req.user.id) && !(await esStaffPedidos(req))) return res.status(404).json({error:'No encontrado'}); const {rows:items}=await pool.query("SELECT pi.*, COALESCE(NULLIF(pi.imagen,''), pr.imagen, '') AS imagen, pr.sku AS producto_sku FROM pedido_items pi LEFT JOIN productos pr ON pr.id=pi.producto_id AND pr.tenant_id=pi.tenant_id WHERE pi.pedido_id=$1 AND pi.tenant_id=$2 ORDER BY pi.id", [req.params.id, req.tenantId]); const {rows:pagos}=await pool.query('SELECT * FROM pedido_pagos WHERE pedido_id=$1 AND tenant_id=$2 ORDER BY created_at', [req.params.id, req.tenantId]); res.json({...rows[0], items, pagos}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.get('/api/pedidos/:id', auth(), async (req,res)=>{ try{ const {rows}=await pool.query('SELECT p.*, u.nombre as usuario_nombre, u.telefono as usuario_telefono, u.email as usuario_email, u.nombre_fantasia, u.direccion as usuario_direccion, s.nombre as seccion_nombre, s.color as seccion_color FROM pedidos p LEFT JOIN usuarios u ON p.usuario_id=u.id LEFT JOIN secciones s ON p.seccion_id=s.id WHERE p.id=$1 AND p.tenant_id=$2', [req.params.id, req.tenantId]); if(!rows[0]) return res.status(404).json({error:'No encontrado'}); const staffPed=await esStaffPedidos(req); if(Number(rows[0].usuario_id)!==Number(req.user.id) && !staffPed) return res.status(404).json({error:'No encontrado'}); let {rows:items}=await pool.query("SELECT pi.*, COALESCE(NULLIF(pi.imagen,''), pr.imagen, '') AS imagen, pr.sku AS producto_sku FROM pedido_items pi LEFT JOIN productos pr ON pr.id=pi.producto_id AND pr.tenant_id=pi.tenant_id WHERE pi.pedido_id=$1 AND pi.tenant_id=$2 ORDER BY pi.id", [req.params.id, req.tenantId]); const {rows:pagos}=await pool.query('SELECT * FROM pedido_pagos WHERE pedido_id=$1 AND tenant_id=$2 ORDER BY created_at', [req.params.id, req.tenantId]); if(!staffPed) items=items.map(({costo_unitario, producto_sku, ...it})=>it); res.json({...rows[0], items, pagos}); }catch(e){ res.status(500).json({error:e.message}); } });
 
 // ═══ PEDIDOS ═══
 // Helpers compartidos: stock (siempre filtrado por tienda) e inserción de ítems.
@@ -3664,7 +3771,7 @@ app.put('/api/metodos-pago/:id', authPerm('config'), async (req,res)=>{ try{ con
 app.delete('/api/metodos-pago/:id', authPerm('config'), async (req,res)=>{ try{ await pool.query('DELETE FROM metodos_pago WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 
 app.get('/api/paginas', async (req,res)=>{ try{ const {seccion_id}=req.query; let q='SELECT * FROM paginas_info WHERE visible=true AND tenant_id=$1'; const params=[req.tenantId]; if(seccion_id){ q+=' AND (seccion_id=$2 OR seccion_id IS NULL)'; params.push(seccion_id); } q+=' ORDER BY orden'; const {rows}=await pool.query(q, params); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
-app.get('/api/paginas/:id', async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM paginas_info WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); if(!rows[0]) return res.status(404).json({error:'No encontrada'}); res.json(rows[0]); }catch(e){ res.status(500).json({error:e.message}); } });
+app.get('/api/paginas/:id', optionalAuth, async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM paginas_info WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); if(!rows[0] || (rows[0].visible===false && !esStaffReq(req))) return res.status(404).json({error:'No encontrada'}); res.json(rows[0]); }catch(e){ res.status(500).json({error:e.message}); } });
 app.post('/api/paginas', authPerm('config'), async (req,res)=>{ try{ const p=req.body; const {rows}=await pool.query('INSERT INTO paginas_info (titulo,slug,contenido,seccion_id,visible,orden,tenant_id) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *', [p.titulo,p.slug,p.contenido||'',p.seccion_id||null,p.visible!==false,p.orden||0, req.tenantId]); res.json(rows[0]); }catch(e){ res.status(500).json({error:e.message}); } });
 app.put('/api/paginas/:id', authPerm('config'), async (req,res)=>{ try{ const p=req.body; await pool.query('UPDATE paginas_info SET titulo=$1,slug=$2,contenido=$3,seccion_id=$4,visible=$5,orden=$6 WHERE id=$7 AND tenant_id=$8', [p.titulo,p.slug,p.contenido||'',p.seccion_id||null,p.visible!==false,p.orden||0,req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 app.delete('/api/paginas/:id', authPerm('config'), async (req,res)=>{ try{ await pool.query('DELETE FROM paginas_info WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
@@ -3730,14 +3837,14 @@ app.get('/api/leads', authPerm('stats'), requiereFeature('marketing'), async (re
 app.put('/api/leads/:id', authPerm('stats'), requiereFeature('marketing'), async (req,res)=>{ try{ await pool.query('UPDATE leads SET contactado=$1 WHERE id=$2 AND tenant_id=$3', [req.body.contactado!==false, req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 app.delete('/api/leads/:id', authPerm('stats'), requiereFeature('marketing'), async (req,res)=>{ try{ await pool.query('DELETE FROM leads WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 
-app.get('/api/favoritos', auth(), async (req,res)=>{ try{ const {rows}=await pool.query(`SELECT f.*, p.nombre, p.modelo, p.marca, p.imagen, p.precio_base, p.precio_oferta, p.moneda, p.stock, p.categoria, p.seccion_id, p.usa_variantes, p.envio_gratis, p.permitir_sin_stock, p.es_digital, p.es_preventa, p.preventa_descuento_pct, p.preventa_fecha, p.preventa_mostrar_fecha, p.preventa_cupo, p.preventa_reservado, p.visible, p.created_at AS creado, ${IMG2('p')} FROM favoritos f JOIN productos p ON f.producto_id=p.id AND p.tenant_id=f.tenant_id WHERE f.usuario_id=$1 AND f.tenant_id=$2 ORDER BY f.created_at DESC`, [req.user.id, req.tenantId]); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
-app.post('/api/favoritos/:producto_id', auth(), async (req,res)=>{ try{ await pool.query('INSERT INTO favoritos (usuario_id,producto_id,tenant_id) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING', [req.user.id, req.params.producto_id, req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.get('/api/favoritos', auth(), async (req,res)=>{ try{ const {rows}=await pool.query(`SELECT f.*, p.nombre, p.modelo, p.marca, p.imagen, p.precio_base, p.precio_oferta, p.moneda, p.stock, p.categoria, p.seccion_id, p.usa_variantes, p.envio_gratis, p.permitir_sin_stock, p.es_digital, p.es_preventa, p.preventa_descuento_pct, p.preventa_fecha, p.preventa_mostrar_fecha, p.preventa_cupo, p.preventa_reservado, p.visible, p.created_at AS creado, ${IMG2('p')} FROM favoritos f JOIN productos p ON f.producto_id=p.id AND p.tenant_id=f.tenant_id WHERE f.usuario_id=$1 AND f.tenant_id=$2 ORDER BY f.created_at DESC`, [req.user.id, req.tenantId]); if(esStaffReq(req)) return res.json(rows); res.json((await sinRestringidas(req, rows.filter(r=>r.visible!==false), { conservarConAcceso: true })).map(limpiarProducto)); }catch(e){ res.status(500).json({error:e.message}); } });
+app.post('/api/favoritos/:producto_id', auth(), async (req,res)=>{ try{ const b=await bloqueoProductoPublico(req, req.params.producto_id); if(b) return res.status(b.status).json({error:b.error}); await pool.query('INSERT INTO favoritos (usuario_id,producto_id,tenant_id) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING', [req.user.id, req.params.producto_id, req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 app.delete('/api/favoritos/:producto_id', auth(), async (req,res)=>{ try{ await pool.query('DELETE FROM favoritos WHERE usuario_id=$1 AND producto_id=$2 AND tenant_id=$3', [req.user.id, req.params.producto_id, req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 
-app.post('/api/notificar-stock', async (req,res)=>{ try{ const {producto_id,email,telefono,canal}=req.body; if(!producto_id||(!email&&!telefono)) return res.status(400).json({error:'Falta email o teléfono'}); await pool.query('INSERT INTO notificaciones_stock (producto_id,email,telefono,canal,tenant_id) VALUES ($1,$2,$3,$4,$5)', [producto_id,email||'',telefono||'',canal||(telefono?'whatsapp':'email'), req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.post('/api/notificar-stock', async (req,res)=>{ try{ const {producto_id,email,telefono,canal}=req.body; if(!producto_id||(!email&&!telefono)) return res.status(400).json({error:'Falta email o teléfono'}); if(!(await productoDeTienda(pool, req.tenantId, producto_id))) return res.status(404).json({error:'Producto no encontrado'}); await pool.query('INSERT INTO notificaciones_stock (producto_id,email,telefono,canal,tenant_id) VALUES ($1,$2,$3,$4,$5)', [producto_id,email||'',telefono||'',canal||(telefono?'whatsapp':'email'), req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 // Admin: ver quién espera stock de qué producto
 app.get('/api/notificaciones-stock', authPerm('productos'), async (req,res)=>{
-  try{ const {rows}=await pool.query(`SELECT n.*, p.nombre, p.modelo, p.stock FROM notificaciones_stock n LEFT JOIN productos p ON n.producto_id=p.id WHERE n.notificado=false AND n.tenant_id=$1 ORDER BY n.created_at DESC LIMIT 200`, [req.tenantId]); res.json(rows); }
+  try{ const {rows}=await pool.query(`SELECT n.*, p.nombre, p.modelo, p.stock FROM notificaciones_stock n LEFT JOIN productos p ON n.producto_id=p.id AND p.tenant_id=n.tenant_id WHERE n.notificado=false AND n.tenant_id=$1 ORDER BY n.created_at DESC LIMIT 200`, [req.tenantId]); res.json(rows); }
   catch(e){ res.status(500).json({error:e.message}); }
 });
 // Admin: marcar una notificación como avisada
@@ -3760,7 +3867,7 @@ app.get('/api/sitemap', async (req,res)=>{
     const base = 'https://' + (dom || 'lean-droidgremio.com');
     const slugify = (x)=> String(x||'').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g,'').replace(/[^a-z0-9]+/g,'-').replace(/(^-|-$)/g,'') || 'producto';
     const esc = (u)=> String(u).replace(/&/g,'&amp;').replace(/</g,'&lt;');
-    const { rows } = await pool.query("SELECT id, nombre, modelo, created_at FROM productos WHERE tenant_id=$1 AND visible=true ORDER BY id DESC LIMIT 5000",[t]);
+    const { rows } = await pool.query("SELECT p.id, p.nombre, p.modelo, p.created_at FROM productos p LEFT JOIN secciones s ON s.id=p.seccion_id AND s.tenant_id=p.tenant_id WHERE p.tenant_id=$1 AND p.visible=true AND COALESCE(s.visible,true)=true AND COALESCE(s.requiere_aprobacion,false)=false ORDER BY p.id DESC LIMIT 5000",[t]);
     let xml='<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n';
     xml+=`<url><loc>${base}/</loc><changefreq>daily</changefreq><priority>1.0</priority></url>\n`;
     for(const p of rows){
