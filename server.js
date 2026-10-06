@@ -2630,7 +2630,8 @@ app.post('/api/bot/aprobar', botAuth, async (req, res) => {
 app.get('/api/bot/skus', botAuth, async (req, res) => {
   const t = req.botTenantId;
   try {
-    const { rows } = await pool.query("SELECT sku, stock FROM productos WHERE tenant_id=$1 AND sku LIKE 'RXZ-%'", [t]);
+    // Con categoría (el bot no marca "caídos" de categorías excluidas) y costo (referencia para precios raros)
+    const { rows } = await pool.query("SELECT sku, stock, categoria, costo_proveedor FROM productos WHERE tenant_id=$1 AND sku LIKE 'RXZ-%'", [t]);
     res.json({ ok: true, skus: rows });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -2660,6 +2661,26 @@ async function avisarTelegramBot(t, texto) {
 }
 const minsDesde = (d) => Math.round((Date.now() - new Date(d).getTime()) / 60000);
 const durTxt = (m) => m < 90 ? `${m} min` : `${Math.floor(m / 60)} h ${m % 60} min`;
+// Ajustes del bot que tienen que sobrevivir a sus deploys (su base es un archivo que se borra): categorías excluidas, aprobación de nuevos
+app.get('/api/bot/ajustes', botAuth, async (req, res) => {
+  try {
+    const { rows } = await pool.query("SELECT valor FROM configuracion WHERE tenant_id=$1 AND clave='_bot_ajustes'", [req.botTenantId]);
+    let ajustes = {}; try { ajustes = rows[0] ? JSON.parse(rows[0].valor || '{}') : {}; } catch {}
+    res.json({ ok: true, ajustes });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.put('/api/bot/ajustes', botAuth, async (req, res) => {
+  try {
+    const a = (req.body && req.body.ajustes && typeof req.body.ajustes === 'object') ? req.body.ajustes : {};
+    // Se combina con lo guardado (un ajuste que no viene no se borra)
+    const { rows: prev } = await pool.query("SELECT valor FROM configuracion WHERE tenant_id=$1 AND clave='_bot_ajustes'", [req.botTenantId]);
+    let limpio = {}; try { limpio = prev[0] ? (JSON.parse(prev[0].valor || '{}') || {}) : {}; } catch {}
+    if (Array.isArray(a.categorias_excluidas)) limpio.categorias_excluidas = a.categorias_excluidas.map(x => String(x).slice(0, 100)).slice(0, 100);
+    if (typeof a.aprobar_nuevos === 'boolean') limpio.aprobar_nuevos = a.aprobar_nuevos;
+    await pool.query("INSERT INTO configuracion (tenant_id,clave,valor) VALUES ($1,'_bot_ajustes',$2) ON CONFLICT (tenant_id,clave) DO UPDATE SET valor=$2", [req.botTenantId, JSON.stringify(limpio)]);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
 app.post('/api/bot/latido', botAuth, async (req, res) => {
   const t = req.botTenantId;
   try {
