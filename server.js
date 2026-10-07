@@ -1966,14 +1966,14 @@ app.get('/api/productos', optionalAuth, async (req,res)=>{
     const countQ=`SELECT COUNT(*) FROM productos WHERE ${where.join(' AND ')}`;
     const {rows:cRows}=await pool.query(countQ, params);
     const total=parseInt(cRows[0].count);
-    const query=`SELECT *, (SELECT MIN(CASE WHEN v.precio_oferta>0 AND v.precio_oferta<v.precio THEN v.precio_oferta ELSE v.precio END) FROM variantes v WHERE v.producto_id=productos.id AND v.tenant_id=productos.tenant_id AND v.precio>0) AS precio_desde, (SELECT v.moneda FROM variantes v WHERE v.producto_id=productos.id AND v.tenant_id=productos.tenant_id AND v.precio>0 ORDER BY (CASE WHEN v.precio_oferta>0 AND v.precio_oferta<v.precio THEN v.precio_oferta ELSE v.precio END) ASC LIMIT 1) AS moneda_desde, ${IMG2('productos')} FROM productos WHERE ${where.join(' AND ')} ORDER BY ${req.query.orden === 'lista' ? 'posicion ASC, id ASC' : 'created_at DESC'} LIMIT $${pi} OFFSET $${pi+1}`;
+    const query=`SELECT *, ${sqlDesde('productos')}, ${IMG2('productos')} FROM productos WHERE ${where.join(' AND ')} ORDER BY ${req.query.orden === 'lista' ? 'posicion ASC, id ASC' : 'created_at DESC'} LIMIT $${pi} OFFSET $${pi+1}`;
     const {rows}=await pool.query(query, [...params, limN, offset]);
     // hide price mayorista sin login
     let result=rows;
     if(!req.user){
       const {rows:secs}=await pool.query('SELECT id FROM secciones WHERE slug=$1 AND tenant_id=$2', ['mayorista', req.tenantId]).catch(()=>({rows:[]}));
       const mayId=secs[0]?.id;
-      if(mayId) result=rows.map(r=> r.seccion_id==mayId ? {...r, precio_base:0, precio_oferta:0} : r);
+      if(mayId) result=rows.map(r=> r.seccion_id==mayId ? {...r, precio_base:0, precio_oferta:0, precio_desde:null} : r);
     }
     if(!esAdminReq) result=result.map(limpiarProducto);
     res.json({productos:result, total, page:pagN, totalPages:Math.ceil(total/limN)});
@@ -2762,7 +2762,7 @@ app.get('/api/bot/vendidos', botAuth, async (req, res) => {
     res.json({ ok: true, dias, productos: rows });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
-app.get('/api/productos/buscar', optionalAuth, async (req,res)=>{ try{ const {q}=req.query; if(!q) return res.json([]); const toks=String(q).trim().split(/\s+/).filter(Boolean).slice(0,8); const campos=`(coalesce(p.nombre,'')||' '||coalesce(p.modelo,'')||' '||coalesce(p.categoria,'')||' '||coalesce(p.marca,'')||' '||coalesce(p.sku,'')||' '||coalesce(p.compatibilidad,''))`; const cond=[]; const params=[req.tenantId]; let pi=2; for(const tk of toks){ cond.push(`${SQL_SIN_ACENTOS(campos)} LIKE $${pi}`); params.push(tokenBusqueda(tk)); pi++; } const whereTok=cond.length?(' AND '+cond.join(' AND ')):''; const {rows}=await pool.query(`SELECT p.id,p.nombre,p.modelo,p.categoria,p.precio_base,p.precio_oferta,p.stock,p.imagen,p.sku,p.codigo_barras,p.seccion_id,p.permitir_sin_stock,p.es_digital,p.usa_variantes,(SELECT MIN(CASE WHEN v.precio_oferta>0 AND v.precio_oferta<v.precio THEN v.precio_oferta ELSE v.precio END) FROM variantes v WHERE v.producto_id=p.id AND v.tenant_id=p.tenant_id AND v.precio>0) AS precio_desde,s.nombre as seccion_nombre,s.color as seccion_color FROM productos p LEFT JOIN secciones s ON p.seccion_id=s.id WHERE p.tenant_id=$1${whereTok}${esStaffReq(req)?'':' AND p.visible=true'} ORDER BY p.nombre LIMIT 20`, params); res.json(esStaffReq(req) ? rows : (await sinRestringidas(req, rows, { conservarConAcceso: true })).map(limpiarProducto)); }catch(e){ res.status(500).json({error:e.message}); } });
+app.get('/api/productos/buscar', optionalAuth, async (req,res)=>{ try{ const {q}=req.query; if(!q) return res.json([]); const toks=String(q).trim().split(/\s+/).filter(Boolean).slice(0,8); const campos=`(coalesce(p.nombre,'')||' '||coalesce(p.modelo,'')||' '||coalesce(p.categoria,'')||' '||coalesce(p.marca,'')||' '||coalesce(p.sku,'')||' '||coalesce(p.compatibilidad,''))`; const cond=[]; const params=[req.tenantId]; let pi=2; for(const tk of toks){ cond.push(`${SQL_SIN_ACENTOS(campos)} LIKE $${pi}`); params.push(tokenBusqueda(tk)); pi++; } const whereTok=cond.length?(' AND '+cond.join(' AND ')):''; const {rows}=await pool.query(`SELECT p.id,p.nombre,p.modelo,p.categoria,p.precio_base,p.precio_oferta,p.stock,p.imagen,p.sku,p.codigo_barras,p.seccion_id,p.permitir_sin_stock,p.es_digital,p.usa_variantes,${sqlDesde('p')},s.nombre as seccion_nombre,s.color as seccion_color FROM productos p LEFT JOIN secciones s ON p.seccion_id=s.id WHERE p.tenant_id=$1${whereTok}${esStaffReq(req)?'':' AND p.visible=true'} ORDER BY p.nombre LIMIT 20`, params); res.json(esStaffReq(req) ? rows : (await sinRestringidas(req, rows, { conservarConAcceso: true })).map(limpiarProducto)); }catch(e){ res.status(500).json({error:e.message}); } });
 // Buscar producto por código de barras/SKU exacto (para el escáner). Devuelve 1 producto.
 app.get('/api/productos/por-codigo/:codigo', optionalAuth, async (req,res)=>{
   try{
@@ -2792,7 +2792,7 @@ app.post('/api/productos/generar-codigos', authPerm('productos'), async (req,res
     res.json({ok:true, generados});
   }catch(e){ res.status(500).json({error:e.message}); }
 });
-app.get('/api/productos/id/:id', optionalAuth, async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM productos WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); if(!rows[0] || (!esStaffReq(req) && rows[0].visible===false)) return res.status(404).json({error:'No encontrado'}); if(!esStaffReq(req) && (await sinRestringidas(req, rows, { conservarConAcceso: true })).length===0) return res.status(404).json({error:'Este producto es solo para clientes mayoristas autorizados'}); if(esStaffReq(req)) return res.json(rows[0]); const [r]=await ocultarPreciosAprobacion(req, rows); res.json(limpiarProducto(r)); }catch(e){ res.status(500).json({error:e.message}); } });
+app.get('/api/productos/id/:id', optionalAuth, async (req,res)=>{ try{ if(!/^\d{1,9}$/.test(String(req.params.id))) return res.status(404).json({error:'No encontrado'}); const {rows}=await pool.query(`SELECT *, ${sqlDesde('productos')} FROM productos WHERE id=$1 AND tenant_id=$2`, [req.params.id, req.tenantId]); if(!rows[0] || (!esStaffReq(req) && rows[0].visible===false)) return res.status(404).json({error:'No encontrado'}); if(!esStaffReq(req) && (await sinRestringidas(req, rows, { conservarConAcceso: true })).length===0) return res.status(404).json({error:'Este producto es solo para clientes mayoristas autorizados'}); if(esStaffReq(req)) return res.json(rows[0]); const [r]=await ocultarPreciosAprobacion(req, rows); res.json(limpiarProducto(r)); }catch(e){ res.status(500).json({error:e.message}); } });
 
 // Validar presupuesto antes de convertir: chequear stock y precios actuales
 app.post('/api/pedidos/:id/validar-conversion', authPerm('pedidos'), async (req,res)=>{
@@ -3170,6 +3170,13 @@ async function validarStockItems(client, tenantId, items){
     const puedeSinStock = pr.permitir_sin_stock || pr.es_digital || sec.permitir_sin_stock || sec.ignorar_stock;
     if(!puedeSinStock && Number(pr.stock) < e.cant) throw new CheckoutError(`Sin stock suficiente: ${nombre} (disponible: ${Math.max(0, Number(pr.stock)||0)})`);
   }
+}
+// Precio "desde" de un producto con variantes: la variante EN PESOS más barata (es la que se muestra y la que lee Google);
+// solo si no tiene ninguna en pesos, la más barata en otra moneda. Devuelve precio_desde y moneda_desde.
+function sqlDesde(t){
+  const pv="CASE WHEN v.precio_oferta>0 AND v.precio_oferta<v.precio THEN v.precio_oferta ELSE v.precio END";
+  const desde=`FROM variantes v WHERE v.producto_id=${t}.id AND v.tenant_id=${t}.tenant_id AND v.precio>0 ORDER BY (COALESCE(v.moneda,'ARS')<>'ARS'), (${pv}) ASC LIMIT 1`;
+  return `(SELECT ${pv} ${desde}) AS precio_desde, (SELECT COALESCE(v.moneda,'ARS') ${desde}) AS moneda_desde`;
 }
 async function insertarItems(client, tenantId, pedidoId, items, descontarStock){
   const propios=await idsProductosDeTienda(client, tenantId, items.map(i=>i.producto_id));
@@ -4014,8 +4021,8 @@ app.get('/api/busqueda-global', optionalAuth, async (req,res)=>{
     for(const sec of secciones){
       const params=[sec.id, req.tenantId]; let pi=3; const cond=[];
       for(const tk of toks){ cond.push(`${SQL_SIN_ACENTOS(campos)} LIKE $${pi}`); params.push(tokenBusqueda(tk)); pi++; }
-      const {rows}=await pool.query(`SELECT id,tenant_id,seccion_id,nombre,modelo,marca,categoria,precio_base,precio_oferta,moneda,imagen,stock,envio_gratis,permitir_sin_stock,es_digital,usa_variantes,es_preventa,preventa_precio,preventa_descuento_pct,preventa_fecha,preventa_mostrar_fecha,preventa_cupo,preventa_reservado,created_at,${IMG2('productos')},(SELECT MIN(CASE WHEN v.precio_oferta>0 AND v.precio_oferta<v.precio THEN v.precio_oferta ELSE v.precio END) FROM variantes v WHERE v.producto_id=productos.id AND v.tenant_id=productos.tenant_id AND v.precio>0) AS precio_desde,(SELECT v.moneda FROM variantes v WHERE v.producto_id=productos.id AND v.tenant_id=productos.tenant_id AND v.precio>0 ORDER BY (CASE WHEN v.precio_oferta>0 AND v.precio_oferta<v.precio THEN v.precio_oferta ELSE v.precio END) ASC LIMIT 1) AS moneda_desde FROM productos WHERE seccion_id=$1 AND tenant_id=$2 AND visible=true${cond.length?' AND '+cond.join(' AND '):''} ORDER BY stock DESC LIMIT 50`, params);
-      if(rows.length){ const hidePrice=sec.slug==='mayorista' && !req.user; resultados.push({seccion:sec, productos: hidePrice? rows.map(r=>({...r, precio_base:0, precio_oferta:0})) : rows}); }
+      const {rows}=await pool.query(`SELECT id,tenant_id,seccion_id,nombre,modelo,marca,categoria,precio_base,precio_oferta,moneda,imagen,stock,envio_gratis,permitir_sin_stock,es_digital,usa_variantes,es_preventa,preventa_precio,preventa_descuento_pct,preventa_fecha,preventa_mostrar_fecha,preventa_cupo,preventa_reservado,created_at,${IMG2('productos')},${sqlDesde('productos')} FROM productos WHERE seccion_id=$1 AND tenant_id=$2 AND visible=true${cond.length?' AND '+cond.join(' AND '):''} ORDER BY stock DESC LIMIT 50`, params);
+      if(rows.length){ const hidePrice=sec.slug==='mayorista' && !req.user; resultados.push({seccion:sec, productos: hidePrice? rows.map(r=>({...r, precio_base:0, precio_oferta:0, precio_desde:null})) : rows}); }
     }
     res.json({resultados, total: resultados.reduce((s,r)=>s+r.productos.length,0)});
   }catch(e){ res.status(500).json({error:e.message}); }
