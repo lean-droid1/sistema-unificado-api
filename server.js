@@ -575,8 +575,11 @@ async function migrate(){
     `UPDATE pedidos SET estado_pago='impago' WHERE estado_pago='pendiente' OR estado_pago IS NULL OR estado_pago=''`,
     `ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS moneda VARCHAR(10) DEFAULT 'ARS'`,
     `ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS codigo_seguimiento VARCHAR(120) DEFAULT ''`,
+    `ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS pedido_vinculado INT`,
     `DELETE FROM carritos_abandonados c USING carritos_abandonados c2 WHERE c.recuperado=false AND c2.recuperado=false AND c.tenant_id=c2.tenant_id AND c.usuario_id=c2.usuario_id AND c.usuario_id IS NOT NULL AND (c.created_at < c2.created_at OR (c.created_at=c2.created_at AND c.id<c2.id))`,
-    `UPDATE pedidos SET moneda='USDT' WHERE (moneda IS NULL OR moneda='ARS') AND EXISTS(SELECT 1 FROM pedido_items pi LEFT JOIN productos pr ON pr.id=pi.producto_id AND pr.tenant_id=(SELECT tenant_id FROM pedidos WHERE id=pi.pedido_id) LEFT JOIN variantes v ON v.id=pi.variante_id WHERE pi.pedido_id=pedidos.id AND COALESCE(v.moneda, pr.moneda,'ARS')='USDT')`,
+    `UPDATE pedidos SET moneda='USDT' WHERE (moneda IS NULL OR moneda='ARS') AND EXISTS(SELECT 1 FROM pedido_items pi LEFT JOIN productos pr ON pr.id=pi.producto_id AND pr.tenant_id=(SELECT tenant_id FROM pedidos WHERE id=pi.pedido_id) LEFT JOIN variantes v ON v.id=pi.variante_id WHERE pi.pedido_id=pedidos.id AND COALESCE(v.moneda, pr.moneda,'ARS')='USDT') AND NOT EXISTS(SELECT 1 FROM pedido_items pi LEFT JOIN productos pr ON pr.id=pi.producto_id AND pr.tenant_id=(SELECT tenant_id FROM pedidos WHERE id=pi.pedido_id) LEFT JOIN variantes v ON v.id=pi.variante_id WHERE pi.pedido_id=pedidos.id AND (pr.id IS NOT NULL OR v.id IS NOT NULL) AND COALESCE(v.moneda, pr.moneda,'ARS')='ARS')`,
+    // Pedidos mezclados de antes de separar pesos y USDT: su total quedó en pesos, así que son en pesos (antes se los marcaba USDT)
+    `UPDATE pedidos SET moneda='ARS' WHERE moneda='USDT' AND pedido_vinculado IS NULL AND created_at < '2026-10-08' AND EXISTS(SELECT 1 FROM pedido_items pi LEFT JOIN productos pr ON pr.id=pi.producto_id AND pr.tenant_id=(SELECT tenant_id FROM pedidos WHERE id=pi.pedido_id) LEFT JOIN variantes v ON v.id=pi.variante_id WHERE pi.pedido_id=pedidos.id AND (pr.id IS NOT NULL OR v.id IS NOT NULL) AND COALESCE(v.moneda, pr.moneda,'ARS')='ARS') AND EXISTS(SELECT 1 FROM pedido_items pi LEFT JOIN productos pr ON pr.id=pi.producto_id AND pr.tenant_id=(SELECT tenant_id FROM pedidos WHERE id=pi.pedido_id) LEFT JOIN variantes v ON v.id=pi.variante_id WHERE pi.pedido_id=pedidos.id AND COALESCE(v.moneda, pr.moneda,'ARS')<>'ARS')`,
     `CREATE TABLE IF NOT EXISTS ordenes_compra (id SERIAL PRIMARY KEY, proveedor VARCHAR(200), seccion_id INT, estado VARCHAR(20) DEFAULT 'pendiente', total NUMERIC(12,2) DEFAULT 0, notas TEXT, recibida BOOLEAN DEFAULT false, created_at TIMESTAMP DEFAULT NOW())`,
     `CREATE TABLE IF NOT EXISTS orden_compra_items (id SERIAL PRIMARY KEY, orden_id INT REFERENCES ordenes_compra(id) ON DELETE CASCADE, producto_id INT, nombre_producto VARCHAR(300), cantidad INT DEFAULT 1, costo_unitario NUMERIC(12,2) DEFAULT 0)`,
     `ALTER TABLE secciones ADD COLUMN IF NOT EXISTS permitir_sin_stock BOOLEAN DEFAULT false`,
@@ -1229,22 +1232,23 @@ async function notificarVentaAdmin(pedidos, comprador){
     const {rows:dc}=await pool.query("SELECT valor FROM design_config WHERE clave='nombre_tienda' AND tenant_id=$1", [tid]).catch(()=>({rows:[]}));
     const tienda = (dc[0] && dc[0].valor) || 'Tu tienda';
     const baseUrl = process.env.PUBLIC_URL || process.env.FRONTEND_URL || '';
-    const total = pedidos.reduce((s,p)=>s+Number(p.total||0),0);
+    const totTxt = totalesMail(pedidos);
     const nombreCliente = (comprador && (comprador.nombre||comprador.usuario)) || 'Cliente';
     let compradorEmail = (comprador && comprador.email) || '';
     try{ const df=pedidos[0].datos_facturacion; const o=typeof df==='string'?JSON.parse(df):df; compradorEmail = compradorEmail || (o&&(o.email||o.mail))||''; }catch(e){}
+    const mixta = pedidos.some(p=>p.moneda==='USDT') && pedidos.some(p=>p.moneda!=='USDT');
     let filas = '';
     for(const p of pedidos){
       const link = baseUrl ? `${baseUrl}/?pedido=${p.id}` : '';
       const num = String(p.id).padStart(4,'0');
-      const items = await _itemsPedidoHtml(p.id);
-      filas += `<tr><td colspan="2" style="padding:10px 12px;border-top:2px solid #333;font-weight:700">Pedido #${num} — $${Number(p.total||0).toLocaleString('es-AR')} ${link?`· <a href="${link}">Ver orden →</a>`:''}</td></tr>${items}`;
+      const items = await _itemsPedidoHtml(p.id, p.moneda);
+      filas += `<tr><td colspan="2" style="padding:10px 12px;border-top:2px solid #333;font-weight:700">Pedido #${num}${mixta?` (${etiquetaMonedaMail(p.moneda)})`:''} — ${montoMail(p.total, p.moneda)} ${link?`· <a href="${link}">Ver orden →</a>`:''}</td></tr>${items}`;
     }
     const html = `
       <div style="font-family:system-ui,sans-serif;max-width:520px;margin:0 auto">
         <h2 style="color:#16a34a">Nueva venta en ${escMail(tienda)}</h2>
         <p>Cliente: <strong>${escMail(nombreCliente)}</strong></p>
-        <p>Total: <strong style="font-size:20px">$${total.toLocaleString('es-AR')}</strong></p>
+        <p>Total: <strong style="font-size:20px">${totTxt}</strong></p>
         <table style="width:100%;border-collapse:collapse;margin-top:12px">
           <tbody>${filas}</tbody>
         </table>
@@ -1254,7 +1258,7 @@ async function notificarVentaAdmin(pedidos, comprador){
       from: `${tienda} <${process.env.RESEND_FROM || 'onboarding@resend.dev'}>`,
       to: destino,
       reply_to: compradorEmail || undefined,
-      subject: `Nueva venta $${total.toLocaleString('es-AR')} — ${tienda}`,
+      subject: `Nueva venta ${totTxt} — ${tienda}`,
       html,
     });
     if(r && r.error){ console.log('[venta-mail] Resend error:', JSON.stringify(r.error)); }
@@ -1264,12 +1268,23 @@ async function notificarVentaAdmin(pedidos, comprador){
 // ── Helpers de mail reutilizables ──
 // Escapa texto que viene de clientes antes de meterlo en el HTML de un mail
 const escMail = (x) => String(x==null?'':x).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-async function _itemsPedidoHtml(pedidoId){
-  const {rows}=await pool.query('SELECT nombre_producto, cantidad, precio_unitario, variante_combinacion FROM pedido_items WHERE pedido_id=$1', [pedidoId]).catch(()=>({rows:[]}));
+// Montos de los mails en la moneda del pedido: un pedido en USDT nunca se muestra con "$"
+const montoMail = (n, moneda) => moneda==='USDT' ? `USDT ${Number(n||0).toLocaleString('es-AR')}` : `$${Number(n||0).toLocaleString('es-AR')}`;
+const etiquetaMonedaMail = (moneda) => moneda==='USDT' ? 'en USDT' : 'en pesos';
+// "$X", "USDT Y" o "$X + USDT Y" (los totales de cada moneda por separado, nunca sumados)
+function totalesMail(pedidos){
+  const ars=pedidos.filter(p=>p.moneda!=='USDT'), usdt=pedidos.filter(p=>p.moneda==='USDT');
+  const tA=ars.reduce((s,p)=>s+Number(p.total||0),0), tU=usdt.reduce((s,p)=>s+Number(p.total||0),0);
+  if(!usdt.length) return montoMail(tA,'ARS');
+  if(!ars.length) return montoMail(tU,'USDT');
+  return `${montoMail(tA,'ARS')} + ${montoMail(tU,'USDT')}`;
+}
+async function _itemsPedidoHtml(pedidoId, moneda){
+  const {rows}=await pool.query('SELECT nombre_producto, cantidad, precio_unitario, variante_combinacion FROM pedido_items WHERE pedido_id=$1 ORDER BY id', [pedidoId]).catch(()=>({rows:[]}));
   return rows.map(i=>{
     const sub=Number(i.precio_unitario||0)*Number(i.cantidad||1);
     const varTxt=i.variante_combinacion?`<div style="color:#888;font-size:12px">${escMail(i.variante_combinacion)}</div>`:'';
-    return `<tr><td style="padding:8px 12px;border-bottom:1px solid #eee">${escMail(i.cantidad||1)}× ${escMail(i.nombre_producto||'Producto')}${varTxt}</td><td style="padding:8px 12px;border-bottom:1px solid #eee;text-align:right;white-space:nowrap">$${sub.toLocaleString('es-AR')}</td></tr>`;
+    return `<tr><td style="padding:8px 12px;border-bottom:1px solid #eee">${escMail(i.cantidad||1)}× ${escMail(i.nombre_producto||'Producto')}${varTxt}</td><td style="padding:8px 12px;border-bottom:1px solid #eee;text-align:right;white-space:nowrap">${montoMail(sub, moneda)}</td></tr>`;
   }).join('');
 }
 async function _sendMail(to, subject, html, opts={}){
@@ -1307,22 +1322,28 @@ async function emailCompraCliente(tenantId, pedidos, comprador){
     if(!email && comprador && comprador.id){ const {rows}=await pool.query('SELECT email FROM usuarios WHERE id=$1',[comprador.id]).catch(()=>({rows:[]})); email=rows[0]&&rows[0].email; }
     if(!email) return;
     const {tienda, baseUrl, email:tiendaEmail}=await _tiendaInfo(tenantId);
-    const total=pedidos.reduce((s,p)=>s+Number(p.total||0),0);
+    const hayUsdt=pedidos.some(p=>p.moneda==='USDT'), hayArs=pedidos.some(p=>p.moneda!=='USDT');
     let bloques='';
     for(const p of pedidos){
-      const filas=await _itemsPedidoHtml(p.id);
+      const filas=await _itemsPedidoHtml(p.id, p.moneda);
       const num=String(p.id).padStart(4,'0');
-      bloques+=`<div style="margin-top:14px"><div style="font-weight:700;margin-bottom:6px">Pedido #${num}</div><table style="width:100%;border-collapse:collapse">${filas}<tr><td style="padding:8px 12px;font-weight:700">Total</td><td style="padding:8px 12px;text-align:right;font-weight:700">$${Number(p.total||0).toLocaleString('es-AR')}</td></tr></table></div>`;
+      const envio=Number(p.costo_envio||0)>0 ? `<tr><td style="padding:8px 12px;color:#666">Envío</td><td style="padding:8px 12px;text-align:right;color:#666">${montoMail(p.costo_envio, p.moneda)}</td></tr>` : '';
+      const desc=Number(p.descuento||0)>0 ? `<tr><td style="padding:8px 12px;color:#16a34a">Descuento</td><td style="padding:8px 12px;text-align:right;color:#16a34a">-${montoMail(p.descuento, p.moneda)}</td></tr>` : '';
+      bloques+=`<div style="margin-top:14px"><div style="font-weight:700;margin-bottom:6px">Pedido #${num}${hayUsdt&&hayArs?` · a pagar ${etiquetaMonedaMail(p.moneda)}`:''}</div><table style="width:100%;border-collapse:collapse">${filas}${desc}${envio}<tr><td style="padding:8px 12px;font-weight:700">Total</td><td style="padding:8px 12px;text-align:right;font-weight:700">${montoMail(p.total, p.moneda)}</td></tr></table></div>`;
     }
+    const totalesHtml = hayUsdt&&hayArs
+      ? `<p style="font-size:16px;margin:14px 0 4px">Total a pagar en pesos: <strong>${totalesMail(pedidos.filter(p=>p.moneda!=='USDT'))}</strong></p><p style="font-size:16px;margin:0">Total a pagar en USDT: <strong>${totalesMail(pedidos.filter(p=>p.moneda==='USDT'))}</strong></p><p style="color:#666;font-size:13px;margin-top:6px">Son dos pagos separados: uno en pesos y otro en USDT.</p>`
+      : `<p style="font-size:18px;margin-top:14px">Total: <strong>${totalesMail(pedidos)}</strong></p>`;
     const html=`<div style="font-family:system-ui,sans-serif;max-width:560px;margin:0 auto">
       <h2 style="color:#16a34a">¡Gracias por tu compra en ${tienda}!</h2>
       <p>Recibimos tu pedido. Este es el detalle:</p>
       ${bloques}
-      <p style="font-size:18px;margin-top:14px">Total: <strong>$${total.toLocaleString('es-AR')}</strong></p>
+      ${totalesHtml}
       ${baseUrl?`<p style="margin-top:16px"><a href="${baseUrl}" style="background:#16a34a;color:#fff;padding:10px 18px;border-radius:8px;text-decoration:none">Ver la tienda</a></p>`:''}
       <p style="color:#888;font-size:12px;margin-top:20px">Cualquier duda, respondé este mail. ${tienda}</p>
     </div>`;
-    await _sendMail(email, `Tu compra en ${tienda} — Pedido #${String(pedidos[0].id).padStart(4,'0')}`, html, { fromName: tienda, replyTo: tiendaEmail || undefined });
+    const nums=pedidos.map(p=>`#${String(p.id).padStart(4,'0')}`);
+    await _sendMail(email, `Tu compra en ${tienda} — ${nums.length>1?'Pedidos':'Pedido'} ${nums.join(' y ')}`, html, { fromName: tienda, replyTo: tiendaEmail || undefined });
   }catch(e){ console.log('[mail-cliente] exc:', e.message); }
 }
 // ── BOTÓN DE ARREPENTIMIENTO (Ley 24.240 art. 34 / Res. 424/2020) ─────────────────────────────
@@ -2976,8 +2997,9 @@ app.get('/api/usuarios', authPerm('usuarios'), async (req,res)=>{
     const {rows}=await pool.query(`SELECT u.*, COALESCE(c.compras,0)::int AS compras, COALESCE(c.total_gastado,0)::float AS total_gastado, COALESCE(c.total_pagado,0)::float AS total_pagado, c.ultima_compra
       FROM usuarios u
       LEFT JOIN (
-        SELECT usuario_id, COUNT(*) AS compras, SUM(total) AS total_gastado,
-               SUM(CASE WHEN estado_pago='pagado' THEN total ELSE 0 END) AS total_pagado, MAX(created_at) AS ultima_compra
+        SELECT usuario_id, COUNT(*) FILTER (WHERE NOT (COALESCE(moneda,'ARS')='USDT' AND pedido_vinculado IS NOT NULL)) AS compras,
+               SUM(CASE WHEN COALESCE(moneda,'ARS')<>'USDT' THEN total ELSE 0 END) AS total_gastado,
+               SUM(CASE WHEN estado_pago='pagado' AND COALESCE(moneda,'ARS')<>'USDT' THEN total ELSE 0 END) AS total_pagado, MAX(created_at) AS ultima_compra
         FROM pedidos WHERE tenant_id=$1 AND tipo='pedido' AND COALESCE(is_test,false)=false AND LOWER(COALESCE(estado,''))<>'cancelado'
         GROUP BY usuario_id
       ) c ON c.usuario_id=u.id
@@ -3110,11 +3132,11 @@ app.get('/api/pedidos', auth(), async (req,res)=>{
     else{ where.push(`p.usuario_id=$${params.length+1}`); params.push(req.user.id); }
     if(seccion_id){ where.push(`p.seccion_id=$${params.length+1}`); params.push(seccion_id); }
     if(tipo){ where.push(`p.tipo=$${params.length+1}`); params.push(tipo); }
-    const {rows}=await pool.query(`SELECT p.*, u.nombre as usuario_nombre, u.telefono as usuario_telefono, u.email as usuario_email, u.nombre_fantasia, s.nombre as seccion_nombre, s.color as seccion_color FROM pedidos p LEFT JOIN usuarios u ON p.usuario_id=u.id LEFT JOIN secciones s ON p.seccion_id=s.id WHERE ${where.join(' AND ')} ORDER BY p.created_at DESC LIMIT 500`, params);
+    const {rows}=await pool.query(`SELECT p.*, u.nombre as usuario_nombre, u.telefono as usuario_telefono, u.email as usuario_email, u.nombre_fantasia, s.nombre as seccion_nombre, s.color as seccion_color, pv.moneda as vinculado_moneda, pv.total as vinculado_total FROM pedidos p LEFT JOIN usuarios u ON p.usuario_id=u.id LEFT JOIN secciones s ON p.seccion_id=s.id LEFT JOIN pedidos pv ON pv.id=p.pedido_vinculado AND pv.tenant_id=p.tenant_id WHERE ${where.join(' AND ')} ORDER BY p.created_at DESC, p.id DESC LIMIT 500`, params);
     res.json(rows);
   }catch(e){ res.status(500).json({error:e.message}); }
 });
-app.get('/api/pedidos/:id', auth(), async (req,res)=>{ try{ const {rows}=await pool.query('SELECT p.*, u.nombre as usuario_nombre, u.telefono as usuario_telefono, u.email as usuario_email, u.nombre_fantasia, u.direccion as usuario_direccion, s.nombre as seccion_nombre, s.color as seccion_color FROM pedidos p LEFT JOIN usuarios u ON p.usuario_id=u.id LEFT JOIN secciones s ON p.seccion_id=s.id WHERE p.id=$1 AND p.tenant_id=$2', [req.params.id, req.tenantId]); if(!rows[0]) return res.status(404).json({error:'No encontrado'}); const staffPed=await esStaffPedidos(req); if(Number(rows[0].usuario_id)!==Number(req.user.id) && !staffPed) return res.status(404).json({error:'No encontrado'}); let {rows:items}=await pool.query("SELECT pi.*, COALESCE(NULLIF(pi.imagen,''), pr.imagen, '') AS imagen, pr.sku AS producto_sku FROM pedido_items pi LEFT JOIN productos pr ON pr.id=pi.producto_id AND pr.tenant_id=pi.tenant_id WHERE pi.pedido_id=$1 AND pi.tenant_id=$2 ORDER BY pi.id", [req.params.id, req.tenantId]); const {rows:pagos}=await pool.query('SELECT * FROM pedido_pagos WHERE pedido_id=$1 AND tenant_id=$2 ORDER BY created_at', [req.params.id, req.tenantId]); if(!staffPed) items=items.map(({costo_unitario, producto_sku, ...it})=>it); res.json({...rows[0], items, pagos}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.get('/api/pedidos/:id', auth(), async (req,res)=>{ try{ const {rows}=await pool.query('SELECT p.*, u.nombre as usuario_nombre, u.telefono as usuario_telefono, u.email as usuario_email, u.nombre_fantasia, u.direccion as usuario_direccion, s.nombre as seccion_nombre, s.color as seccion_color, pv.moneda as vinculado_moneda, pv.total as vinculado_total FROM pedidos p LEFT JOIN usuarios u ON p.usuario_id=u.id LEFT JOIN secciones s ON p.seccion_id=s.id LEFT JOIN pedidos pv ON pv.id=p.pedido_vinculado AND pv.tenant_id=p.tenant_id WHERE p.id=$1 AND p.tenant_id=$2', [req.params.id, req.tenantId]); if(!rows[0]) return res.status(404).json({error:'No encontrado'}); const staffPed=await esStaffPedidos(req); if(Number(rows[0].usuario_id)!==Number(req.user.id) && !staffPed) return res.status(404).json({error:'No encontrado'}); let {rows:items}=await pool.query("SELECT pi.*, COALESCE(NULLIF(pi.imagen,''), pr.imagen, '') AS imagen, pr.sku AS producto_sku FROM pedido_items pi LEFT JOIN productos pr ON pr.id=pi.producto_id AND pr.tenant_id=pi.tenant_id WHERE pi.pedido_id=$1 AND pi.tenant_id=$2 ORDER BY pi.id", [req.params.id, req.tenantId]); const {rows:pagos}=await pool.query('SELECT * FROM pedido_pagos WHERE pedido_id=$1 AND tenant_id=$2 ORDER BY created_at', [req.params.id, req.tenantId]); if(!staffPed) items=items.map(({costo_unitario, producto_sku, ...it})=>it); res.json({...rows[0], items, pagos}); }catch(e){ res.status(500).json({error:e.message}); } });
 
 // ═══ PEDIDOS ═══
 // Helpers compartidos: stock (siempre filtrado por tienda) e inserción de ítems.
@@ -3173,7 +3195,8 @@ async function insertarItems(client, tenantId, pedidoId, items, descontarStock){
 }
 async function etiquetarMoneda(client, pedidoId){
   // Sin .catch: corre dentro de la transacción del pedido; si fallara, tiene que fallar todo (no responder OK sin guardar)
-  await client.query(`UPDATE pedidos SET moneda = CASE WHEN EXISTS(SELECT 1 FROM pedido_items pi LEFT JOIN productos pr ON pr.id=pi.producto_id AND pr.tenant_id=(SELECT tenant_id FROM pedidos WHERE id=pi.pedido_id) LEFT JOIN variantes v ON v.id=pi.variante_id WHERE pi.pedido_id=$1 AND COALESCE(v.moneda, pr.moneda,'ARS')='USDT') THEN 'USDT' ELSE 'ARS' END WHERE id=$1`, [pedidoId]);
+  // USDT solo si todo es en dólares: un pedido con algo en pesos queda en pesos (su total se carga en pesos)
+  await client.query(`UPDATE pedidos SET moneda = CASE WHEN EXISTS(SELECT 1 FROM pedido_items pi LEFT JOIN productos pr ON pr.id=pi.producto_id AND pr.tenant_id=(SELECT tenant_id FROM pedidos WHERE id=pi.pedido_id) LEFT JOIN variantes v ON v.id=pi.variante_id WHERE pi.pedido_id=$1 AND COALESCE(v.moneda, pr.moneda,'ARS')='USDT') AND NOT EXISTS(SELECT 1 FROM pedido_items pi LEFT JOIN productos pr ON pr.id=pi.producto_id AND pr.tenant_id=(SELECT tenant_id FROM pedidos WHERE id=pi.pedido_id) LEFT JOIN variantes v ON v.id=pi.variante_id WHERE pi.pedido_id=$1 AND (pr.id IS NOT NULL OR v.id IS NOT NULL) AND COALESCE(v.moneda, pr.moneda,'ARS')='ARS') THEN 'USDT' ELSE 'ARS' END WHERE id=$1`, [pedidoId]);
 }
 // Lee {tipo, cp} de la entrega: del body nuevo o, si la web es vieja, del JSON datos_envio
 function leerEntrega(body, peds){
@@ -3232,7 +3255,8 @@ app.post('/api/pedidos', auth(), async (req,res)=>{
       if(b.cupon_codigo) await client.query("UPDATE cupones SET usos_actuales = COALESCE(usos_actuales,0) + 1 WHERE UPPER(codigo)=UPPER($1) AND tenant_id=$2", [String(b.cupon_codigo), req.tenantId]);
       // Cuenta corriente automática: SOLO si el pedido se marca como "debe" (fiado)
       const ep=String(b.estado_pago||'impago');
-      if(pedidoUserId && ep==='debe'){
+      const {rows:monRow}=await client.query('SELECT moneda FROM pedidos WHERE id=$1', [pedido.id]);
+      if(pedidoUserId && ep==='debe' && monRow[0]?.moneda!=='USDT'){ // la cuenta corriente es en pesos
         const deuda = Number(b.total||0) - (Number(b.sena)||0);
         if(deuda>0) await client.query('INSERT INTO cuenta_corriente (tenant_id,usuario_id,tipo,monto,concepto,pedido_id) VALUES ($6,$1,$2,$3,$4,$5)', [pedidoUserId, 'cargo', deuda, `Pedido #${String(pedido.id).padStart(4,'0')}`, pedido.id, req.tenantId]);
       }
@@ -3249,12 +3273,25 @@ app.post('/api/pedidos', auth(), async (req,res)=>{
       const cot=await checkout.cotizarCarrito(client, req.tenantId, req.user.id, { secciones:[{ seccion_id:b.seccion_id, items:b.items }], entrega:{ tipo:'retiro' } });
       const s=cot.secciones[0];
       if(!s) throw new CheckoutError('El presupuesto no tiene productos');
-      const soloUsdt = s.subtotal===0 && s.subtotal_usdt>0;
-      const {rows}=await client.query("INSERT INTO pedidos (tenant_id,usuario_id,seccion_id,tipo,metodo_pago,notas,subtotal,descuento,total,estado,estado_pago) VALUES ($1,$2,$3,'presupuesto',$4,$5,$6,0,$6,'pendiente','impago') RETURNING *",
-        [req.tenantId, req.user.id, s.seccion_id, TXT(b.metodo_pago,100), TXT(b.notas,4000), soloUsdt ? s.subtotal_usdt : s.subtotal]);
-      pedido=rows[0];
-      await insertarItems(client, req.tenantId, pedido.id, s._items, false);
-      await etiquetarMoneda(client, pedido.id);
+      // Igual que en la compra: lo que es en pesos y lo que es en USDT van en presupuestos separados y vinculados
+      const itemsArs=s._items.filter(i=>(i.moneda||'ARS')==='ARS'), itemsUsdt=s._items.filter(i=>(i.moneda||'ARS')!=='ARS');
+      const partes=[];
+      if(itemsArs.length || !itemsUsdt.length) partes.push({ moneda:'ARS', items:itemsArs, total:s.subtotal });
+      if(itemsUsdt.length) partes.push({ moneda:'USDT', items:itemsUsdt, total:s.subtotal_usdt });
+      const ids=[];
+      for(const pt of partes){
+        const {rows}=await client.query("INSERT INTO pedidos (tenant_id,usuario_id,seccion_id,tipo,metodo_pago,notas,subtotal,descuento,total,estado,estado_pago,moneda) VALUES ($1,$2,$3,'presupuesto',$4,$5,$6,0,$6,'pendiente','impago',$7) RETURNING id",
+          [req.tenantId, req.user.id, s.seccion_id, TXT(b.metodo_pago,100), TXT(b.notas,4000), pt.total, pt.moneda]);
+        await insertarItems(client, req.tenantId, rows[0].id, pt.items, false);
+        ids.push(rows[0].id);
+      }
+      if(ids.length===2){
+        await client.query('UPDATE pedidos SET pedido_vinculado=$2 WHERE id=$1', [ids[0], ids[1]]);
+        await client.query('UPDATE pedidos SET pedido_vinculado=$2 WHERE id=$1', [ids[1], ids[0]]);
+      }
+      const {rows:fin}=await client.query('SELECT * FROM pedidos WHERE id=$1', [ids[0]]);
+      pedido=fin[0];
+      if(ids.length===2) pedido.vinculado=(await client.query('SELECT * FROM pedidos WHERE id=$1', [ids[1]])).rows[0];
     }
     await client.query('COMMIT');
     res.json(pedido);
@@ -3288,18 +3325,37 @@ app.post('/api/pedidos/multi', auth(), async (req,res)=>{
     const creados=[];
     for(const s of cot.secciones){
       const ped=peds.find(p=>String(p.seccion_id)===String(s.seccion_id)) || peds[0];
-      const soloUsdt = s.subtotal===0 && s.subtotal_usdt>0;
-      let notas=TXT(ped.notas,4000);
-      if(s._items.some(i=>i._preventa)) notas=`${notas} [RESERVA/PREVENTA — requiere seña]`.trim();
-      if(!soloUsdt && s.subtotal_usdt>0) notas=`${notas} [Además: USDT ${s.subtotal_usdt} a pagar aparte]`.trim();
-      if(s.descuento_pago>0) notas=`${notas} [Descuento ${s.descuento_pago_pct}% por pagar con ${s.metodo_pago}: -$${Number(s.descuento_pago).toLocaleString('es-AR')}]`.trim();
+      // Pesos y USDT nunca van en el mismo pedido: si la compra tiene de los dos, salen 2 pedidos vinculados
+      // (cada uno con su total y su moneda). El envío, el cupón y el descuento por medio de pago son en pesos.
+      const itemsArs=s._items.filter(i=>(i.moneda||'ARS')==='ARS');
+      const itemsUsdt=s._items.filter(i=>(i.moneda||'ARS')!=='ARS');
+      const envioPesosPendiente = entrega.tipo==='envio' && s.requiere_envio && !!(s.envio.a_cotizar || s.envio.a_coordinar);
+      const conArs = itemsArs.length>0 || Number(s.total)>0 || !itemsUsdt.length || envioPesosPendiente;
       const metodoEnvio = (entrega.tipo==='retiro' ? 'Retiro en el local' : (s.envio.elegido ? (s.envio.elegido.a_cotizar ? `${s.envio.elegido.nombre} (envío a cotizar)` : s.envio.elegido.nombre) : (s.requiere_envio ? 'A coordinar' : ''))).slice(0,100);
-      const {rows}=await client.query('INSERT INTO pedidos (tenant_id,usuario_id,seccion_id,tipo,metodo_pago,notas,cupon_codigo,subtotal,descuento,total,datos_envio,costo_envio,metodo_envio,cp_destino,is_test,datos_facturacion,estado_pago,es_reserva) VALUES ($17,$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$18) RETURNING *',
-        [req.user.id, s.seccion_id, 'pedido', TXT(s.metodo_pago||ped.metodo_pago,100), notas, s.cupon||'', soloUsdt ? s.subtotal_usdt : s.subtotal, round2srv((s.descuento||0)+(s.descuento_pago||0)), soloUsdt ? s.subtotal_usdt : s.total, TXT(ped.datos_envio,8000), s.envio.costo, metodoEnvio, TXT(entrega.cp,20), staff ? !!b.is_test : false, TXT(ped.datos_facturacion,4000), 'impago', req.tenantId, s._items.some(i=>i._preventa)]);
-      await insertarItems(client, req.tenantId, rows[0].id, s._items, true);
-      await etiquetarMoneda(client, rows[0].id);
-      const {rows:fin}=await client.query('SELECT * FROM pedidos WHERE id=$1', [rows[0].id]);
-      creados.push(fin[0]);
+      const partes=[];
+      if(conArs) partes.push({ moneda:'ARS', items:itemsArs, metodo:TXT(s.metodo_pago||ped.metodo_pago,100), cupon:s.cupon||'', subtotal:s.subtotal, descuento:round2srv((s.descuento||0)+(s.descuento_pago||0)), total:s.total, envio:s.envio.costo,
+        notaPago: s.descuento_pago>0 ? `[Descuento ${s.descuento_pago_pct}% por pagar con ${s.metodo_pago}: -$${Number(s.descuento_pago).toLocaleString('es-AR')}]` : '',
+        notaSoloEnvio: !itemsArs.length && itemsUsdt.length ? '[Este pedido es solo el envío en pesos; los productos van en el pedido en USDT vinculado]' : '' });
+      if(itemsUsdt.length) partes.push({ moneda:'USDT', items:itemsUsdt, metodo: conArs ? 'USDT' : TXT(s.metodo_pago||ped.metodo_pago,100), cupon:'', subtotal:s.subtotal_usdt, descuento:0, total:s.subtotal_usdt, envio:0, notaPago:'', notaSoloEnvio:'' });
+      const deEstaCompra=[];
+      for(const pt of partes){
+        let notas=TXT(ped.notas,4000);
+        if(pt.items.some(i=>i._preventa)) notas=`${notas} [RESERVA/PREVENTA — requiere seña]`.trim();
+        if(pt.notaPago) notas=`${notas} ${pt.notaPago}`.trim();
+        if(pt.notaSoloEnvio) notas=`${notas} ${pt.notaSoloEnvio}`.trim();
+        const {rows}=await client.query('INSERT INTO pedidos (tenant_id,usuario_id,seccion_id,tipo,metodo_pago,notas,cupon_codigo,subtotal,descuento,total,datos_envio,costo_envio,metodo_envio,cp_destino,is_test,datos_facturacion,estado_pago,es_reserva,moneda) VALUES ($17,$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$18,$19) RETURNING id',
+          [req.user.id, s.seccion_id, 'pedido', pt.metodo, notas, pt.cupon, pt.subtotal, pt.descuento, pt.total, TXT(ped.datos_envio,8000), pt.envio, metodoEnvio, TXT(entrega.cp,20), staff ? !!b.is_test : false, TXT(ped.datos_facturacion,4000), 'impago', req.tenantId, pt.items.some(i=>i._preventa), pt.moneda]);
+        await insertarItems(client, req.tenantId, rows[0].id, pt.items, true);
+        deEstaCompra.push(rows[0].id);
+      }
+      if(deEstaCompra.length===2){
+        await client.query('UPDATE pedidos SET pedido_vinculado=$2 WHERE id=$1', [deEstaCompra[0], deEstaCompra[1]]);
+        await client.query('UPDATE pedidos SET pedido_vinculado=$2 WHERE id=$1', [deEstaCompra[1], deEstaCompra[0]]);
+      }
+      for(const id of deEstaCompra){
+        const {rows:fin}=await client.query('SELECT * FROM pedidos WHERE id=$1', [id]);
+        creados.push(fin[0]);
+      }
     }
     if(cot.cupon && cot.cupon.ok){
       // Atómico: si otra compra usó el último cupo mientras tanto, esta no lo puede usar (la fila queda bloqueada hasta el COMMIT)
@@ -3318,7 +3374,7 @@ app.post('/api/pedidos/multi', auth(), async (req,res)=>{
 // Carrito abandonado → recuperado cuando el cliente compra. Si se lo contactó, cuenta como recuperado por contacto.
 async function marcarCarritoComprado(tenantId, usuarioId, pedidos){
   if(!usuarioId || !pedidos || !pedidos.length) return;
-  const total = pedidos.reduce((a,p)=>a+(Number(p.total)||0),0);
+  const total = pedidos.filter(p=>(p.moneda||'ARS')==='ARS').reduce((a,p)=>a+(Number(p.total)||0),0); // el monto recuperado es en pesos
   await pool.query(`UPDATE carritos_abandonados SET recuperado=true, recuperado_at=NOW(), pedido_id=$3, monto_recuperado=$4,
       recuperado_por=CASE WHEN contactado_at IS NOT NULL THEN 'contacto' ELSE 'solo' END
     WHERE tenant_id=$1 AND usuario_id=$2 AND recuperado=false`, [tenantId, usuarioId, pedidos[0].id, total]);
@@ -3389,7 +3445,7 @@ app.put('/api/pedidos/:id', authPerm('pedidos'), async (req,res)=>{
   try{
     client=await pool.connect();
     await client.query('BEGIN');
-    const {rows:oldPedRows}=await client.query('SELECT estado, tipo, estado_pago, usuario_id, total, sena, descuento, costo_envio, metodo_pago FROM pedidos WHERE id=$1 AND tenant_id=$2 FOR UPDATE', [req.params.id, req.tenantId]);
+    const {rows:oldPedRows}=await client.query('SELECT estado, tipo, estado_pago, usuario_id, total, sena, descuento, costo_envio, metodo_pago, moneda FROM pedidos WHERE id=$1 AND tenant_id=$2 FOR UPDATE', [req.params.id, req.tenantId]);
     if(!oldPedRows[0]){ await client.query('ROLLBACK'); return res.status(404).json({error:'No encontrado'}); }
     const old=oldPedRows[0];
     // Ítems ANTES del cambio (con la variante: el stock de una variante es de la variante, no del producto)
@@ -3428,8 +3484,8 @@ app.put('/api/pedidos/:id', authPerm('pedidos'), async (req,res)=>{
           await client.query('UPDATE pedidos SET sena=0 WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]);
         }
       }
-      if(pedUsuarioId && nuevoEstadoPago==='debe' && oldEstadoPago!=='debe'){
-        // Pasó a "debe" (fiado): registrar el cargo (una sola vez por pedido)
+      if(pedUsuarioId && nuevoEstadoPago==='debe' && oldEstadoPago!=='debe' && old.moneda!=='USDT'){
+        // Pasó a "debe" (fiado): registrar el cargo (una sola vez por pedido). La cuenta corriente es en pesos: un pedido en USDT no carga ahí
         const {rows:ya}=await client.query("SELECT id FROM cuenta_corriente WHERE pedido_id=$1 AND tipo='cargo' AND tenant_id=$2", [req.params.id, req.tenantId]);
         const deuda=totalPedido-(Number(act[0]?.sena)||0);
         if(!ya.length && deuda>0) await client.query('INSERT INTO cuenta_corriente (tenant_id,usuario_id,tipo,monto,concepto,pedido_id) VALUES ($6,$1,$2,$3,$4,$5)', [pedUsuarioId,'cargo',deuda,`Pedido #${String(req.params.id).padStart(4,'0')}`,req.params.id, req.tenantId]);
@@ -3487,7 +3543,7 @@ app.put('/api/pedidos/:id', authPerm('pedidos'), async (req,res)=>{
     // Cancelado: el cargo automático de "debe" deja de corresponder. Reactivado en "debe": vuelve.
     if(afectabaStock && !afectaStock && cancelSt.includes(nuevoEstado)){
       await client.query("DELETE FROM cuenta_corriente WHERE pedido_id=$1 AND tipo='cargo' AND tenant_id=$2", [req.params.id, req.tenantId]);
-    } else if(!afectabaStock && afectaStock && cancelSt.includes(oldEstado) && pedUsuarioId && nuevoEstadoPago==='debe'){
+    } else if(!afectabaStock && afectaStock && cancelSt.includes(oldEstado) && pedUsuarioId && nuevoEstadoPago==='debe' && old.moneda!=='USDT'){
       const {rows:ya}=await client.query("SELECT id FROM cuenta_corriente WHERE pedido_id=$1 AND tipo='cargo' AND tenant_id=$2", [req.params.id, req.tenantId]);
       const deuda=totalPedido-(Number(act[0]?.sena)||0);
       if(!ya.length && deuda>0) await client.query('INSERT INTO cuenta_corriente (tenant_id,usuario_id,tipo,monto,concepto,pedido_id) VALUES ($6,$1,$2,$3,$4,$5)', [pedUsuarioId,'cargo',deuda,`Pedido #${String(req.params.id).padStart(4,'0')}`,req.params.id, req.tenantId]);
@@ -3535,6 +3591,7 @@ app.delete('/api/pedidos/:id', authPerm('pedidos'), async (req,res)=>{
     await client.query("DELETE FROM cuenta_corriente WHERE pedido_id=$1 AND tipo='cargo' AND tenant_id=$2", [req.params.id, req.tenantId]);
     await client.query('DELETE FROM pedido_historial WHERE pedido_id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]);
     await client.query('DELETE FROM pedido_items WHERE pedido_id=$1', [req.params.id]);
+    await client.query('UPDATE pedidos SET pedido_vinculado=NULL WHERE pedido_vinculado=$1 AND tenant_id=$2', [req.params.id, req.tenantId]);
     await client.query('DELETE FROM pedidos WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]);
     await client.query('COMMIT');
   }catch(e){
