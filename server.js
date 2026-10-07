@@ -734,6 +734,7 @@ async function migrate(){
     `ALTER TABLE productos ADD COLUMN IF NOT EXISTS posicion INT DEFAULT 0`,
     `ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS mayorista BOOLEAN DEFAULT false`,
     `ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS mayorista_solicitado_at TIMESTAMP`,
+    `ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS mayorista_rechazado_at TIMESTAMP`,
     // Seguridad multi-tienda: categorías y códigos de cupón únicos POR TIENDA (antes eran globales y una tienda pisaba a otra)
     `DO $$ DECLARE pk text; cols int; BEGIN
        SELECT conname, array_length(conkey,1) INTO pk, cols FROM pg_constraint WHERE conrelid='categorias_meta'::regclass AND contype='p';
@@ -1526,7 +1527,12 @@ app.post('/api/register', async (req,res)=>{
 // El cliente pide acceso a la lista mayorista (queda marcado para que el dueño lo apruebe en Clientes)
 app.post('/api/me/solicitar-mayorista', auth(), async (req,res)=>{
   try{
-    const { rows } = await pool.query('UPDATE usuarios SET mayorista_solicitado_at=COALESCE(mayorista_solicitado_at, NOW()) WHERE id=$1 AND tenant_id=$2 AND COALESCE(mayorista,false)=false RETURNING mayorista_solicitado_at', [req.user.id, req.tenantId]);
+    const { rows } = await pool.query('UPDATE usuarios SET mayorista_solicitado_at=COALESCE(mayorista_solicitado_at, NOW()) WHERE id=$1 AND tenant_id=$2 AND COALESCE(mayorista,false)=false AND mayorista_rechazado_at IS NULL RETURNING mayorista_solicitado_at', [req.user.id, req.tenantId]);
+    if(!rows[0]){
+      // Si la tienda ya rechazó el pedido, no se puede volver a pedir desde la web (se consulta por WhatsApp)
+      const { rows: u } = await pool.query('SELECT mayorista, mayorista_rechazado_at FROM usuarios WHERE id=$1 AND tenant_id=$2', [req.user.id, req.tenantId]);
+      if(u[0] && !u[0].mayorista && u[0].mayorista_rechazado_at) return res.status(409).json({ error: 'Tu pedido de acceso ya fue revisado. Si querés, consultanos por WhatsApp.', rechazado: true });
+    }
     res.json({ ok: true, solicitado: !!rows[0], ya_autorizado: !rows[0] });
   }catch(e){ res.status(500).json({error:e.message}); }
 });
@@ -3066,7 +3072,7 @@ app.put('/api/usuarios/:id', authPerm('usuarios'), async (req,res)=>{
       }
     }
     if(u.password){ const pwError=validatePassword(u.password); if(pwError) return res.status(400).json({error:pwError}); }
-    if(u.mayorista===true){ sets.push(`mayorista_solicitado_at=NULL`); }
+    if(u.mayorista===true){ sets.push(`mayorista_solicitado_at=NULL`, `mayorista_rechazado_at=NULL`); }
     for(const f of fields){ if(u[f]!==undefined){ sets.push(`${f}=$${pi++}`); params.push(u[f]); } }
     if(u.password){ const hash=await bcrypt.hash(u.password,10); sets.push(`password=$${pi++}`); params.push(hash); if(String(req.params.id)!==String(req.user?.id)) sets.push('sesiones_desde=NOW()'); }
     if(!sets.length) return res.json({ok:true});
@@ -3076,6 +3082,15 @@ app.put('/api/usuarios/:id', authPerm('usuarios'), async (req,res)=>{
   }catch(e){ res.status(500).json({error:e.message}); }
 });
 app.post('/api/usuarios/:id/aprobar', authPerm('usuarios'), async (req,res)=>{ try{ const bloqueo=await staffProtegido(req, req.params.id); if(bloqueo) return res.status(403).json({error:bloqueo}); const lp=await listaPrecioValida(req.tenantId, req.body && req.body.lista_precio_id); await pool.query('UPDATE usuarios SET aprobado=true, activo=true, lista_precio_id=$1 WHERE id=$2 AND tenant_id=$3', [lp||null, req.params.id, req.tenantId]); const {rows}=await pool.query('SELECT * FROM usuarios WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); res.json({ok:true, user:sanitizeUser(rows[0])}); }catch(e){ res.status(500).json({error:e.message}); } });
+// Rechazar el pedido de acceso mayorista (la cuenta sigue activa para comprar en la tienda común)
+app.post('/api/usuarios/:id/rechazar-mayorista', authPerm('usuarios'), async (req,res)=>{
+  try{
+    const bloqueo=await staffProtegido(req, req.params.id); if(bloqueo) return res.status(403).json({error:bloqueo});
+    const { rows } = await pool.query('UPDATE usuarios SET mayorista_solicitado_at=NULL, mayorista_rechazado_at=NOW() WHERE id=$1 AND tenant_id=$2 AND COALESCE(mayorista,false)=false RETURNING id', [req.params.id, req.tenantId]);
+    if(!rows[0]) return res.status(404).json({error:'No encontrado o ya es mayorista'});
+    res.json({ ok:true });
+  }catch(e){ res.status(500).json({error:e.message}); }
+});
 app.post('/api/usuarios/:id/rechazar', authPerm('usuarios'), async (req,res)=>{ try{ const bloqueo=await staffProtegido(req, req.params.id); if(bloqueo) return res.status(403).json({error:bloqueo}); await pool.query('UPDATE usuarios SET activo=false WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 app.post('/api/usuarios/:id/suspender', authPerm('usuarios'), async (req,res)=>{ try{ const bloqueo=await staffProtegido(req, req.params.id); if(bloqueo) return res.status(403).json({error:bloqueo}); if(String(req.params.id)===String(req.user?.id)) return res.status(400).json({error:'No podés suspender tu propia cuenta'}); const activo=req.body && (req.body.activo===true || req.body.activo==='true'); await pool.query('UPDATE usuarios SET activo=$1 WHERE id=$2 AND tenant_id=$3', [activo, req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 // RESET MEJORADO - codigo largo
