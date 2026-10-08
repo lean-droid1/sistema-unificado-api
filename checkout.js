@@ -226,7 +226,7 @@ function createCheckout(pool) {
       const sinLimite = v || p.es_preventa || p.permitir_sin_stock || p.es_digital || secS.permitir_sin_stock || secS.ignorar_stock;
       if (avisos && !sinLimite && num(p.stock) < i.cantidad) {
         if (num(p.stock) <= 0) { avisos.push({ producto_id: p.id, variante_id: null, tipo: 'sin_stock', disponible: 0, mensaje: `"${p.nombre || p.modelo}" se quedó sin stock.` }); continue; }
-        avisos.push({ producto_id: p.id, variante_id: null, tipo: 'stock', disponible: num(p.stock), mensaje: `"${p.nombre || p.modelo}": hay ${num(p.stock)} disponibles. Se piden ${num(p.stock)} ahora y el resto queda en tu carrito.` });
+        avisos.push({ producto_id: p.id, variante_id: null, tipo: 'stock', disponible: num(p.stock), mensaje: `"${p.nombre || p.modelo}": solo quedan ${num(p.stock)}, ajustamos la cantidad.` });
         i.cantidad = num(p.stock);
       }
       const sec = ctx.secciones[p.seccion_id];
