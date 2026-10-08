@@ -185,7 +185,10 @@ function createCheckout(pool) {
   // Normaliza los ítems que manda la web y les pone el precio del servidor
   // Con { avisos: [] } (solo al cotizar) no corta: anota lo que falta y lo deja afuera, así el carrito se corrige solo.
   async function preciarItems(db, ctx, itemsIn, { permitirOcultos = false, avisos = null } = {}) {
-    const items = (Array.isArray(itemsIn) ? itemsIn : []).slice(0, 500).map(i => ({
+    // Más de 500 líneas o 10.000 unidades: error claro (antes se cortaba en silencio y la web daba por comprado lo que no entraba)
+    if (Array.isArray(itemsIn) && itemsIn.length > 500) throw new CheckoutError('El carrito tiene más de 500 productos distintos en una tienda. Hacé el pedido en partes.');
+    if (Array.isArray(itemsIn) && itemsIn.some(i => (parseInt(i.cantidad ?? i.qty, 10) || 0) > 10000)) throw new CheckoutError('Máximo 10.000 unidades por producto.');
+    const items = (Array.isArray(itemsIn) ? itemsIn : []).map(i => ({
       producto_id: parseInt(i.producto_id ?? i.id, 10),
       variante_id: i.variante_id ? parseInt(i.variante_id, 10) : null,
       cantidad: Math.min(10000, Math.max(1, parseInt(i.cantidad ?? i.qty, 10) || 1)),
@@ -209,7 +212,7 @@ function createCheckout(pool) {
       const p = prodMap[i.producto_id];
       if (!p || (!p.visible && !permitirOcultos)) { falla(i, 'no_disponible', p ? `"${p.nombre || p.modelo}" ya no está disponible.` : 'Un producto del carrito ya no está disponible.'); continue; }
       if (ctx.secciones[p.seccion_id] && ctx.secciones[p.seccion_id].requiere_aprobacion && !ctx.accesoMayorista) {
-        falla(i, 'no_disponible', `"${p.nombre || p.modelo}" es de la lista mayorista: solo pueden comprarlo clientes autorizados.`); continue;
+        falla(i, 'requiere_acceso', ctx.user ? `"${p.nombre || p.modelo}" es de la lista mayorista: solo pueden comprarlo clientes autorizados.` : `"${p.nombre || p.modelo}" es de la lista mayorista: ingresá con tu cuenta mayorista para comprarlo.`); continue;
       }
       let v = null;
       if (i.variante_id) {
@@ -223,7 +226,7 @@ function createCheckout(pool) {
       const sinLimite = v || p.es_preventa || p.permitir_sin_stock || p.es_digital || secS.permitir_sin_stock || secS.ignorar_stock;
       if (avisos && !sinLimite && num(p.stock) < i.cantidad) {
         if (num(p.stock) <= 0) { avisos.push({ producto_id: p.id, variante_id: null, tipo: 'sin_stock', disponible: 0, mensaje: `"${p.nombre || p.modelo}" se quedó sin stock.` }); continue; }
-        avisos.push({ producto_id: p.id, variante_id: null, tipo: 'stock', disponible: num(p.stock), mensaje: `"${p.nombre || p.modelo}": solo quedan ${num(p.stock)}, ajustamos la cantidad.` });
+        avisos.push({ producto_id: p.id, variante_id: null, tipo: 'stock', disponible: num(p.stock), mensaje: `"${p.nombre || p.modelo}": hay ${num(p.stock)} disponibles. Se piden ${num(p.stock)} ahora y el resto queda en tu carrito.` });
         i.cantidad = num(p.stock);
       }
       const sec = ctx.secciones[p.seccion_id];

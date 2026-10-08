@@ -110,6 +110,8 @@ const { createCheckout, CheckoutError, cotizacionDolar } = require('./checkout')
 const checkout = createCheckout(pool);
 
 // Datos de usuario que nunca deben salir hacia el navegador
+// Sesión: los clientes quedan ingresados 30 días desde la última visita (la web la renueva sola); el personal, 7 días
+const vidaToken = (rol) => (rol === 'admin' || rol === 'subadmin') ? '7d' : '30d';
 const sanitizeUser = (u) => { if (!u) return u; const { password, reset_codigo, reset_expira, notas_admin, ...rest } = u; return rest; };
 // ¿Es personal de la tienda (admin, o subadmin con permiso de pedidos)? Siempre leído de la base, no del token.
 async function esStaffPedidos(req){
@@ -735,6 +737,8 @@ async function migrate(){
     `ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS mayorista BOOLEAN DEFAULT false`,
     `ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS mayorista_solicitado_at TIMESTAMP`,
     `ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS mayorista_rechazado_at TIMESTAMP`,
+    `CREATE TABLE IF NOT EXISTS carritos_guardados (tenant_id INT NOT NULL, usuario_id INT NOT NULL, items JSONB NOT NULL DEFAULT '{}', updated_at TIMESTAMPTZ DEFAULT NOW(), PRIMARY KEY (tenant_id, usuario_id))`,
+    `ALTER TABLE carritos_guardados ADD COLUMN IF NOT EXISTS version INT NOT NULL DEFAULT 0`,
     // Seguridad multi-tienda: categorías y códigos de cupón únicos POR TIENDA (antes eran globales y una tienda pisaba a otra)
     `DO $$ DECLARE pk text; cols int; BEGIN
        SELECT conname, array_length(conkey,1) INTO pk, cols FROM pg_constraint WHERE conrelid='categorias_meta'::regclass AND contype='p';
@@ -1459,7 +1463,7 @@ app.post('/api/login', async (req,res)=>{
       await pool.query('UPDATE otp_codes SET usado=true WHERE id=$1', [otps[0].id]);
     }
     delete loginAttempts[key];
-    const token=jwt.sign({id:rows[0].id, rol:rows[0].rol, usuario:rows[0].usuario, tenant_id:rows[0].tenant_id||1, es_owner:rows[0].es_owner||false}, JWT_SECRET, {expiresIn:'7d'});
+    const token=jwt.sign({id:rows[0].id, rol:rows[0].rol, usuario:rows[0].usuario, tenant_id:rows[0].tenant_id||1, es_owner:rows[0].es_owner||false}, JWT_SECRET, {expiresIn:vidaToken(rows[0].rol)});
     res.json({token, user:sanitizeUser(rows[0])});
   }catch(e){ res.status(500).json({error:e.message}); }
 });
@@ -1467,7 +1471,7 @@ app.post('/api/logout', auth(), async (req,res)=>{
   try{ const decoded=jwt.decode(req._token); const expira=new Date(decoded.exp*1000); await pool.query('INSERT INTO tokens_revocados (token_hash,expira) VALUES ($1,$2) ON CONFLICT DO NOTHING', [hashToken(req._token), expira]); await pool.query('DELETE FROM tokens_revocados WHERE expira<NOW()').catch(()=>{}); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); }
 });
 app.post('/api/refresh-token', auth(), async (req,res)=>{
-  try{ const {rows}=await pool.query('SELECT id,rol,usuario,activo,tenant_id,es_owner FROM usuarios WHERE id=$1', [req.user.id]); if(!rows[0]||!rows[0].activo) return res.status(401).json({error:'Cuenta desactivada'}); const decoded=jwt.decode(req._token); await pool.query('INSERT INTO tokens_revocados (token_hash,expira) VALUES ($1,$2) ON CONFLICT DO NOTHING', [hashToken(req._token), new Date(decoded.exp*1000)]); const newToken=jwt.sign({id:rows[0].id, rol:rows[0].rol, usuario:rows[0].usuario, tenant_id:rows[0].tenant_id||1, es_owner:rows[0].es_owner||false}, JWT_SECRET, {expiresIn:'7d'}); res.json({token:newToken}); }catch(e){ res.status(500).json({error:e.message}); }
+  try{ const {rows}=await pool.query('SELECT id,rol,usuario,activo,tenant_id,es_owner FROM usuarios WHERE id=$1', [req.user.id]); if(!rows[0]||!rows[0].activo) return res.status(401).json({error:'Cuenta desactivada'}); const decoded=jwt.decode(req._token); await pool.query('INSERT INTO tokens_revocados (token_hash,expira) VALUES ($1,$2) ON CONFLICT DO NOTHING', [hashToken(req._token), new Date(decoded.exp*1000)]); const newToken=jwt.sign({id:rows[0].id, rol:rows[0].rol, usuario:rows[0].usuario, tenant_id:rows[0].tenant_id||1, es_owner:rows[0].es_owner||false}, JWT_SECRET, {expiresIn:vidaToken(rows[0].rol)}); res.json({token:newToken}); }catch(e){ res.status(500).json({error:e.message}); }
 });
 app.put('/api/me/otp', auth(), async (req,res)=>{ try{ const {activo}=req.body; await pool.query('UPDATE usuarios SET otp_activo=$1 WHERE id=$2 AND tenant_id=$3', [activo, req.user.id, req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 
@@ -1536,6 +1540,44 @@ app.post('/api/me/solicitar-mayorista', auth(), async (req,res)=>{
     res.json({ ok: true, solicitado: !!rows[0], ya_autorizado: !rows[0] });
   }catch(e){ res.status(500).json({error:e.message}); }
 });
+// Carrito guardado en la cuenta: no se pierde al cerrar sesión, cambiar de dispositivo o si el navegador borra sus datos.
+// Cada guardado lleva la versión que el dispositivo leyó: si otro dispositivo guardó antes, responde 409 con lo último
+// (la web lo junta con lo suyo y vuelve a guardar) → un celular o pestaña vieja nunca pisa el carrito.
+const CARRITO_MAX_ITEMS = 1500;
+function limpiarCarritoGuardado(items){
+  if(!items || typeof items!=='object' || Array.isArray(items)) return null;
+  const out={}; let total=0;
+  for(const [sec, lista] of Object.entries(items)){
+    if(!/^\d{1,9}$/.test(String(sec)) || !Array.isArray(lista)) continue;
+    const ok=lista.filter(it=>it && typeof it==='object' && /^\d{1,9}$/.test(String(it.id)) && Number(it.qty)>0);
+    total+=ok.length; if(ok.length) out[sec]=ok;
+  }
+  if(total>CARRITO_MAX_ITEMS) return false;
+  return out;
+}
+app.get('/api/me/carrito', auth(), async (req,res)=>{
+  try{
+    const {rows}=await pool.query('SELECT items, version, updated_at FROM carritos_guardados WHERE tenant_id=$1 AND usuario_id=$2', [req.tenantId, req.user.id]);
+    res.json({ items: rows[0] ? rows[0].items : {}, version: rows[0] ? rows[0].version : 0, updated_at: rows[0] ? rows[0].updated_at : null });
+  }catch(e){ res.status(500).json({error:e.message}); }
+});
+app.put('/api/me/carrito', auth(), async (req,res)=>{
+  try{
+    const items=limpiarCarritoGuardado(req.body && req.body.items);
+    if(items===false) return res.status(413).json({error:`El carrito tiene más de ${CARRITO_MAX_ITEMS} productos`});
+    if(!items) return res.status(400).json({error:'Carrito inválido'});
+    const json=JSON.stringify(items);
+    if(json.length>2000000) return res.status(413).json({error:'El carrito es demasiado grande'});
+    const version=parseInt(req.body.version,10)||0;
+    let r=await pool.query('UPDATE carritos_guardados SET items=$3::jsonb, version=version+1, updated_at=NOW() WHERE tenant_id=$1 AND usuario_id=$2 AND version=$4 RETURNING version', [req.tenantId, req.user.id, json, version]);
+    if(!r.rows[0] && version===0) r=await pool.query('INSERT INTO carritos_guardados (tenant_id, usuario_id, items, version, updated_at) VALUES ($1,$2,$3::jsonb,1,NOW()) ON CONFLICT (tenant_id, usuario_id) DO NOTHING RETURNING version', [req.tenantId, req.user.id, json]);
+    if(!r.rows[0]){
+      const {rows}=await pool.query('SELECT items, version FROM carritos_guardados WHERE tenant_id=$1 AND usuario_id=$2', [req.tenantId, req.user.id]);
+      return res.status(409).json({ error:'El carrito cambió en otro dispositivo', items: rows[0] ? rows[0].items : {}, version: rows[0] ? rows[0].version : 0 });
+    }
+    res.json({ ok:true, version: r.rows[0].version });
+  }catch(e){ res.status(500).json({error:e.message}); }
+});
 app.get('/api/me', auth(), async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM usuarios WHERE id=$1 AND tenant_id=$2', [req.user.id, req.tenantId]); res.json(sanitizeUser(rows[0])); }catch(e){ res.status(500).json({error:e.message}); } });
 // Crear cliente rápido desde el panel (venta de mostrador). Genera usuario auto si no se pasa.
 app.post('/api/usuarios/rapido', authPerm('usuarios'), async (req,res)=>{
@@ -1575,7 +1617,7 @@ app.put('/api/me', auth(), async (req,res)=>{
       const u=rows[0];
       // iat un segundo después de sesiones_desde, para que el token nuevo no quede del lado de los cerrados
       const iat=Math.floor(new Date(u.sesiones_desde||Date.now()).getTime()/1000)+1;
-      nuevoToken=jwt.sign({id:u.id, rol:u.rol, usuario:u.usuario, tenant_id:u.tenant_id||1, es_owner:u.es_owner||false, iat}, JWT_SECRET, {expiresIn:'7d'});
+      nuevoToken=jwt.sign({id:u.id, rol:u.rol, usuario:u.usuario, tenant_id:u.tenant_id||1, es_owner:u.es_owner||false, iat}, JWT_SECRET, {expiresIn:vidaToken(u.rol)});
     }
     res.json(nuevoToken ? {...sanitizeUser(rows[0]), token:nuevoToken} : sanitizeUser(rows[0]));
   }catch(e){ res.status(500).json({error:e.message}); }
@@ -3121,6 +3163,7 @@ app.delete('/api/usuarios/:id', authPerm('usuarios'), async (req,res)=>{
     await client.query('DELETE FROM pedido_pagos WHERE pedido_id IN (SELECT id FROM pedidos WHERE usuario_id=$1 AND tenant_id=$2)', [req.params.id, req.tenantId]);
     await client.query('DELETE FROM pedidos WHERE usuario_id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]);
     await client.query('DELETE FROM otp_codes WHERE usuario_id=$1', [req.params.id]);
+    await client.query('DELETE FROM carritos_guardados WHERE usuario_id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]);
     const r=await client.query('DELETE FROM usuarios WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]);
     await client.query('COMMIT');
     if(!r.rowCount) return res.status(404).json({error:'No encontrado'});
