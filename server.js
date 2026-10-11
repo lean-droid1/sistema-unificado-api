@@ -144,7 +144,7 @@ const auth = (role) => async (req,res,next)=>{
   try{
     const t = req.headers.authorization?.split(' ')[1];
     if(!t) return res.status(401).json({error:'Token requerido'});
-    const revoked = await pool.query('SELECT 1 FROM tokens_revocados WHERE token_hash=$1', [hashToken(t)]).catch(()=>({rows:[]}));
+    const revoked = await pool.query('SELECT 1 FROM tokens_revocados WHERE token_hash=$1 AND (desde IS NULL OR desde<=NOW())', [hashToken(t)]).catch(()=>({rows:[]}));
     if(revoked.rows.length) return res.status(401).json({error:'Sesión cerrada'});
     const d = jwt.verify(t, JWT_SECRET);
     if(!tokenDeEstaTienda(d, req)) return res.status(401).json({error:'Tu sesión es de otra tienda. Iniciá sesión de nuevo.'});
@@ -162,7 +162,7 @@ const authPerm = (permiso) => async (req,res,next)=>{
   try{
     const t = req.headers.authorization?.split(' ')[1];
     if(!t) return res.status(401).json({error:'Token requerido'});
-    const revoked = await pool.query('SELECT 1 FROM tokens_revocados WHERE token_hash=$1', [hashToken(t)]).catch(()=>({rows:[]}));
+    const revoked = await pool.query('SELECT 1 FROM tokens_revocados WHERE token_hash=$1 AND (desde IS NULL OR desde<=NOW())', [hashToken(t)]).catch(()=>({rows:[]}));
     if(revoked.rows.length) return res.status(401).json({error:'Sesión cerrada'});
     const d = jwt.verify(t, JWT_SECRET);
     const {rows} = await pool.query('SELECT rol, activo, permisos, sesiones_desde FROM usuarios WHERE id=$1 AND tenant_id=$2', [d.id, req.tenantId]).catch(()=>({rows:[]}));
@@ -204,14 +204,14 @@ const limitePlan = async (req, clave) => {
   if(Number(req.tenantId)===1) return Infinity;
   try{ const d=await getTenantData(req.tenantId); const n=Number(d.features && d.features[clave]); return Number.isFinite(n) && n>=0 ? n : Infinity; }catch{ return Infinity; }
 };
-const optionalAuth = async (req,res,next)=>{ try{ const t=req.headers.authorization?.split(' ')[1]; if(t){ const d=jwt.verify(t,JWT_SECRET); if(tokenDeEstaTienda(d, req)){ const revoked=await pool.query('SELECT 1 FROM tokens_revocados WHERE token_hash=$1', [hashToken(t)]).catch(()=>({rows:[]})); const {rows}=revoked.rows.length?{rows:[]}:await pool.query('SELECT activo, rol, sesiones_desde FROM usuarios WHERE id=$1 AND tenant_id=$2', [d.id, req.tenantId]).catch(()=>({rows:[]})); if(rows[0] && rows[0].activo && !sesionVencida(rows[0], d)){ req.user=d; req._rol=rows[0].rol; } } } }catch{} next(); };
+const optionalAuth = async (req,res,next)=>{ try{ const t=req.headers.authorization?.split(' ')[1]; if(t){ const d=jwt.verify(t,JWT_SECRET); if(tokenDeEstaTienda(d, req)){ const revoked=await pool.query('SELECT 1 FROM tokens_revocados WHERE token_hash=$1 AND (desde IS NULL OR desde<=NOW())', [hashToken(t)]).catch(()=>({rows:[]})); const {rows}=revoked.rows.length?{rows:[]}:await pool.query('SELECT activo, rol, sesiones_desde FROM usuarios WHERE id=$1 AND tenant_id=$2', [d.id, req.tenantId]).catch(()=>({rows:[]})); if(rows[0] && rows[0].activo && !sesionVencida(rows[0], d)){ req.user=d; req._rol=rows[0].rol; } } } }catch{} next(); };
 
 // Middleware DUEÑO de la plataforma: solo el owner (Leandro) puede administrar tenants. NO filtra por tenant.
 const authOwner = async (req,res,next)=>{
   try{
     const t = req.headers.authorization?.split(' ')[1];
     if(!t) return res.status(401).json({error:'Token requerido'});
-    const revoked = await pool.query('SELECT 1 FROM tokens_revocados WHERE token_hash=$1', [hashToken(t)]).catch(()=>({rows:[]}));
+    const revoked = await pool.query('SELECT 1 FROM tokens_revocados WHERE token_hash=$1 AND (desde IS NULL OR desde<=NOW())', [hashToken(t)]).catch(()=>({rows:[]}));
     if(revoked.rows.length) return res.status(401).json({error:'Sesión cerrada'});
     const d = jwt.verify(t, JWT_SECRET);
     const {rows} = await pool.query('SELECT es_owner, activo, sesiones_desde FROM usuarios WHERE id=$1', [d.id]).catch(()=>({rows:[]}));
@@ -538,6 +538,8 @@ async function migrate(){
     `CREATE TABLE IF NOT EXISTS favoritos (id SERIAL PRIMARY KEY, usuario_id INT REFERENCES usuarios(id) ON DELETE CASCADE, producto_id INT REFERENCES productos(id) ON DELETE CASCADE, created_at TIMESTAMP DEFAULT NOW(), UNIQUE(usuario_id, producto_id))`,
     `CREATE TABLE IF NOT EXISTS notificaciones_stock (id SERIAL PRIMARY KEY, producto_id INT REFERENCES productos(id) ON DELETE CASCADE, email VARCHAR(200), notificado BOOLEAN DEFAULT false, created_at TIMESTAMP DEFAULT NOW())`,
     `CREATE TABLE IF NOT EXISTS tokens_revocados (token_hash VARCHAR(100) PRIMARY KEY, expira TIMESTAMP DEFAULT NOW())`,
+    // Desde cuándo deja de valer: al renovar la sesión, el token viejo sigue 2 minutos (otras pestañas o pedidos en curso no se cierran)
+    `ALTER TABLE tokens_revocados ADD COLUMN IF NOT EXISTS desde TIMESTAMP DEFAULT NOW()`,
     `CREATE TABLE IF NOT EXISTS otp_codes (id SERIAL PRIMARY KEY, usuario_id INT REFERENCES usuarios(id), codigo VARCHAR(10), expira TIMESTAMP, usado BOOLEAN DEFAULT false)`,
     `CREATE TABLE IF NOT EXISTS metodos_envio_custom (id SERIAL PRIMARY KEY, seccion_id INT, nombre VARCHAR(200), descripcion TEXT DEFAULT '', precio NUMERIC(12,2) DEFAULT 0, tipo VARCHAR(30) DEFAULT 'fijo', activo BOOLEAN DEFAULT true, gratis_desde NUMERIC(12,2) DEFAULT 0, tiempo_estimado VARCHAR(100) DEFAULT '', icono VARCHAR(50) DEFAULT '🚚', orden INT DEFAULT 0, created_at TIMESTAMP DEFAULT NOW())`,
     `CREATE TABLE IF NOT EXISTS carritos_abandonados (id SERIAL PRIMARY KEY, usuario_id INT, email VARCHAR(200) DEFAULT '', telefono VARCHAR(50) DEFAULT '', items JSONB DEFAULT '[]', total NUMERIC(12,2) DEFAULT 0, seccion_id INT, created_at TIMESTAMP DEFAULT NOW(), recuperado BOOLEAN DEFAULT false)`,
@@ -1463,15 +1465,15 @@ app.post('/api/login', async (req,res)=>{
       await pool.query('UPDATE otp_codes SET usado=true WHERE id=$1', [otps[0].id]);
     }
     delete loginAttempts[key];
-    const token=jwt.sign({id:rows[0].id, rol:rows[0].rol, usuario:rows[0].usuario, tenant_id:rows[0].tenant_id||1, es_owner:rows[0].es_owner||false}, JWT_SECRET, {expiresIn:vidaToken(rows[0].rol)});
+    const token=jwt.sign({id:rows[0].id, rol:rows[0].rol, usuario:rows[0].usuario, tenant_id:rows[0].tenant_id||1, es_owner:rows[0].es_owner||false}, JWT_SECRET, {expiresIn:vidaToken(rows[0].rol), jwtid:crypto.randomUUID()});
     res.json({token, user:sanitizeUser(rows[0])});
   }catch(e){ res.status(500).json({error:e.message}); }
 });
 app.post('/api/logout', auth(), async (req,res)=>{
-  try{ const decoded=jwt.decode(req._token); const expira=new Date(decoded.exp*1000); await pool.query('INSERT INTO tokens_revocados (token_hash,expira) VALUES ($1,$2) ON CONFLICT DO NOTHING', [hashToken(req._token), expira]); await pool.query('DELETE FROM tokens_revocados WHERE expira<NOW()').catch(()=>{}); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); }
+  try{ const decoded=jwt.decode(req._token); const expira=new Date(decoded.exp*1000); await pool.query('INSERT INTO tokens_revocados (token_hash,expira,desde) VALUES ($1,$2,NOW()) ON CONFLICT (token_hash) DO UPDATE SET desde=NOW()', [hashToken(req._token), expira]); await pool.query('DELETE FROM tokens_revocados WHERE expira<NOW()').catch(()=>{}); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); }
 });
 app.post('/api/refresh-token', auth(), async (req,res)=>{
-  try{ const {rows}=await pool.query('SELECT id,rol,usuario,activo,tenant_id,es_owner FROM usuarios WHERE id=$1', [req.user.id]); if(!rows[0]||!rows[0].activo) return res.status(401).json({error:'Cuenta desactivada'}); const decoded=jwt.decode(req._token); await pool.query('INSERT INTO tokens_revocados (token_hash,expira) VALUES ($1,$2) ON CONFLICT DO NOTHING', [hashToken(req._token), new Date(decoded.exp*1000)]); const newToken=jwt.sign({id:rows[0].id, rol:rows[0].rol, usuario:rows[0].usuario, tenant_id:rows[0].tenant_id||1, es_owner:rows[0].es_owner||false}, JWT_SECRET, {expiresIn:vidaToken(rows[0].rol)}); res.json({token:newToken}); }catch(e){ res.status(500).json({error:e.message}); }
+  try{ const {rows}=await pool.query('SELECT id,rol,usuario,activo,tenant_id,es_owner FROM usuarios WHERE id=$1', [req.user.id]); if(!rows[0]||!rows[0].activo) return res.status(401).json({error:'Cuenta desactivada'}); const decoded=jwt.decode(req._token); await pool.query("INSERT INTO tokens_revocados (token_hash,expira,desde) VALUES ($1,$2,NOW()+INTERVAL '2 minutes') ON CONFLICT DO NOTHING", [hashToken(req._token), new Date(decoded.exp*1000)]); const newToken=jwt.sign({id:rows[0].id, rol:rows[0].rol, usuario:rows[0].usuario, tenant_id:rows[0].tenant_id||1, es_owner:rows[0].es_owner||false}, JWT_SECRET, {expiresIn:vidaToken(rows[0].rol), jwtid:crypto.randomUUID()}); res.json({token:newToken}); }catch(e){ res.status(500).json({error:e.message}); }
 });
 app.put('/api/me/otp', auth(), async (req,res)=>{ try{ const {activo}=req.body; await pool.query('UPDATE usuarios SET otp_activo=$1 WHERE id=$2 AND tenant_id=$3', [activo, req.user.id, req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
 
@@ -1617,7 +1619,7 @@ app.put('/api/me', auth(), async (req,res)=>{
       const u=rows[0];
       // iat un segundo después de sesiones_desde, para que el token nuevo no quede del lado de los cerrados
       const iat=Math.floor(new Date(u.sesiones_desde||Date.now()).getTime()/1000)+1;
-      nuevoToken=jwt.sign({id:u.id, rol:u.rol, usuario:u.usuario, tenant_id:u.tenant_id||1, es_owner:u.es_owner||false, iat}, JWT_SECRET, {expiresIn:vidaToken(u.rol)});
+      nuevoToken=jwt.sign({id:u.id, rol:u.rol, usuario:u.usuario, tenant_id:u.tenant_id||1, es_owner:u.es_owner||false, iat}, JWT_SECRET, {expiresIn:vidaToken(u.rol), jwtid:crypto.randomUUID()});
     }
     res.json(nuevoToken ? {...sanitizeUser(rows[0]), token:nuevoToken} : sanitizeUser(rows[0]));
   }catch(e){ res.status(500).json({error:e.message}); }
