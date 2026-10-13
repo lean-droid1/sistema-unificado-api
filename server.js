@@ -2812,7 +2812,7 @@ app.get('/api/bot/vendidos', botAuth, async (req, res) => {
     res.json({ ok: true, dias, productos: rows });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
-app.get('/api/productos/buscar', optionalAuth, async (req,res)=>{ try{ const {q}=req.query; if(!q) return res.json([]); const toks=String(q).trim().split(/\s+/).filter(Boolean).slice(0,8); const campos=`(coalesce(p.nombre,'')||' '||coalesce(p.modelo,'')||' '||coalesce(p.categoria,'')||' '||coalesce(p.marca,'')||' '||coalesce(p.sku,'')||' '||coalesce(p.compatibilidad,''))`; const cond=[]; const params=[req.tenantId]; let pi=2; for(const tk of toks){ cond.push(`${SQL_SIN_ACENTOS(campos)} LIKE $${pi}`); params.push(tokenBusqueda(tk)); pi++; } const whereTok=cond.length?(' AND '+cond.join(' AND ')):''; const {rows}=await pool.query(`SELECT p.id,p.nombre,p.modelo,p.categoria,p.precio_base,p.precio_oferta,p.stock,p.imagen,p.sku,p.codigo_barras,p.seccion_id,p.permitir_sin_stock,p.es_digital,p.usa_variantes,${sqlDesde('p')},s.nombre as seccion_nombre,s.color as seccion_color FROM productos p LEFT JOIN secciones s ON p.seccion_id=s.id WHERE p.tenant_id=$1${whereTok}${esStaffReq(req)?'':' AND p.visible=true'} ORDER BY p.nombre LIMIT 20`, params); res.json(esStaffReq(req) ? rows : (await sinRestringidas(req, rows, { conservarConAcceso: true })).map(limpiarProducto)); }catch(e){ res.status(500).json({error:e.message}); } });
+app.get('/api/productos/buscar', optionalAuth, async (req,res)=>{ try{ const {q}=req.query; if(!q) return res.json([]); const toks=String(q).trim().split(/\s+/).filter(Boolean).slice(0,8); const campos=`(coalesce(p.nombre,'')||' '||coalesce(p.modelo,'')||' '||coalesce(p.categoria,'')||' '||coalesce(p.marca,'')||' '||coalesce(p.sku,'')||' '||coalesce(p.compatibilidad,'')||' '||coalesce(p.descripcion,''))`; const cond=[]; const params=[req.tenantId]; let pi=2; for(const tk of toks){ cond.push(`${SQL_SIN_ACENTOS(campos)} LIKE $${pi}`); params.push(tokenBusqueda(tk)); pi++; } const whereTok=cond.length?(' AND '+cond.join(' AND ')):''; const {rows}=await pool.query(`SELECT p.id,p.nombre,p.modelo,p.categoria,p.precio_base,p.precio_oferta,p.stock,p.imagen,p.sku,p.codigo_barras,p.seccion_id,p.permitir_sin_stock,p.es_digital,p.usa_variantes,${sqlDesde('p')},s.nombre as seccion_nombre,s.color as seccion_color FROM productos p LEFT JOIN secciones s ON p.seccion_id=s.id WHERE p.tenant_id=$1${whereTok}${esStaffReq(req)?'':' AND p.visible=true'} ORDER BY p.stock DESC NULLS LAST, p.nombre LIMIT 100`, params); res.json(esStaffReq(req) ? rows : (await sinRestringidas(req, rows, { conservarConAcceso: true })).map(limpiarProducto)); }catch(e){ res.status(500).json({error:e.message}); } });
 // Buscar producto por código de barras/SKU exacto (para el escáner). Devuelve 1 producto.
 app.get('/api/productos/por-codigo/:codigo', optionalAuth, async (req,res)=>{
   try{
@@ -3260,6 +3260,33 @@ async function insertarItems(client, tenantId, pedidoId, items, descontarStock){
     }
   }
 }
+// Reparación única: presupuestos guardados desde el carrito por una cuenta del local quedaron sin nombre ni precio ($0).
+// Les completa nombre y precio con el mismo cálculo del carrito. Solo toca líneas vacías de presupuestos: volver a correrla no cambia nada.
+async function repararPresupuestosSinPrecio(){
+  const {rows}=await pool.query(`SELECT pi.id, pi.pedido_id, pi.producto_id, pi.variante_id, pi.cantidad, pe.tenant_id, pe.usuario_id, COALESCE(pe.moneda,'ARS') AS moneda
+    FROM pedido_items pi JOIN pedidos pe ON pe.id=pi.pedido_id
+    WHERE pe.tipo='presupuesto' AND pi.producto_id IS NOT NULL AND COALESCE(pi.precio_unitario,0)=0 AND COALESCE(pi.nombre_producto,'')=''`);
+  if(!rows.length) return;
+  const sumas=new Map(); const ctxs={};
+  for(const r of rows){
+    try{
+      const k=`${r.tenant_id}:${r.usuario_id||0}`;
+      const ctx=ctxs[k] || (ctxs[k]=await checkout.contexto(pool, r.tenant_id, r.usuario_id||null));
+      const [it]=await checkout.preciarItems(pool, ctx, [{ producto_id:r.producto_id, variante_id:r.variante_id, cantidad:r.cantidad }], { permitirOcultos:true });
+      if(!it) continue;
+      await pool.query("UPDATE pedido_items SET nombre_producto=$2, categoria=$3, modelo=$4, precio_unitario=$5, precio_base=$6, variante_combinacion=COALESCE(NULLIF(variante_combinacion,''),$7) WHERE id=$1 AND COALESCE(precio_unitario,0)=0",
+        [r.id, TXT(it.nombre_producto,300), TXT(it.categoria,200), TXT(it.modelo,200), it.precio_unitario, it.precio_base, it.variante_label||null]);
+      const monedaItem=(it.moneda||'ARS')==='ARS'?'ARS':'USDT';
+      if(!sumas.has(r.pedido_id)) sumas.set(r.pedido_id, 0);
+      if(monedaItem===(r.moneda==='USDT'?'USDT':'ARS')) sumas.set(r.pedido_id, sumas.get(r.pedido_id) + it.precio_unitario*r.cantidad);
+    }catch(e){ console.log('[reparar presupuestos] línea', r.id, e.message); }
+  }
+  for(const [pid, sub] of sumas){
+    const s2=Math.round(sub*100)/100;
+    await pool.query("UPDATE pedidos SET subtotal=$2, total=GREATEST(0, $2-COALESCE(descuento,0))+COALESCE(costo_envio,0) WHERE id=$1 AND tipo='presupuesto' AND COALESCE(total,0)=0", [pid, s2]).catch(e=>console.log('[reparar presupuestos] pedido', pid, e.message));
+  }
+  console.log(`[reparar presupuestos] ${sumas.size} presupuesto(s) completados`);
+}
 async function etiquetarMoneda(client, pedidoId){
   // Sin .catch: corre dentro de la transacción del pedido; si fallara, tiene que fallar todo (no responder OK sin guardar)
   // USDT solo si todo es en dólares: un pedido con algo en pesos queda en pesos (su total se carga en pesos)
@@ -3297,9 +3324,13 @@ app.post('/api/pedidos', auth(), async (req,res)=>{
   try{
     const staff=await esStaffPedidos(req);
     const b=req.body||{};
+    // Presupuesto guardado desde el carrito de la web: llegan solo ids y cantidades. Se cotiza en el servidor
+    // aunque lo guarde una cuenta del local (antes quedaba sin nombres, sin precios y en $0)
+    const itemsB=Array.isArray(b.items)?b.items:[];
+    const desdeCarrito = b.tipo==='presupuesto' && itemsB.length>0 && itemsB.every(i=>i && i.precio_unitario===undefined && !i.nombre_producto);
     await client.query('BEGIN');
     let pedido;
-    if(staff){
+    if(staff && !desdeCarrito){
       const items=Array.isArray(b.items)?b.items:[];
       const esPresupuesto = b.tipo === 'presupuesto';
       if(Number(req.tenantId)!==1){
@@ -4279,4 +4310,4 @@ app.get('/api/andreani/etiqueta/:envio', authPerm('pedidos'), async (req,res)=>{
 
 // START
 const PORT=process.env.PORT||3000;
-migrate().then(()=>{ app.listen(PORT, ()=>console.log(`🚀 V4 running on ${PORT}`)); tareasSeo().catch(e=>console.log('tareas SEO warn', e.message)); setInterval(vigilarBot, Number(process.env.VIGILAR_BOT_MS) || 5*60*1000); if (process.env.HEALTHCHECK_URL) { pingExterno(); setInterval(pingExterno, 5*60*1000); } }).catch(e=>{ console.error('Migration failed', e); process.exit(1); });
+migrate().then(()=>{ app.listen(PORT, ()=>console.log(`🚀 V4 running on ${PORT}`)); tareasSeo().catch(e=>console.log('tareas SEO warn', e.message)); repararPresupuestosSinPrecio().catch(e=>console.log('reparar presupuestos warn', e.message)); setInterval(vigilarBot, Number(process.env.VIGILAR_BOT_MS) || 5*60*1000); if (process.env.HEALTHCHECK_URL) { pingExterno(); setInterval(pingExterno, 5*60*1000); } }).catch(e=>{ console.error('Migration failed', e); process.exit(1); });
