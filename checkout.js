@@ -198,7 +198,7 @@ function createCheckout(pool) {
     const varIds = [...new Set(items.map(i => i.variante_id).filter(Boolean))];
     const { rows: prods } = await db.query(
       `SELECT id, seccion_id, nombre, modelo, categoria, imagen, precio_base, precio_oferta, moneda, stock, permitir_sin_stock, es_digital,
-              es_preventa, preventa_cupo, preventa_reservado, preventa_descuento_pct, envio_gratis, visible, usa_variantes, peso, alto, ancho, largo
+              es_preventa, preventa_cupo, preventa_reservado, preventa_descuento_pct, envio_gratis, excluir_envio_gratis, visible, usa_variantes, peso, alto, ancho, largo
        FROM productos WHERE id = ANY($1::int[]) AND tenant_id=$2`, [ids, ctx.tenantId]);
     const prodMap = {}; prods.forEach(p => { prodMap[p.id] = p; });
     const varMap = {};
@@ -238,7 +238,7 @@ function createCheckout(pool) {
         producto_id: p.id, variante_id: v ? v.id : null, variante_label: label, cantidad: i.cantidad,
         precio_unitario: round2(precio), precio_base: num(p.precio_base), moneda,
         nombre_producto: p.nombre || p.modelo || '', categoria: p.categoria || '', modelo: p.modelo || '', imagen: p.imagen || '',
-        seccion_id: p.seccion_id, envio_gratis: !!p.envio_gratis, es_digital: !!p.es_digital, _preventa: !!p.es_preventa,
+        seccion_id: p.seccion_id, envio_gratis: !!p.envio_gratis, excluir_envio_gratis: !!p.excluir_envio_gratis, es_digital: !!p.es_digital, _preventa: !!p.es_preventa,
         peso: num(p.peso), alto: num(p.alto), ancho: num(p.ancho), largo: num(p.largo),
         _prod: p, _var: v,
       });
@@ -250,7 +250,9 @@ function createCheckout(pool) {
     const umbral = num(ctx.config[`envio_gratis_desde_${sec.id}`]);
     const fisicos = itemsArs.filter(i => !i.es_digital);
     const todosGratis = fisicos.length > 0 && fisicos.every(i => i.envio_gratis);
-    const gratisSeccion = (umbral > 0 && subtotal >= umbral) || todosGratis;
+    // Un producto marcado "excluir del envío gratis" (pesados) hace que esa tienda cobre el envío aunque pase el monto
+    const hayExcluido = fisicos.some(i => i.excluir_envio_gratis);
+    const gratisSeccion = !hayExcluido && ((umbral > 0 && subtotal >= umbral) || todosGratis);
     const { rows } = await db.query('SELECT * FROM metodos_envio_custom WHERE activo=true AND tenant_id=$1 AND (seccion_id=$2 OR seccion_id IS NULL) ORDER BY orden, id', [ctx.tenantId, sec.id]);
     // tipo: 'fijo' (cobra su precio), 'gratis' (siempre sin cargo) o 'a_cotizar' (el costo se pasa después).
     // Un método 'fijo' sin precio cargado también es "a cotizar": nunca se muestra como gratis por error.
@@ -259,7 +261,7 @@ function createCheckout(pool) {
       const sinPrecio = !esGratis && (m.tipo === 'a_cotizar' || num(m.precio) <= 0);
       const original = esGratis || sinPrecio ? 0 : num(m.precio);
       const gd = num(m.gratis_desde);
-      const bonificado = !esGratis && (gratisSeccion || (gd > 0 && subtotal >= gd));
+      const bonificado = !esGratis && (gratisSeccion || (!hayExcluido && gd > 0 && subtotal >= gd));
       const aCotizar = sinPrecio && !bonificado;
       return { id: `custom:${m.id}`, nombre: m.nombre, descripcion: m.descripcion || '', tiempo_estimado: m.tiempo_estimado || '', icono: m.icono || 'truck', costo: bonificado || aCotizar ? 0 : original, costo_original: original, gratis: esGratis || bonificado, a_cotizar: aCotizar, proveedor: 'propio' };
     });
@@ -275,7 +277,7 @@ function createCheckout(pool) {
         } catch (e) { console.log(`[envio] ${prov.id} no cotizó:`, e.message); }
       }
     }
-    return { opciones, gratis_seccion: gratisSeccion, umbral, falta_para_gratis: umbral > 0 && !gratisSeccion ? round2(umbral - subtotal) : 0 };
+    return { opciones, gratis_seccion: gratisSeccion, umbral: hayExcluido ? 0 : umbral, excluido_gratis: hayExcluido, falta_para_gratis: !hayExcluido && umbral > 0 && !gratisSeccion ? round2(umbral - subtotal) : 0 };
   }
 
   // Valida un cupón contra los ítems de UNA sección. Devuelve { descuento, envio_gratis } o tira CheckoutError.

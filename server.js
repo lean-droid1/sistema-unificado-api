@@ -687,6 +687,7 @@ async function migrate(){
     `ALTER TABLE productos ADD COLUMN IF NOT EXISTS modelo VARCHAR(200) DEFAULT ''`,
     `ALTER TABLE productos ADD COLUMN IF NOT EXISTS nombre VARCHAR(300) DEFAULT ''`,
     `ALTER TABLE productos ADD COLUMN IF NOT EXISTS envio_gratis BOOLEAN DEFAULT false`,
+    `ALTER TABLE productos ADD COLUMN IF NOT EXISTS excluir_envio_gratis BOOLEAN DEFAULT false`, // pesados: no entran en el envío gratis por monto
     `ALTER TABLE productos ADD COLUMN IF NOT EXISTS permitir_sin_stock BOOLEAN DEFAULT false`,
     `ALTER TABLE productos ADD COLUMN IF NOT EXISTS es_digital BOOLEAN DEFAULT false`,
     `ALTER TABLE productos ADD COLUMN IF NOT EXISTS peso NUMERIC(8,2) DEFAULT 0`,
@@ -2137,8 +2138,8 @@ app.post('/api/categorias/meta', authPerm('productos'), async (req,res)=>{
 app.post('/api/productos', authPerm('productos'), async (req,res)=>{
   try{
     const p=req.body;
-    const {rows}=await pool.query(`INSERT INTO productos (tenant_id,seccion_id,categoria,modelo,nombre,precio_base,precio_original,stock,stock_minimo,imagen,notas,compatibilidad,descripcion,sku,tipo,moneda,precio_oferta,envio_gratis,visible,peso,alto,ancho,largo,permitir_sin_stock,es_digital,marca,es_preventa,preventa_precio,preventa_fecha,preventa_mostrar_fecha,preventa_descuento_pct,preventa_cupo) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32) RETURNING *`,
-      [req.tenantId, p.seccion_id, p.categoria||'', p.modelo||'', p.nombre||'', p.precio_base||0, p.precio_original||0, p.stock||0, p.stock_minimo||0, p.imagen||'', p.notas||'', p.compatibilidad||'', p.descripcion||'', p.sku||'', p.tipo||'fisico', p.moneda||'ARS', p.precio_oferta||0, p.envio_gratis||false, p.visible!==false, p.peso||0, p.alto||0, p.ancho||0, p.largo||0, p.permitir_sin_stock||false, p.es_digital||false, p.marca||'', p.es_preventa||false, p.preventa_precio||0, p.preventa_fecha||null, p.preventa_mostrar_fecha||false, p.preventa_descuento_pct||0, p.preventa_cupo||0]);
+    const {rows}=await pool.query(`INSERT INTO productos (tenant_id,seccion_id,categoria,modelo,nombre,precio_base,precio_original,stock,stock_minimo,imagen,notas,compatibilidad,descripcion,sku,tipo,moneda,precio_oferta,envio_gratis,visible,peso,alto,ancho,largo,permitir_sin_stock,es_digital,marca,es_preventa,preventa_precio,preventa_fecha,preventa_mostrar_fecha,preventa_descuento_pct,preventa_cupo,excluir_envio_gratis) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33) RETURNING *`,
+      [req.tenantId, p.seccion_id, p.categoria||'', p.modelo||'', p.nombre||'', p.precio_base||0, p.precio_original||0, p.stock||0, p.stock_minimo||0, p.imagen||'', p.notas||'', p.compatibilidad||'', p.descripcion||'', p.sku||'', p.tipo||'fisico', p.moneda||'ARS', p.precio_oferta||0, p.envio_gratis||false, p.visible!==false, p.peso||0, p.alto||0, p.ancho||0, p.largo||0, p.permitir_sin_stock||false, p.es_digital||false, p.marca||'', p.es_preventa||false, p.preventa_precio||0, p.preventa_fecha||null, p.preventa_mostrar_fecha||false, p.preventa_descuento_pct||0, p.preventa_cupo||0, !!p.excluir_envio_gratis]);
     res.json(rows[0]);
   }catch(e){ res.status(500).json({error:e.message}); }
 });
@@ -2150,8 +2151,8 @@ app.post('/api/productos/:id/duplicar', authPerm('productos'), async (req,res)=>
     if(!orig[0]){ return res.status(404).json({error:'No encontrado'}); } // el finally libera la conexión (antes se liberaba dos veces y podía tirar el servidor)
     const p=orig[0];
     await client.query('BEGIN');
-    const {rows}=await client.query(`INSERT INTO productos (tenant_id,seccion_id,categoria,modelo,nombre,precio_base,precio_original,stock,stock_minimo,imagen,notas,compatibilidad,descripcion,sku,tipo,moneda,precio_oferta,envio_gratis,visible,peso,alto,ancho,largo,permitir_sin_stock,es_digital,marca,usa_variantes) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27) RETURNING *`,
-      [t, p.seccion_id, p.categoria, p.modelo, (p.nombre||p.modelo||'')+' (copia)', p.precio_base, p.precio_original, 0, p.stock_minimo, p.imagen, p.notas, p.compatibilidad, p.descripcion, p.sku?p.sku+'-copia':'', p.tipo, p.moneda, p.precio_oferta, p.envio_gratis, false, p.peso, p.alto, p.ancho, p.largo, p.permitir_sin_stock, p.es_digital, p.marca, p.usa_variantes]);
+    const {rows}=await client.query(`INSERT INTO productos (tenant_id,seccion_id,categoria,modelo,nombre,precio_base,precio_original,stock,stock_minimo,imagen,notas,compatibilidad,descripcion,sku,tipo,moneda,precio_oferta,envio_gratis,visible,peso,alto,ancho,largo,permitir_sin_stock,es_digital,marca,usa_variantes,excluir_envio_gratis) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28) RETURNING *`,
+      [t, p.seccion_id, p.categoria, p.modelo, (p.nombre||p.modelo||'')+' (copia)', p.precio_base, p.precio_original, 0, p.stock_minimo, p.imagen, p.notas, p.compatibilidad, p.descripcion, p.sku?p.sku+'-copia':'', p.tipo, p.moneda, p.precio_oferta, p.envio_gratis, false, p.peso, p.alto, p.ancho, p.largo, p.permitir_sin_stock, p.es_digital, p.marca, p.usa_variantes, !!p.excluir_envio_gratis]);
     const nuevo=rows[0];
     // Atributos + sus valores (mapeando al nuevo producto)
     const {rows:atrs}=await client.query('SELECT * FROM producto_atributos WHERE producto_id=$1 AND tenant_id=$2 ORDER BY orden,id', [p.id, t]);
@@ -2180,7 +2181,7 @@ app.post('/api/productos/:id/duplicar', authPerm('productos'), async (req,res)=>
 app.put('/api/productos/:id', authPerm('productos'), async (req,res)=>{
   try{
     const p=req.body;
-    const fields=['seccion_id','categoria','modelo','nombre','precio_base','precio_original','stock','stock_minimo','imagen','notas','compatibilidad','descripcion','sku','codigo_barras','tipo','moneda','precio_oferta','envio_gratis','visible','peso','alto','ancho','largo','permitir_sin_stock','es_digital','marca','es_preventa','preventa_precio','preventa_fecha','preventa_mostrar_fecha','preventa_descuento_pct','preventa_cupo','preventa_reservado'];
+    const fields=['seccion_id','categoria','modelo','nombre','precio_base','precio_original','stock','stock_minimo','imagen','notas','compatibilidad','descripcion','sku','codigo_barras','tipo','moneda','precio_oferta','envio_gratis','visible','peso','alto','ancho','largo','permitir_sin_stock','es_digital','marca','es_preventa','preventa_precio','preventa_fecha','preventa_mostrar_fecha','preventa_descuento_pct','preventa_cupo','preventa_reservado','excluir_envio_gratis'];
     const sets=[]; const params=[]; let pi=1;
     for(const f of fields){ if(p[f]!==undefined){ sets.push(`${f}=$${pi++}`); params.push(p[f]); } }
     if(!sets.length) return res.json({ok:true});
@@ -4112,7 +4113,7 @@ app.get('/api/busqueda-global', optionalAuth, async (req,res)=>{
     for(const sec of secciones){
       const params=[sec.id, req.tenantId]; let pi=3; const cond=[];
       for(const tk of toks){ cond.push(`${SQL_SIN_ACENTOS(campos)} LIKE $${pi}`); params.push(tokenBusqueda(tk)); pi++; }
-      const {rows}=await pool.query(`SELECT id,tenant_id,seccion_id,nombre,modelo,marca,categoria,precio_base,precio_oferta,moneda,imagen,stock,envio_gratis,permitir_sin_stock,es_digital,usa_variantes,es_preventa,preventa_precio,preventa_descuento_pct,preventa_fecha,preventa_mostrar_fecha,preventa_cupo,preventa_reservado,created_at,${IMG2('productos')},${sqlDesde('productos')} FROM productos WHERE seccion_id=$1 AND tenant_id=$2 AND visible=true${cond.length?' AND '+cond.join(' AND '):''} ORDER BY stock DESC LIMIT 50`, params);
+      const {rows}=await pool.query(`SELECT id,tenant_id,seccion_id,nombre,modelo,marca,categoria,precio_base,precio_oferta,moneda,imagen,stock,envio_gratis,excluir_envio_gratis,permitir_sin_stock,es_digital,usa_variantes,es_preventa,preventa_precio,preventa_descuento_pct,preventa_fecha,preventa_mostrar_fecha,preventa_cupo,preventa_reservado,created_at,${IMG2('productos')},${sqlDesde('productos')} FROM productos WHERE seccion_id=$1 AND tenant_id=$2 AND visible=true${cond.length?' AND '+cond.join(' AND '):''} ORDER BY stock DESC LIMIT 50`, params);
       if(rows.length){ const hidePrice=sec.slug==='mayorista' && !req.user; resultados.push({seccion:sec, productos: hidePrice? rows.map(r=>({...r, precio_base:0, precio_oferta:0, precio_desde:null})) : rows}); }
     }
     res.json({resultados, total: resultados.reduce((s,r)=>s+r.productos.length,0)});
