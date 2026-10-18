@@ -731,6 +731,9 @@ async function migrate(){
     `ALTER TABLE secciones ADD COLUMN IF NOT EXISTS aviso_titulo VARCHAR(200) DEFAULT ''`,
     `ALTER TABLE secciones ADD COLUMN IF NOT EXISTS aviso TEXT DEFAULT ''`,
     `ALTER TABLE categorias_meta ADD COLUMN IF NOT EXISTS descripcion TEXT DEFAULT ''`,
+    // Compra mínima por categoría en unidades (se pueden combinar productos de la categoría)
+    `ALTER TABLE categorias_meta ADD COLUMN IF NOT EXISTS min_unidades INT DEFAULT 0`,
+    `ALTER TABLE categorias_meta ADD COLUMN IF NOT EXISTS min_unidad VARCHAR(30) DEFAULT ''`,
     `ALTER TABLE pedido_items ADD COLUMN IF NOT EXISTS costo_unitario NUMERIC(12,2)`,
     `ALTER TABLE productos ADD COLUMN IF NOT EXISTS stock_minimo INT DEFAULT 0`,
     `ALTER TABLE productos ADD COLUMN IF NOT EXISTS visible BOOLEAN DEFAULT true`,
@@ -2043,9 +2046,9 @@ app.get('/api/categorias/admin', authPerm('productos'), async (req,res)=>{
     const {rows:meta}=await pool.query('SELECT * FROM categorias_meta WHERE tenant_id=$1', [req.tenantId]).catch(()=>({rows:[]}));
     const metaMap={}; meta.forEach(m=>metaMap[m.categoria]=m);
     const catSet=new Set(cats.map(c=>c.categoria).filter(Boolean));
-    const result=cats.filter(c=>c.categoria).map(c=>({ nombre:c.categoria, cantidad:c.cantidad, orden:(metaMap[c.categoria]?.orden??999), visible:(metaMap[c.categoria]?.visible!==false), titulo:metaMap[c.categoria]?.titulo||'', descripcion:metaMap[c.categoria]?.descripcion||'' }));
+    const result=cats.filter(c=>c.categoria).map(c=>({ nombre:c.categoria, cantidad:c.cantidad, orden:(metaMap[c.categoria]?.orden??999), visible:(metaMap[c.categoria]?.visible!==false), titulo:metaMap[c.categoria]?.titulo||'', descripcion:metaMap[c.categoria]?.descripcion||'', min_unidades:Number(metaMap[c.categoria]?.min_unidades)||0, min_unidad:metaMap[c.categoria]?.min_unidad||'' }));
     // Categorías creadas manualmente (en meta) que todavía no tienen productos
-    meta.forEach(m=>{ if(!catSet.has(m.categoria)) result.push({ nombre:m.categoria, cantidad:0, orden:(m.orden??999), visible:(m.visible!==false) }); });
+    meta.forEach(m=>{ if(!catSet.has(m.categoria)) result.push({ nombre:m.categoria, cantidad:0, orden:(m.orden??999), visible:(m.visible!==false), min_unidades:Number(m.min_unidades)||0, min_unidad:m.min_unidad||'' }); });
     result.sort((a,b)=> a.orden-b.orden || a.nombre.localeCompare(b.nombre));
     res.json(result);
   }catch(e){ res.status(500).json({error:e.message}); }
@@ -2123,6 +2126,26 @@ app.post('/api/categorias/seo', authPerm('productos'), async (req,res)=>{
     const titulo = String(req.body?.titulo || '').trim().slice(0, 200), descripcion = String(req.body?.descripcion || '').trim().slice(0, 3000);
     await pool.query(`INSERT INTO categorias_meta (tenant_id, categoria, titulo, descripcion, orden) VALUES ($1,$2,$3,$4,999) ON CONFLICT (tenant_id, categoria) DO UPDATE SET titulo=$3, descripcion=$4`, [req.tenantId, nombre, titulo, descripcion]);
     res.json({ok:true});
+  }catch(e){ res.status(500).json({error:e.message}); }
+});
+// Compra mínima por categoría: N unidades sumando cualquier producto de la categoría (0 = sin mínimo)
+app.post('/api/categorias/minimo', authPerm('productos'), async (req,res)=>{
+  try{
+    const nombre = String(req.body?.nombre || '').trim().slice(0, 200);
+    if (!nombre) return res.status(400).json({error:'Falta la categoría'});
+    const min = Math.max(0, Math.min(10000, parseInt(req.body?.min_unidades, 10) || 0));
+    if (min === 1) return res.status(400).json({error:'El mínimo tiene que ser de 2 o más (o 0 para sacarlo)'});
+    const unidad = String(req.body?.min_unidad || '').trim().replace(/\s+/g, ' ').slice(0, 30);
+    await pool.query(`INSERT INTO categorias_meta (tenant_id, categoria, orden, visible, min_unidades, min_unidad) VALUES ($1,$2,999,true,$3,$4)
+      ON CONFLICT (tenant_id, categoria) DO UPDATE SET min_unidades=$3, min_unidad=$4`, [req.tenantId, nombre, min, unidad]);
+    res.json({ok:true, min_unidades:min, min_unidad:unidad});
+  }catch(e){ res.status(500).json({error:e.message}); }
+});
+app.get('/api/categorias-minimos', async (req,res)=>{
+  try{
+    const {rows} = await pool.query('SELECT categoria, min_unidades AS minimo, min_unidad AS unidad FROM categorias_meta WHERE tenant_id=$1 AND min_unidades>1', [req.tenantId]);
+    res.set('Cache-Control', 'public, max-age=60');
+    res.json(rows.map(r => ({ categoria:r.categoria, minimo:Number(r.minimo), unidad:r.unidad || 'unidades' })));
   }catch(e){ res.status(500).json({error:e.message}); }
 });
 app.post('/api/categorias/meta', authPerm('productos'), async (req,res)=>{

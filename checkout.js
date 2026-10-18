@@ -154,6 +154,17 @@ function pctDescuentoPago(ctx, metodo, seccionId) {
   return Number.isFinite(pct) && pct > 0 ? Math.min(pct, 100) : 0;
 }
 
+// Mínimo por categoría: nombres comparados sin mayúsculas ni espacios de más
+const claveCat = (c) => String(c || '').trim().replace(/\s+/g, ' ').toLowerCase();
+function minimosCategoria(ctx, items) {
+  const cant = new Map();
+  for (const i of items) {
+    const k = claveCat(i.categoria);
+    if (k && ctx.minCat && ctx.minCat[k]) cant.set(k, (cant.get(k) || 0) + i.cantidad);
+  }
+  return [...cant].map(([k, n]) => ({ ...ctx.minCat[k], cantidad: n, faltan: Math.max(0, ctx.minCat[k].minimo - n) }));
+}
+
 function createCheckout(pool) {
   // Todo lo que depende del cliente y de la tienda (una sola vez por cotización)
   async function contexto(db, tenantId, userId) {
@@ -164,6 +175,9 @@ function createCheckout(pool) {
       db.query("SELECT clave, valor FROM configuracion WHERE tenant_id=$1 AND (clave LIKE 'envio_gratis_desde_%' OR clave LIKE 'compra_minima_%' OR clave LIKE 'min_aplica_retiro_%' OR clave LIKE 'descuento\\_%')", [tenantId]),
     ]);
     const { rows: metodos } = await db.query('SELECT nombre, seccion_id FROM metodos_pago WHERE tenant_id=$1 AND activo=true', [tenantId]).catch(() => ({ rows: [] }));
+    // Compra mínima por categoría (en unidades, sumando cualquier producto de la categoría)
+    const { rows: mins } = await db.query('SELECT categoria, min_unidades, min_unidad FROM categorias_meta WHERE tenant_id=$1 AND min_unidades>1', [tenantId]).catch(() => ({ rows: [] }));
+    const minCat = {}; mins.forEach(m => { minCat[claveCat(m.categoria)] = { categoria: m.categoria, minimo: Number(m.min_unidades), unidad: m.min_unidad || 'unidades' }; });
     const user = u.rows[0] || null;
     let lista = null; const pf = {};
     if (user && user.lista_precio_id) {
@@ -179,7 +193,7 @@ function createCheckout(pool) {
     const esStaff = !!user && (user.rol === 'admin' || (user.rol === 'subadmin' && String(user.permisos || '').split(',').includes('pedidos')));
     // Tiendas con aprobación (mayorista): solo clientes autorizados o el equipo
     const accesoMayorista = !!user && user.activo !== false && (user.rol === 'admin' || user.rol === 'subadmin' || !!user.mayorista);
-    return { tenantId, user, lista, pf, promos: promos.rows, secciones, config, esStaff, accesoMayorista, metodos };
+    return { tenantId, user, lista, pf, promos: promos.rows, secciones, config, esStaff, accesoMayorista, metodos, minCat };
   }
 
   // Normaliza los ítems que manda la web y les pone el precio del servidor
@@ -389,6 +403,9 @@ function createCheckout(pool) {
       if (faltaMinimo > 0) errores.push({ seccion_id: secId, tipo: 'minimo', mensaje: minUsd
         ? `${sec.nombre}: la compra mínima${entregaTipo === 'envio' ? ' para envío' : ''} es de USD ${minBase.toLocaleString('es-AR')} (hoy $${min.toLocaleString('es-AR')} al dólar de $${num(usd && usd.valor).toLocaleString('es-AR')}).`
         : `${sec.nombre}: la compra mínima${entregaTipo === 'envio' ? ' para envío' : ''} es de $${min.toLocaleString('es-AR')}.` });
+      // Mínimo por categoría: vale para envío y retiro; se cuentan las unidades de todos los productos de esa categoría
+      const minimosCat = minimosCategoria(ctx, items);
+      for (const m of minimosCat) if (m.faltan > 0) errores.push({ seccion_id: secId, tipo: 'minimo_categoria', categoria: m.categoria, mensaje: `${m.categoria}: la compra mínima es de ${m.minimo} ${m.unidad} (podés combinar productos de la categoría). Llevás ${m.cantidad}, sumá ${m.faltan} más.` });
       if (entregaTipo === 'envio' && requiereEnvio && envio.opciones.length && !elegido) errores.push({ seccion_id: secId, tipo: 'envio', mensaje: `Elegí cómo querés recibir lo de ${sec.nombre}.` });
       resultado.push({
         seccion_id: secId, nombre: sec.nombre, slug: sec.slug,
@@ -396,7 +413,7 @@ function createCheckout(pool) {
         subtotal, subtotal_usdt: subtotalUsdt, descuento, cupon: cuponAplicado,
         metodo_pago: metodoPago || null, descuento_pago: descuentoPago, descuento_pago_pct: descuentoPago > 0 ? pctPago : 0,
         requiere_envio: requiereEnvio, envio: { ...envio, elegido, costo: costoEnvio, a_cotizar: !!(elegido && elegido.a_cotizar), a_coordinar: entregaTipo === 'envio' && requiereEnvio && !envio.opciones.length },
-        total, compra_minima: min, compra_minima_usd: minUsd ? minBase : null, falta_minimo: faltaMinimo,
+        total, compra_minima: min, compra_minima_usd: minUsd ? minBase : null, falta_minimo: faltaMinimo, minimos_categoria: minimosCat,
         _items: items,
       });
     }
