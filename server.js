@@ -2232,28 +2232,46 @@ app.post('/api/productos/bulk', authPerm('productos'), async (req,res)=>{
     const {rows:secsT}=await pool.query('SELECT id FROM secciones WHERE tenant_id=$1 ORDER BY orden, id', [t]);
     const secsPropias=new Set(secsT.map(x=>x.id)); const secDefecto=secsT[0]?.id||null;
     const secDe = (p) => { if(secDest) return secDest; const x=parseInt(p.seccion_id, 10); return (x && secsPropias.has(x)) ? x : null; };
+    // Descripción: se respetan los saltos de línea (S() los aplasta)
+    const D = (v) => (v===undefined || v===null) ? '' : String(v).replace(/\r\n/g, '\n').trim().slice(0, 20000);
+    // Excel bajado de la tienda ("Descargar Excel"): trae el ID de cada producto
+    const idDe = (p) => { const x = parseInt(p && p.id, 10); return x > 0 ? x : null; };
     const buscar = async (p) => {
+      if(idDe(p)){ const {rows}=await pool.query('SELECT id FROM productos WHERE id=$1 AND tenant_id=$2', [idDe(p), t]); if(rows[0]) return rows[0]; }
       const sec = secDe(p); const sku = S(p.sku, 100); const nom = S(p.nombre || p.modelo);
       if(sku){ const {rows}=await pool.query('SELECT id FROM productos WHERE sku=$1 AND tenant_id=$2 AND ($3::int IS NULL OR seccion_id=$3) LIMIT 1', [sku, t, sec]); if(rows[0]) return rows[0]; }
       if(nom){ const {rows}=await pool.query('SELECT id FROM productos WHERE LOWER(TRIM(nombre))=LOWER($1) AND tenant_id=$2 AND ($3::int IS NULL OR seccion_id=$3) LIMIT 1', [nom, t, sec]); if(rows[0]) return rows[0]; }
       return null;
     };
     const insertar = (p) => pool.query(`INSERT INTO productos (tenant_id,seccion_id,categoria,modelo,nombre,precio_base,precio_oferta,precio_original,stock,imagen,sku,descripcion,compatibilidad,peso,alto,ancho,largo,visible,permitir_sin_stock,posicion)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,true,$18,$19)`,
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$20,$18,$19)`,
       [t, secDe(p) || secDefecto, S(p.categoria,200), S(p.modelo,200), S(p.nombre || p.modelo), N(p.precio_base), N(p.precio_oferta), N(p.precio_original), I(p.stock) ?? 0,
-       S(p.imagen,2000), S(p.sku,100), S(p.descripcion,8000), S(p.compatibilidad,2000), N(p.peso), N(p.alto), N(p.ancho), N(p.largo), !!p.permitir_sin_stock, I(p.posicion) ?? 0]);
+       S(p.imagen,2000), S(p.sku,100), D(p.descripcion), S(p.compatibilidad,2000), N(p.peso), N(p.alto), N(p.ancho), N(p.largo), !!p.permitir_sin_stock, I(p.posicion) ?? 0, p.visible !== false]);
     const actualizar = (id, p) => pool.query(`UPDATE productos SET
         categoria=CASE WHEN $1<>'' THEN $1 ELSE categoria END, precio_base=$2, precio_oferta=$3,
-        precio_original=CASE WHEN $4>0 THEN $4 ELSE precio_original END,
+        precio_original=CASE WHEN $4::numeric>0 THEN $4::numeric ELSE precio_original END,
         stock=COALESCE($5::int, stock),
         compatibilidad=CASE WHEN $6<>'' THEN $6 ELSE compatibilidad END,
         posicion=COALESCE($7::int, posicion),
         permitir_sin_stock=COALESCE($8::boolean, permitir_sin_stock),
-        peso=CASE WHEN $9>0 THEN $9 ELSE peso END, alto=CASE WHEN $10>0 THEN $10 ELSE alto END,
-        ancho=CASE WHEN $11>0 THEN $11 ELSE ancho END, largo=CASE WHEN $12>0 THEN $12 ELSE largo END
+        peso=CASE WHEN $9::numeric>0 THEN $9::numeric ELSE peso END, alto=CASE WHEN $10::numeric>0 THEN $10::numeric ELSE alto END,
+        ancho=CASE WHEN $11::numeric>0 THEN $11::numeric ELSE ancho END, largo=CASE WHEN $12::numeric>0 THEN $12::numeric ELSE largo END
       WHERE id=$13 AND tenant_id=$14`,
       [S(p.categoria,200), N(p.precio_base), N(p.precio_oferta), N(p.precio_original), I(p.stock), S(p.compatibilidad,2000), I(p.posicion),
        (p.permitir_sin_stock===undefined || p.permitir_sin_stock===null) ? null : !!p.permitir_sin_stock, N(p.peso), N(p.alto), N(p.ancho), N(p.largo), id, t]);
+    // Además, en el Excel de la tienda se pueden cambiar nombre, descripción, SKU y si se ve o no
+    const extra = async (id, p) => {
+      if(!idDe(p)) return;
+      const sets = []; const vals = [];
+      const put = (col, v) => { vals.push(v); sets.push(`${col}=$${vals.length}`); };
+      if(S(p.nombre)) put('nombre', S(p.nombre));
+      if(typeof p.descripcion === 'string') put('descripcion', D(p.descripcion));
+      if(typeof p.sku === 'string') put('sku', S(p.sku,100));
+      if(typeof p.visible === 'boolean') put('visible', p.visible);
+      if(!sets.length) return;
+      vals.push(id, t);
+      await pool.query(`UPDATE productos SET ${sets.join(', ')} WHERE id=$${vals.length-1} AND tenant_id=$${vals.length}`, vals);
+    };
     let insertados=0, actualizados=0, saltados=0, errores=0, primerError=null;
     const fallo = (e, p) => { errores++; if(!primerError) primerError = `${S(p && (p.nombre || p.modelo), 80)}: ${String(e.message || e).slice(0,140)}`; };
 
@@ -2311,7 +2329,7 @@ app.post('/api/productos/bulk', authPerm('productos'), async (req,res)=>{
         const ex = await buscar(p);
         if(modo==='solo_nuevos'){ if(ex){ saltados++; continue; } await insertar(p); insertados++; continue; }
         // crear_actualizar (por defecto)
-        if(ex){ await actualizar(ex.id, p); actualizados++; } else { await insertar(p); insertados++; }
+        if(ex){ await actualizar(ex.id, p); await extra(ex.id, p); actualizados++; } else { await insertar(p); insertados++; }
       }catch(e){ fallo(e, p); }
     }
     res.json({ok:true, modo: modo || 'crear_actualizar', insertados, actualizados, saltados, errores, primer_error: primerError || undefined});
