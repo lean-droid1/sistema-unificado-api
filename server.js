@@ -734,6 +734,26 @@ async function migrate(){
     // Compra mínima por categoría en unidades (se pueden combinar productos de la categoría)
     `ALTER TABLE categorias_meta ADD COLUMN IF NOT EXISTS min_unidades INT DEFAULT 0`,
     `ALTER TABLE categorias_meta ADD COLUMN IF NOT EXISTS min_unidad VARCHAR(30) DEFAULT ''`,
+    // Programa de profes: código por profe, alumnos vinculados por N meses y saldo a favor del profe
+    `CREATE TABLE IF NOT EXISTS profes (id SERIAL PRIMARY KEY, tenant_id INT NOT NULL DEFAULT 1, usuario_id INT, nombre VARCHAR(200) DEFAULT '', codigo VARCHAR(40) NOT NULL, email_academia VARCHAR(200) DEFAULT '', pct_alumno NUMERIC(5,2), pct_profe NUMERIC(5,2), activo BOOLEAN DEFAULT true, created_at TIMESTAMP DEFAULT NOW())`,
+    `CREATE UNIQUE INDEX IF NOT EXISTS uq_profes_codigo ON profes(tenant_id, UPPER(codigo))`,
+    `CREATE UNIQUE INDEX IF NOT EXISTS uq_profes_usuario ON profes(tenant_id, usuario_id) WHERE usuario_id IS NOT NULL`,
+    `CREATE TABLE IF NOT EXISTS profe_alumnos (id SERIAL PRIMARY KEY, tenant_id INT NOT NULL DEFAULT 1, profe_id INT NOT NULL REFERENCES profes(id) ON DELETE CASCADE, email VARCHAR(200) NOT NULL DEFAULT '', usuario_id INT, nombre VARCHAR(200) DEFAULT '', origen VARCHAR(20) DEFAULT 'codigo', curso VARCHAR(200) DEFAULT '', desde TIMESTAMP DEFAULT NOW(), vence TIMESTAMP NOT NULL, created_at TIMESTAMP DEFAULT NOW())`,
+    `CREATE UNIQUE INDEX IF NOT EXISTS uq_profe_alumno_email ON profe_alumnos(tenant_id, profe_id, LOWER(email)) WHERE email<>''`,
+    `CREATE UNIQUE INDEX IF NOT EXISTS uq_profe_alumno_usuario ON profe_alumnos(tenant_id, profe_id, usuario_id) WHERE email='' AND usuario_id IS NOT NULL`,
+    `CREATE INDEX IF NOT EXISTS idx_profe_alumnos_email ON profe_alumnos(tenant_id, LOWER(email))`,
+    `CREATE TABLE IF NOT EXISTS profe_movimientos (id SERIAL PRIMARY KEY, tenant_id INT NOT NULL DEFAULT 1, profe_id INT NOT NULL REFERENCES profes(id) ON DELETE CASCADE, pedido_id INT, tipo VARCHAR(20) NOT NULL, monto NUMERIC(12,2) NOT NULL, detalle TEXT DEFAULT '', created_at TIMESTAMP DEFAULT NOW())`,
+    `CREATE INDEX IF NOT EXISTS idx_profe_mov ON profe_movimientos(profe_id)`,
+    `ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS profe_id INT`,
+    `ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS profe_tipo VARCHAR(10)`,
+    `ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS profe_descuento NUMERIC(12,2) DEFAULT 0`,
+    `ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS profe_comision NUMERIC(12,2) DEFAULT 0`,
+    `ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS profe_acreditado BOOLEAN DEFAULT false`,
+    `ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS saldo_profe_id INT`,
+    `ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS saldo_usado NUMERIC(12,2) DEFAULT 0`,
+    `ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS saldo_devuelto BOOLEAN DEFAULT false`,
+    `ALTER TABLE categorias_meta ADD COLUMN IF NOT EXISTS profe_pct_alumno NUMERIC(5,2)`,
+    `ALTER TABLE categorias_meta ADD COLUMN IF NOT EXISTS profe_pct_profe NUMERIC(5,2)`,
     `ALTER TABLE pedido_items ADD COLUMN IF NOT EXISTS costo_unitario NUMERIC(12,2)`,
     `ALTER TABLE productos ADD COLUMN IF NOT EXISTS stock_minimo INT DEFAULT 0`,
     `ALTER TABLE productos ADD COLUMN IF NOT EXISTS visible BOOLEAN DEFAULT true`,
@@ -2148,6 +2168,185 @@ app.get('/api/categorias-minimos', async (req,res)=>{
     res.json(rows.map(r => ({ categoria:r.categoria, minimo:Number(r.minimo), unidad:r.unidad || 'unidades' })));
   }catch(e){ res.status(500).json({error:e.message}); }
 });
+// ==== PROGRAMA DE PROFES (panel, cuenta del cliente y academia) ====
+const pctONull = (v) => { if (v === null || v === undefined || String(v).trim() === '') return null; const n = parseFloat(String(v).replace(',', '.')); return Number.isFinite(n) ? Math.max(0, Math.min(100, Math.round(n * 100) / 100)) : null; };
+const codigoProfe = (v) => String(v || '').trim().toUpperCase().replace(/\s+/g, '-').replace(/[^A-Z0-9_-]/g, '').slice(0, 40);
+async function configProfes(tenantId){
+  const {rows}=await pool.query("SELECT clave, valor FROM configuracion WHERE tenant_id=$1 AND clave LIKE 'profes\\_%'", [tenantId]);
+  const c={}; rows.forEach(r=>{ c[r.clave]=r.valor; });
+  const pct=(v,d)=>{ const n=parseFloat(String(v??'').replace(',','.')); return Number.isFinite(n)&&n>=0?Math.min(n,100):d; };
+  return { pct_alumno: pct(c.profes_pct_alumno, 2.5), pct_profe: pct(c.profes_pct_profe, 2.5), meses: Math.max(1, Math.min(36, parseInt(c.profes_meses,10)||3)), secciones: String(c.profes_secciones||'').split(',').map(x=>x.trim()).filter(Boolean) };
+}
+async function nombresSecciones(tenantId, ids){
+  if(!ids.length) return [];
+  const {rows}=await pool.query('SELECT nombre FROM secciones WHERE tenant_id=$1 AND id = ANY($2::int[]) ORDER BY orden, id', [tenantId, ids.map(Number).filter(Boolean)]);
+  return rows.map(r=>r.nombre);
+}
+const PROFE_STATS = `
+  COALESCE((SELECT SUM(monto) FROM profe_movimientos m WHERE m.profe_id=p.id),0)::float AS saldo,
+  (SELECT COUNT(*)::int FROM profe_alumnos a WHERE a.profe_id=p.id AND a.vence>NOW()) AS alumnos_activos,
+  (SELECT COUNT(*)::int FROM profe_alumnos a WHERE a.profe_id=p.id) AS alumnos_total,
+  (SELECT COUNT(*)::int FROM pedidos pe WHERE pe.profe_id=p.id AND pe.profe_tipo='alumno' AND LOWER(COALESCE(pe.estado,'')) NOT IN ('cancelado','anulado','rechazado')) AS ventas,
+  (SELECT COALESCE(SUM(pe.total),0)::float FROM pedidos pe WHERE pe.profe_id=p.id AND pe.profe_tipo='alumno' AND LOWER(COALESCE(pe.estado,'')) NOT IN ('cancelado','anulado','rechazado')) AS vendido,
+  (SELECT COALESCE(SUM(pe.profe_comision),0)::float FROM pedidos pe WHERE pe.profe_id=p.id AND pe.profe_acreditado=false AND pe.profe_tipo='alumno' AND LOWER(COALESCE(pe.estado,'')) NOT IN ('cancelado','anulado','rechazado')) AS pendiente`;
+
+app.get('/api/profes', authPerm('usuarios'), async (req,res)=>{
+  try{
+    const {rows}=await pool.query(`SELECT p.*, u.nombre AS usuario_nombre, u.email AS usuario_email, u.usuario AS usuario_usuario, ${PROFE_STATS}
+      FROM profes p LEFT JOIN usuarios u ON u.id=p.usuario_id WHERE p.tenant_id=$1 ORDER BY p.activo DESC, LOWER(COALESCE(NULLIF(p.nombre,''), u.nombre, ''))`, [req.tenantId]);
+    res.json(rows);
+  }catch(e){ res.status(500).json({error:e.message}); }
+});
+app.get('/api/profes/config', authPerm('usuarios'), async (req,res)=>{
+  try{
+    const cfg=await configProfes(req.tenantId);
+    const {rows:cats}=await pool.query('SELECT categoria, profe_pct_alumno AS pct_alumno, profe_pct_profe AS pct_profe FROM categorias_meta WHERE tenant_id=$1 AND (profe_pct_alumno IS NOT NULL OR profe_pct_profe IS NOT NULL) ORDER BY categoria', [req.tenantId]);
+    res.json({ ...cfg, categorias: cats, integracion: !!process.env.INTEGRACION_SECRET });
+  }catch(e){ res.status(500).json({error:e.message}); }
+});
+app.put('/api/profes/config', authPerm('usuarios'), async (req,res)=>{
+  try{
+    const b=req.body||{};
+    const upd={
+      profes_pct_alumno: String(pctONull(b.pct_alumno) ?? 0),
+      profes_pct_profe: String(pctONull(b.pct_profe) ?? 0),
+      profes_meses: String(Math.max(1, Math.min(36, parseInt(b.meses,10)||3))),
+      profes_secciones: (Array.isArray(b.secciones)?b.secciones:[]).map(Number).filter(Boolean).join(','),
+    };
+    for(const [k,v] of Object.entries(upd)) await pool.query("INSERT INTO configuracion (tenant_id,clave,valor) VALUES ($1,$2,$3) ON CONFLICT (tenant_id,clave) DO UPDATE SET valor=$3", [req.tenantId,k,v]);
+    res.json({ok:true});
+  }catch(e){ res.status(500).json({error:e.message}); }
+});
+// % propio de una categoría (vacío = usa el del profe o el general; 0 = no aplica en esa categoría)
+app.post('/api/profes/categoria', authPerm('usuarios'), async (req,res)=>{
+  try{
+    const nombre=String(req.body?.nombre||'').trim().slice(0,200);
+    if(!nombre) return res.status(400).json({error:'Falta la categoría'});
+    const a=pctONull(req.body?.pct_alumno), p=pctONull(req.body?.pct_profe);
+    await pool.query(`INSERT INTO categorias_meta (tenant_id, categoria, orden, visible, profe_pct_alumno, profe_pct_profe) VALUES ($1,$2,999,true,$3,$4)
+      ON CONFLICT (tenant_id, categoria) DO UPDATE SET profe_pct_alumno=$3, profe_pct_profe=$4`, [req.tenantId, nombre, a, p]);
+    res.json({ok:true});
+  }catch(e){ res.status(500).json({error:e.message}); }
+});
+async function datosProfe(req, b, id){
+  const codigo=codigoProfe(b.codigo);
+  if(codigo.length<3) throw Object.assign(new Error('El código tiene que tener al menos 3 letras o números'), {status:400});
+  const uid=parseInt(b.usuario_id,10)||null;
+  if(!uid) throw Object.assign(new Error('Elegí la cuenta de cliente del profe (con esa cuenta usa su saldo)'), {status:400});
+  const {rows:u}=await pool.query('SELECT id, nombre, email FROM usuarios WHERE id=$1 AND tenant_id=$2', [uid, req.tenantId]);
+  if(!u[0]) throw Object.assign(new Error('Esa cuenta no existe'), {status:400});
+  const {rows:cup}=await pool.query('SELECT 1 FROM cupones WHERE UPPER(codigo)=$1 AND tenant_id=$2 LIMIT 1', [codigo, req.tenantId]);
+  if(cup[0]) throw Object.assign(new Error('Ya hay un cupón con ese código. Elegí otro.'), {status:400});
+  return { usuario_id:uid, nombre:String(b.nombre||u[0].nombre||'').trim().slice(0,200), codigo,
+    email_academia:String(b.email_academia||u[0].email||'').trim().toLowerCase().slice(0,200),
+    pct_alumno:pctONull(b.pct_alumno), pct_profe:pctONull(b.pct_profe), activo:b.activo!==false };
+}
+const errProfe=(res,e)=>{ if(e.code==='23505') return res.status(400).json({error: /usuario/.test(e.constraint||'') ? 'Esa cuenta ya es profe' : 'Ese código ya lo tiene otro profe'}); res.status(e.status||500).json({error:e.message}); };
+app.post('/api/profes', authPerm('usuarios'), async (req,res)=>{
+  try{
+    const d=await datosProfe(req, req.body||{});
+    const {rows}=await pool.query('INSERT INTO profes (tenant_id,usuario_id,nombre,codigo,email_academia,pct_alumno,pct_profe,activo) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *', [req.tenantId, d.usuario_id, d.nombre, d.codigo, d.email_academia, d.pct_alumno, d.pct_profe, d.activo]);
+    res.json(rows[0]);
+  }catch(e){ errProfe(res,e); }
+});
+app.put('/api/profes/:id', authPerm('usuarios'), async (req,res)=>{
+  try{
+    const d=await datosProfe(req, req.body||{}, req.params.id);
+    const {rows}=await pool.query('UPDATE profes SET usuario_id=$3, nombre=$4, codigo=$5, email_academia=$6, pct_alumno=$7, pct_profe=$8, activo=$9 WHERE id=$1 AND tenant_id=$2 RETURNING *', [req.params.id, req.tenantId, d.usuario_id, d.nombre, d.codigo, d.email_academia, d.pct_alumno, d.pct_profe, d.activo]);
+    if(!rows[0]) return res.status(404).json({error:'No encontrado'});
+    res.json(rows[0]);
+  }catch(e){ errProfe(res,e); }
+});
+app.get('/api/profes/:id/detalle', authPerm('usuarios'), async (req,res)=>{
+  try{
+    const {rows:pf}=await pool.query('SELECT id FROM profes WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]);
+    if(!pf[0]) return res.status(404).json({error:'No encontrado'});
+    const [al, mov, ped]=await Promise.all([
+      pool.query('SELECT a.*, (a.vence>NOW()) AS activo FROM profe_alumnos a WHERE a.profe_id=$1 ORDER BY (a.vence>NOW()) DESC, a.vence DESC LIMIT 500', [req.params.id]),
+      pool.query('SELECT * FROM profe_movimientos WHERE profe_id=$1 ORDER BY created_at DESC, id DESC LIMIT 200', [req.params.id]),
+      pool.query(`SELECT pe.id, pe.created_at, pe.total, pe.estado, pe.estado_pago, pe.profe_tipo, pe.profe_descuento, pe.profe_comision, pe.profe_acreditado, u.nombre AS cliente
+        FROM pedidos pe LEFT JOIN usuarios u ON u.id=pe.usuario_id WHERE pe.profe_id=$1 AND pe.tenant_id=$2 ORDER BY pe.created_at DESC LIMIT 200`, [req.params.id, req.tenantId]),
+    ]);
+    res.json({ alumnos: al.rows, movimientos: mov.rows, pedidos: ped.rows });
+  }catch(e){ res.status(500).json({error:e.message}); }
+});
+app.post('/api/profes/:id/alumnos', authPerm('usuarios'), async (req,res)=>{
+  try{
+    const {rows:pf}=await pool.query('SELECT id FROM profes WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]);
+    if(!pf[0]) return res.status(404).json({error:'No encontrado'});
+    const email=String(req.body?.email||'').trim().toLowerCase();
+    if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return res.status(400).json({error:'Poné un email válido'});
+    const cfg=await configProfes(req.tenantId);
+    const {rows:u}=await pool.query('SELECT id, nombre FROM usuarios WHERE tenant_id=$1 AND LOWER(email)=$2 LIMIT 1', [req.tenantId, email]);
+    const r=await vincularAlumno(pool, req.tenantId, pf[0].id, { email, usuario_id:u[0]?.id, nombre:req.body?.nombre||u[0]?.nombre||'', origen:'manual', meses:req.body?.meses||cfg.meses, renovar:true });
+    res.json(r||{ok:true});
+  }catch(e){ res.status(500).json({error:e.message}); }
+});
+app.delete('/api/profes/:id/alumnos/:aid', authPerm('usuarios'), async (req,res)=>{
+  try{ await pool.query('DELETE FROM profe_alumnos a USING profes p WHERE a.id=$1 AND a.profe_id=p.id AND p.id=$2 AND p.tenant_id=$3', [req.params.aid, req.params.id, req.tenantId]); res.json({ok:true}); }
+  catch(e){ res.status(500).json({error:e.message}); }
+});
+app.post('/api/profes/:id/ajuste', authPerm('usuarios'), async (req,res)=>{
+  try{
+    const monto=Math.round((Number(req.body?.monto)||0)*100)/100;
+    if(!monto) return res.status(400).json({error:'Poné un monto (positivo suma, negativo resta)'});
+    const {rows:pf}=await pool.query('SELECT id FROM profes WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]);
+    if(!pf[0]) return res.status(404).json({error:'No encontrado'});
+    await pool.query("INSERT INTO profe_movimientos (tenant_id,profe_id,tipo,monto,detalle) VALUES ($1,$2,'ajuste',$3,$4)", [req.tenantId, pf[0].id, monto, String(req.body?.detalle||'Ajuste manual').slice(0,300)]);
+    res.json({ok:true});
+  }catch(e){ res.status(500).json({error:e.message}); }
+});
+// Cuenta del cliente: su programa de profe (si es profe) y su beneficio de alumno (si está vinculado)
+app.get('/api/profes/mi', auth(), async (req,res)=>{
+  try{
+    const cfg=await configProfes(req.tenantId);
+    const tiendas=await nombresSecciones(req.tenantId, cfg.secciones);
+    const {rows:u}=await pool.query('SELECT email FROM usuarios WHERE id=$1 AND tenant_id=$2', [req.user.id, req.tenantId]);
+    const email=String(u[0]?.email||'').trim().toLowerCase();
+    const {rows:be}=await pool.query(`SELECT a.vence, a.curso, p.codigo, p.pct_alumno, COALESCE(NULLIF(p.nombre,''), pu.nombre, 'tu profe') AS profe
+      FROM profe_alumnos a JOIN profes p ON p.id=a.profe_id LEFT JOIN usuarios pu ON pu.id=p.usuario_id
+      WHERE a.tenant_id=$1 AND p.activo=true AND a.vence>NOW() AND (a.usuario_id=$2 OR ($3<>'' AND LOWER(a.email)=$3)) ORDER BY a.vence DESC LIMIT 1`, [req.tenantId, req.user.id, email]);
+    const beneficio = be[0] ? { codigo:be[0].codigo, profe:be[0].profe, vence:be[0].vence, curso:be[0].curso, pct: be[0].pct_alumno!=null ? Number(be[0].pct_alumno) : cfg.pct_alumno, tiendas } : null;
+    const {rows:pf}=await pool.query(`SELECT p.*, ${PROFE_STATS} FROM profes p WHERE p.tenant_id=$1 AND p.usuario_id=$2 AND p.activo=true`, [req.tenantId, req.user.id]);
+    let profe=null;
+    if(pf[0]){
+      const p=pf[0];
+      const [al, ped, mov]=await Promise.all([
+        pool.query('SELECT nombre, email, origen, curso, vence FROM profe_alumnos WHERE profe_id=$1 AND vence>NOW() ORDER BY vence DESC LIMIT 200', [p.id]),
+        pool.query(`SELECT pe.id, pe.created_at, pe.total, pe.estado, pe.profe_comision, pe.profe_acreditado, u.nombre AS alumno FROM pedidos pe LEFT JOIN usuarios u ON u.id=pe.usuario_id
+          WHERE pe.profe_id=$1 AND pe.profe_tipo='alumno' AND LOWER(COALESCE(pe.estado,'')) NOT IN ('cancelado','anulado','rechazado') ORDER BY pe.created_at DESC LIMIT 50`, [p.id]),
+        pool.query('SELECT tipo, monto, detalle, created_at FROM profe_movimientos WHERE profe_id=$1 ORDER BY created_at DESC, id DESC LIMIT 50', [p.id]),
+      ]);
+      profe={ codigo:p.codigo, nombre:p.nombre, pct_alumno: p.pct_alumno!=null?Number(p.pct_alumno):cfg.pct_alumno, pct_profe: p.pct_profe!=null?Number(p.pct_profe):cfg.pct_profe,
+        saldo:Math.round(p.saldo*100)/100, pendiente:p.pendiente, alumnos_activos:p.alumnos_activos, ventas:p.ventas, meses:cfg.meses, tiendas,
+        alumnos:al.rows.map(a=>({ nombre:a.nombre || String(a.email||'').replace(/^(.{2}).*(@.*)$/, '$1…$2'), origen:a.origen, curso:a.curso, vence:a.vence })),
+        compras:ped.rows, movimientos:mov.rows };
+    }
+    res.json({ profe, beneficio });
+  }catch(e){ res.status(500).json({error:e.message}); }
+});
+// La academia avisa que un alumno confirmó un curso con un profe: queda vinculado (o se renueva) por N meses.
+// Se autentica con INTEGRACION_SECRET (la misma variable en la tienda y en la academia).
+app.post('/api/profes/academia/vincular', async (req,res)=>{
+  try{
+    const secret=process.env.INTEGRACION_SECRET||'';
+    if(!secret) return res.status(503).json({error:'Falta configurar INTEGRACION_SECRET en la tienda'});
+    const got=String(req.get('X-Integracion')||'');
+    const a=Buffer.from(got), b=Buffer.from(secret);
+    if(a.length!==b.length || !crypto.timingSafeEqual(a,b)) return res.status(401).json({error:'No autorizado'});
+    const email=String(req.body?.email||'').trim().toLowerCase();
+    const prof=String(req.body?.instructor_email||'').trim().toLowerCase();
+    if(!email || !prof) return res.status(400).json({error:'Faltan datos'});
+    const {rows:pf}=await pool.query(`SELECT p.*, u.nombre AS usuario_nombre FROM profes p LEFT JOIN usuarios u ON u.id=p.usuario_id
+      WHERE p.tenant_id=$1 AND p.activo=true AND (LOWER(p.email_academia)=$2 OR (COALESCE(p.email_academia,'')='' AND LOWER(u.email)=$2)) LIMIT 1`, [req.tenantId, prof]);
+    if(!pf[0]) return res.json({ok:true, vinculado:false});
+    const cfg=await configProfes(req.tenantId);
+    const {rows:u}=await pool.query('SELECT id FROM usuarios WHERE tenant_id=$1 AND LOWER(email)=$2 LIMIT 1', [req.tenantId, email]);
+    const link=await vincularAlumno(pool, req.tenantId, pf[0].id, { email, usuario_id:u[0]?.id, nombre:req.body?.nombre||'', origen:'academia', curso:req.body?.curso||'', meses:cfg.meses, desde:req.body?.desde||null, renovar:true });
+    if(!link) return res.json({ok:true, vinculado:false, motivo:'vencido'});
+    res.json({ ok:true, vinculado:true, codigo:pf[0].codigo, profe:pf[0].nombre||pf[0].usuario_nombre||'', pct_alumno: pf[0].pct_alumno!=null?Number(pf[0].pct_alumno):cfg.pct_alumno, vence:link?.vence||null, tiendas: await nombresSecciones(req.tenantId, cfg.secciones) });
+  }catch(e){ res.status(500).json({error:e.message}); }
+});
 app.post('/api/categorias/meta', authPerm('productos'), async (req,res)=>{
   try{
     const {categorias}=req.body; // [{nombre, orden, visible}]
@@ -3452,7 +3651,7 @@ app.post('/api/pedidos/multi', auth(), async (req,res)=>{
     const cuponCodigo = b.cupon !== undefined ? b.cupon : ((peds.find(p=>p.cupon_codigo)||{}).cupon_codigo || '');
     // El cálculo (puede consultar Andreani y el dólar) usa el pool: no retiene una conexión mientras espera
     const cot=await checkout.cotizarCarrito(pool, req.tenantId, req.user.id, {
-      entrega, cupon: cuponCodigo, metodo_pago: peds[0].metodo_pago,
+      entrega, cupon: cuponCodigo, metodo_pago: peds[0].metodo_pago, usar_saldo: !!b.usar_saldo,
       secciones: peds.map(p=>({ seccion_id:p.seccion_id, items:p.items, envio_id:p.envio_id, metodo_envio:p.metodo_envio, metodo_pago:p.metodo_pago })),
     });
     if(!cot.secciones.length) throw new CheckoutError('El carrito está vacío');
@@ -3477,7 +3676,7 @@ app.post('/api/pedidos/multi', auth(), async (req,res)=>{
         notaPago: s.descuento_pago>0 ? `[Descuento ${s.descuento_pago_pct}% por pagar con ${s.metodo_pago}: -$${Number(s.descuento_pago).toLocaleString('es-AR')}]` : '',
         notaSoloEnvio: !itemsArs.length && itemsUsdt.length ? '[Este pedido es solo el envío en pesos; los productos van en el pedido en USDT vinculado]' : '' });
       if(itemsUsdt.length) partes.push({ moneda:'USDT', items:itemsUsdt, metodo: conArs ? 'USDT' : TXT(s.metodo_pago||ped.metodo_pago,100), cupon:'', subtotal:s.subtotal_usdt, descuento:0, total:s.subtotal_usdt, envio:0, notaPago:'', notaSoloEnvio:'' });
-      const deEstaCompra=[];
+      const deEstaCompra=[]; let pedidoArs=null;
       for(const pt of partes){
         let notas=TXT(ped.notas,4000);
         if(pt.items.some(i=>i._preventa)) notas=`${notas} [RESERVA/PREVENTA — requiere seña]`.trim();
@@ -3487,7 +3686,9 @@ app.post('/api/pedidos/multi', auth(), async (req,res)=>{
           [req.user.id, s.seccion_id, 'pedido', pt.metodo, notas, pt.cupon, pt.subtotal, pt.descuento, pt.total, TXT(ped.datos_envio,8000), pt.envio, metodoEnvio, TXT(entrega.cp,20), staff ? !!b.is_test : false, TXT(ped.datos_facturacion,4000), 'impago', req.tenantId, pt.items.some(i=>i._preventa), pt.moneda]);
         await insertarItems(client, req.tenantId, rows[0].id, pt.items, true);
         deEstaCompra.push(rows[0].id);
+        if(pt.moneda==='ARS') pedidoArs=rows[0].id;
       }
+      if(pedidoArs) await guardarProfeEnPedido(client, req.tenantId, pedidoArs, s, cot.profe);
       if(deEstaCompra.length===2){
         await client.query('UPDATE pedidos SET pedido_vinculado=$2 WHERE id=$1', [deEstaCompra[0], deEstaCompra[1]]);
         await client.query('UPDATE pedidos SET pedido_vinculado=$2 WHERE id=$1', [deEstaCompra[1], deEstaCompra[0]]);
@@ -3497,7 +3698,9 @@ app.post('/api/pedidos/multi', auth(), async (req,res)=>{
         creados.push(fin[0]);
       }
     }
-    if(cot.cupon && cot.cupon.ok){
+    // Alumno nuevo con código de profe: queda vinculado por N meses
+    if(cot.profe && cot.profe.nuevo && cot.secciones.some(x=>x._profe)) await vincularAlumno(client, req.tenantId, cot.profe.id, { email: cot.ctx.user && cot.ctx.user.email, usuario_id: req.user.id, nombre: cot.ctx.user && cot.ctx.user.nombre, origen:'codigo', meses: cot.profe.meses, soloSiNoHay:true });
+    if(cot.cupon && cot.cupon.ok && cot.cupon.tipo!=='profe'){
       // Atómico: si otra compra usó el último cupo mientras tanto, esta no lo puede usar (la fila queda bloqueada hasta el COMMIT)
       const u=await client.query("UPDATE cupones SET usos_actuales = COALESCE(usos_actuales,0) + 1 WHERE UPPER(codigo)=UPPER($1) AND tenant_id=$2 AND activo=true AND (COALESCE(uso_maximo,0)=0 OR COALESCE(usos_actuales,0) < uso_maximo)", [cot.cupon.codigo, req.tenantId]);
       if(!u.rowCount) throw new CheckoutError('Ese cupón ya se usó o se agotó. Quitalo del carrito para seguir con la compra.');
@@ -3518,6 +3721,76 @@ async function marcarCarritoComprado(tenantId, usuarioId, pedidos){
   await pool.query(`UPDATE carritos_abandonados SET recuperado=true, recuperado_at=NOW(), pedido_id=$3, monto_recuperado=$4,
       recuperado_por=CASE WHEN contactado_at IS NOT NULL THEN 'contacto' ELSE 'solo' END
     WHERE tenant_id=$1 AND usuario_id=$2 AND recuperado=false`, [tenantId, usuarioId, pedidos[0].id, total]);
+}
+
+// ==== PROGRAMA DE PROFES ====
+// Guarda en el pedido el beneficio de alumno y el saldo usado (dentro de la transacción de la compra)
+async function guardarProfeEnPedido(client, tenantId, pedidoId, s, prof){
+  const notas=[];
+  if(s._profe){
+    await client.query('UPDATE pedidos SET profe_id=$2, profe_tipo=$3, profe_descuento=$4, profe_comision=$5 WHERE id=$1', [pedidoId, s._profe.id, s._profe.tipo, s._profe.descuento, s._profe.tipo==='propio'?0:s._profe.comision]);
+    notas.push(s._profe.tipo==='propio' ? `[Código propio de profe (${prof?.codigo||''}): -$${Number(s._profe.descuento).toLocaleString('es-AR')}]` : `[Beneficio alumno de ${prof?.nombre||'profe'} (${prof?.codigo||''}): -$${Number(s._profe.descuento).toLocaleString('es-AR')}]`);
+  }
+  if(s._saldo){
+    // El saldo se bloquea y se vuelve a contar: si cambió desde que se armó el carrito, no se usa de más
+    const {rows:pf}=await client.query('SELECT id FROM profes WHERE id=$1 AND tenant_id=$2 FOR UPDATE', [s._saldo.id, tenantId]);
+    if(!pf[0]) throw new CheckoutError('No se encontró tu cuenta de profe');
+    const {rows:sd}=await client.query('SELECT COALESCE(SUM(monto),0)::float AS saldo FROM profe_movimientos WHERE profe_id=$1', [s._saldo.id]);
+    if(Number(sd[0].saldo) + 0.01 < Number(s._saldo.monto)) throw new CheckoutError('Tu saldo a favor cambió. Volvé a revisar el carrito.');
+    await client.query("INSERT INTO profe_movimientos (tenant_id,profe_id,pedido_id,tipo,monto,detalle) VALUES ($1,$2,$3,'uso',$4,$5)", [tenantId, s._saldo.id, pedidoId, -Number(s._saldo.monto), `Usado en el pedido #${String(pedidoId).padStart(4,'0')}`]);
+    await client.query('UPDATE pedidos SET saldo_profe_id=$2, saldo_usado=$3, descuento=COALESCE(descuento,0)+$3 WHERE id=$1', [pedidoId, s._saldo.id, s._saldo.monto]);
+    notas.push(`[Saldo a favor de profe usado: -$${Number(s._saldo.monto).toLocaleString('es-AR')}]`);
+  }
+  if(notas.length) await client.query("UPDATE pedidos SET notas=TRIM(COALESCE(notas,'') || ' ' || $2) WHERE id=$1", [pedidoId, notas.join(' ')]);
+}
+// Vincula (o renueva) un alumno con un profe. soloSiNoHay: no pisa un vínculo existente (lo usa el código).
+// renovar: lo usa la academia (otro curso con el profe) → corre el vencimiento y corta el vínculo activo con otro profe.
+async function vincularAlumno(db, tenantId, profeId, { email, usuario_id, nombre, origen, curso, meses, desde, soloSiNoHay=false, renovar=false }){
+  const mail=String(email||'').trim().toLowerCase().slice(0,200);
+  const uid=usuario_id||null;
+  if(!mail && !uid) return null;
+  const m=Math.max(1, Math.min(36, parseInt(meses,10)||3));
+  // Desde: el inicio del curso (si es más adelante, el beneficio arranca ya y dura N meses desde el curso)
+  const d=desde ? new Date(desde) : null;
+  const base=(d && !isNaN(d)) ? d.getTime() : Date.now();
+  const vence=new Date(base+m*30.44*86400000);
+  if(vence.getTime()<=Date.now()) return null; // curso viejo: ya no corresponde
+  if(renovar && mail) await db.query("UPDATE profe_alumnos SET vence=NOW() WHERE tenant_id=$1 AND profe_id<>$2 AND LOWER(email)=$3 AND vence>NOW()", [tenantId, profeId, mail]);
+  const {rows:ya}=await db.query(`SELECT id, vence FROM profe_alumnos WHERE tenant_id=$1 AND profe_id=$2 AND ${mail ? 'LOWER(email)=$3' : "email='' AND usuario_id=$3"}`, [tenantId, profeId, mail || uid]);
+  if(ya[0]){
+    if(soloSiNoHay) return ya[0];
+    const {rows}=await db.query('UPDATE profe_alumnos SET vence=GREATEST(vence,$2), usuario_id=COALESCE(usuario_id,$3), nombre=CASE WHEN COALESCE(nombre,\'\')=\'\' THEN $4 ELSE nombre END, curso=CASE WHEN $5<>\'\' THEN $5 ELSE curso END, origen=CASE WHEN $6<>\'\' THEN $6 ELSE origen END WHERE id=$1 RETURNING *', [ya[0].id, vence, uid, String(nombre||'').slice(0,200), String(curso||'').slice(0,200), origen||'']);
+    return rows[0];
+  }
+  const {rows}=await db.query('INSERT INTO profe_alumnos (tenant_id,profe_id,email,usuario_id,nombre,origen,curso,vence) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT DO NOTHING RETURNING *', [tenantId, profeId, mail, uid, String(nombre||'').slice(0,200), origen||'codigo', String(curso||'').slice(0,200), vence]);
+  return rows[0]||null;
+}
+// Acredita la comisión del profe cuando el pedido queda PAGADO (y la saca si se cancela o deja de estar pagado).
+// Devuelve el saldo usado si el pedido se cancela. Idempotente: se puede llamar las veces que sea.
+async function sincronizarProfe(pedidoId){
+  const {rows}=await pool.query('SELECT id, tenant_id, estado, estado_pago, profe_id, profe_comision, profe_acreditado, saldo_profe_id, saldo_usado, saldo_devuelto FROM pedidos WHERE id=$1', [pedidoId]);
+  const p=rows[0]; if(!p) return;
+  const num4=String(p.id).padStart(4,'0');
+  const cancelado=['cancelado','anulado','rechazado'].includes(String(p.estado||'').toLowerCase());
+  if(p.profe_id && Number(p.profe_comision)>0){
+    const corresponde = p.estado_pago==='pagado' && !cancelado;
+    if(corresponde && !p.profe_acreditado){
+      const u=await pool.query('UPDATE pedidos SET profe_acreditado=true WHERE id=$1 AND profe_acreditado=false', [p.id]);
+      if(u.rowCount) await pool.query("INSERT INTO profe_movimientos (tenant_id,profe_id,pedido_id,tipo,monto,detalle) VALUES ($1,$2,$3,'comision',$4,$5)", [p.tenant_id, p.profe_id, p.id, Number(p.profe_comision), `Compra de alumno · pedido #${num4}`]);
+    } else if(!corresponde && p.profe_acreditado){
+      const u=await pool.query('UPDATE pedidos SET profe_acreditado=false WHERE id=$1 AND profe_acreditado=true', [p.id]);
+      if(u.rowCount) await pool.query("INSERT INTO profe_movimientos (tenant_id,profe_id,pedido_id,tipo,monto,detalle) VALUES ($1,$2,$3,'reverso',$4,$5)", [p.tenant_id, p.profe_id, p.id, -Number(p.profe_comision), cancelado ? `Pedido #${num4} cancelado` : `Pedido #${num4} ya no figura pagado`]);
+    }
+  }
+  if(p.saldo_profe_id && Number(p.saldo_usado)>0){
+    if(cancelado && !p.saldo_devuelto){
+      const u=await pool.query('UPDATE pedidos SET saldo_devuelto=true WHERE id=$1 AND saldo_devuelto=false', [p.id]);
+      if(u.rowCount) await pool.query("INSERT INTO profe_movimientos (tenant_id,profe_id,pedido_id,tipo,monto,detalle) VALUES ($1,$2,$3,'devolucion',$4,$5)", [p.tenant_id, p.saldo_profe_id, p.id, Number(p.saldo_usado), `Pedido #${num4} cancelado: vuelve el saldo`]);
+    } else if(!cancelado && p.saldo_devuelto){
+      const u=await pool.query('UPDATE pedidos SET saldo_devuelto=false WHERE id=$1 AND saldo_devuelto=true', [p.id]);
+      if(u.rowCount) await pool.query("INSERT INTO profe_movimientos (tenant_id,profe_id,pedido_id,tipo,monto,detalle) VALUES ($1,$2,$3,'uso',$4,$5)", [p.tenant_id, p.saldo_profe_id, p.id, -Number(p.saldo_usado), `Pedido #${num4} reactivado`]);
+    }
+  }
 }
 
 // ==== PAGOS MIXTOS DE UN PEDIDO ====
@@ -3562,6 +3835,7 @@ app.post('/api/pedidos/:id/pagos', authPerm('pedidos'), async (req,res)=>{
     await pool.query('INSERT INTO pedido_pagos (tenant_id,pedido_id,metodo,monto,recibido,cuenta_como,ajuste_pct,ajuste_monto,nota) SELECT $9,$1,$2,$3,$4,$5,$6,$7,$8 WHERE EXISTS(SELECT 1 FROM pedidos WHERE id=$1 AND tenant_id=$9)',
       [req.params.id, metodo||'', rec, rec, cta, Number(ajuste_pct)||0, ajusteMonto, nota||'', req.tenantId]);
     const r=await recalcularEstadoPago(req.params.id);
+    await sincronizarProfe(req.params.id).catch(e=>console.log('[profes]', e.message));
     res.json({ok:true, ...r});
   }catch(e){ res.status(500).json({error:e.message}); }
 });
@@ -3571,6 +3845,7 @@ app.delete('/api/pedidos/:id/pagos/:pagoId', authPerm('pedidos'), async (req,res
     if(!own[0]) return res.status(404).json({error:'No encontrado'});
     await pool.query('DELETE FROM pedido_pagos WHERE id=$1 AND pedido_id=$2 AND tenant_id=$3',[req.params.pagoId, req.params.id, req.tenantId]);
     const r=await recalcularEstadoPago(req.params.id);
+    await sincronizarProfe(req.params.id).catch(e=>console.log('[profes]', e.message));
     res.json({ok:true, ...r});
   }catch(e){ res.status(500).json({error:e.message}); }
 });
@@ -3698,6 +3973,7 @@ app.put('/api/pedidos/:id', authPerm('pedidos'), async (req,res)=>{
   // Después de confirmar: historial y cupos de preventa (leen lo ya guardado)
   if(historial) pool.query('INSERT INTO pedido_historial (tenant_id,pedido_id,tipo,detalle,usuario_id,usuario_nombre) VALUES ($1,$2,$3,$4,$5,$6)', [req.tenantId, req.params.id, 'estado_pago', historial.detalle, req.user?.id || null, historial.quien]).catch(()=>{});
   for(const pid of preventaTocados) await recalcReservado(pid, req.tenantId);
+  await sincronizarProfe(req.params.id).catch(e=>console.log('[profes]', e.message));
   res.json({ok:true});
 });
 app.post('/api/pedidos/:id/archivar', authPerm('pedidos'), async (req,res)=>{ try{ await pool.query('UPDATE pedidos SET archivado=true WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
@@ -3730,6 +4006,11 @@ app.delete('/api/pedidos/:id', authPerm('pedidos'), async (req,res)=>{
     await client.query('DELETE FROM pedido_pagos WHERE pedido_id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]);
     await client.query("DELETE FROM cuenta_corriente WHERE pedido_id=$1 AND tipo='cargo' AND tenant_id=$2", [req.params.id, req.tenantId]);
     await client.query('DELETE FROM pedido_historial WHERE pedido_id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]);
+    // Programa de profes: sale la comisión acreditada y vuelve el saldo usado
+    const {rows:pp0}=await client.query('SELECT profe_id, profe_comision, profe_acreditado, saldo_profe_id, saldo_usado, saldo_devuelto FROM pedidos WHERE id=$1', [req.params.id]);
+    const pq=pp0[0]||{}; const n4=String(req.params.id).padStart(4,'0');
+    if(pq.profe_id && pq.profe_acreditado && Number(pq.profe_comision)>0) await client.query("INSERT INTO profe_movimientos (tenant_id,profe_id,pedido_id,tipo,monto,detalle) VALUES ($1,$2,$3,'reverso',$4,$5)", [req.tenantId, pq.profe_id, req.params.id, -Number(pq.profe_comision), `Pedido #${n4} borrado`]);
+    if(pq.saldo_profe_id && Number(pq.saldo_usado)>0 && !pq.saldo_devuelto) await client.query("INSERT INTO profe_movimientos (tenant_id,profe_id,pedido_id,tipo,monto,detalle) VALUES ($1,$2,$3,'devolucion',$4,$5)", [req.tenantId, pq.saldo_profe_id, req.params.id, Number(pq.saldo_usado), `Pedido #${n4} borrado: vuelve el saldo`]);
     await client.query('DELETE FROM pedido_items WHERE pedido_id=$1', [req.params.id]);
     await client.query('UPDATE pedidos SET pedido_vinculado=NULL WHERE pedido_vinculado=$1 AND tenant_id=$2', [req.params.id, req.tenantId]);
     await client.query('DELETE FROM pedidos WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]);

@@ -169,10 +169,10 @@ function createCheckout(pool) {
   // Todo lo que depende del cliente y de la tienda (una sola vez por cotización)
   async function contexto(db, tenantId, userId) {
     const [u, promos, secs, cfg] = await Promise.all([
-      userId ? db.query('SELECT id, rol, permisos, lista_precio_id, es_revendedor, descuento_revendedor, mayorista, activo FROM usuarios WHERE id=$1 AND tenant_id=$2', [userId, tenantId]) : { rows: [] },
+      userId ? db.query('SELECT id, rol, permisos, lista_precio_id, es_revendedor, descuento_revendedor, mayorista, activo, email, nombre FROM usuarios WHERE id=$1 AND tenant_id=$2', [userId, tenantId]) : { rows: [] },
       db.query('SELECT * FROM promociones WHERE tenant_id=$1 AND activo=true AND (fecha_desde IS NULL OR fecha_desde<=CURRENT_DATE) AND (fecha_hasta IS NULL OR fecha_hasta>=CURRENT_DATE)', [tenantId]),
       db.query('SELECT id, nombre, slug, cp_origen, ignorar_stock, permitir_sin_stock, requiere_aprobacion FROM secciones WHERE tenant_id=$1', [tenantId]),
-      db.query("SELECT clave, valor FROM configuracion WHERE tenant_id=$1 AND (clave LIKE 'envio_gratis_desde_%' OR clave LIKE 'compra_minima_%' OR clave LIKE 'min_aplica_retiro_%' OR clave LIKE 'descuento\\_%')", [tenantId]),
+      db.query("SELECT clave, valor FROM configuracion WHERE tenant_id=$1 AND (clave LIKE 'envio_gratis_desde_%' OR clave LIKE 'compra_minima_%' OR clave LIKE 'min_aplica_retiro_%' OR clave LIKE 'descuento\\_%' OR clave LIKE 'profes\\_%')", [tenantId]),
     ]);
     const { rows: metodos } = await db.query('SELECT nombre, seccion_id FROM metodos_pago WHERE tenant_id=$1 AND activo=true', [tenantId]).catch(() => ({ rows: [] }));
     // Compra mínima por categoría (en unidades, sumando cualquier producto de la categoría)
@@ -326,7 +326,66 @@ function createCheckout(pool) {
     return { codigo: c.codigo, cupon_id: c.id, tipo: c.tipo, valor: num(c.valor), descuento: Math.min(round2(descuento), subtotal), envio_gratis: envioGratis, vence_at: c.vence_at || null, todas: c.origen === 'carrito' };
   }
 
-  // Cotiza el carrito completo. body = { secciones:[{seccion_id, items, envio_id}], entrega:{tipo, cp}, cupon, metodo_pago }
+  // ── Programa de profes ──
+  // Cada profe tiene un código: sus alumnos (vinculados por la academia o al usar el código por primera vez)
+  // tienen un % de descuento por N meses y el profe suma un % de lo que pagan como saldo a favor.
+  // El profe puede usar su propio código (descuento sí, saldo no). No se suma a cupones ni al descuento por medio de pago.
+  // El % sale de la categoría si tiene uno propio; si no, del profe; si no, el general.
+  async function evaluarProfe(db, ctx, codigo) {
+    const cod = String(codigo || '').trim();
+    if (!cod) return null;
+    const { rows } = await db.query('SELECT p.*, u.nombre AS usuario_nombre FROM profes p LEFT JOIN usuarios u ON u.id=p.usuario_id WHERE p.tenant_id=$1 AND UPPER(p.codigo)=UPPER($2)', [ctx.tenantId, cod]).catch(() => ({ rows: [] }));
+    const pf = rows[0];
+    if (!pf) return null; // no es un código de profe: se evalúa como cupón común
+    const nombre = pf.nombre || pf.usuario_nombre || 'tu profe';
+    const out = { id: pf.id, codigo: pf.codigo, nombre, ok: false, error: null, tipo: null, vence: null, nuevo: false };
+    if (!pf.activo) { out.error = 'Este código de profe no está activo'; return out; }
+    if (!ctx.user) { out.error = 'Iniciá sesión con tu cuenta para usar el beneficio de alumno'; return out; }
+    if (ctx.lista || ctx.user.es_revendedor) { out.error = 'Tu cuenta ya tiene precio especial: el beneficio de alumno no se suma'; return out; }
+    const cfg = ctx.config;
+    const pctNum = (v, def) => { const n = parseFloat(String(v ?? '').replace(',', '.')); return Number.isFinite(n) && n >= 0 ? Math.min(n, 100) : def; };
+    const gA = pctNum(cfg.profes_pct_alumno, 2.5), gP = pctNum(cfg.profes_pct_profe, 2.5);
+    const baseA = pf.pct_alumno != null ? pctNum(pf.pct_alumno, gA) : gA;
+    const baseP = pf.pct_profe != null ? pctNum(pf.pct_profe, gP) : gP;
+    const { rows: cats } = await db.query('SELECT categoria, profe_pct_alumno, profe_pct_profe FROM categorias_meta WHERE tenant_id=$1 AND (profe_pct_alumno IS NOT NULL OR profe_pct_profe IS NOT NULL)', [ctx.tenantId]).catch(() => ({ rows: [] }));
+    const porCat = {}; cats.forEach(c => { porCat[String(c.categoria || '').trim().toLowerCase()] = c; });
+    out.pct = (categoria) => {
+      const c = porCat[String(categoria || '').trim().toLowerCase()];
+      return { a: c && c.profe_pct_alumno != null ? pctNum(c.profe_pct_alumno, baseA) : baseA, p: c && c.profe_pct_profe != null ? pctNum(c.profe_pct_profe, baseP) : baseP };
+    };
+    out.pctAlumno = baseA;
+    out.secciones = String(cfg.profes_secciones || '').split(',').map(x => x.trim()).filter(Boolean);
+    const meses = Math.max(1, Math.min(36, parseInt(cfg.profes_meses, 10) || 3));
+    if (Number(pf.usuario_id) === Number(ctx.user.id)) { out.ok = true; out.tipo = 'propio'; return out; }
+    const email = String(ctx.user.email || '').trim().toLowerCase();
+    const { rows: links } = await db.query(
+      `SELECT pa.profe_id, pa.vence, COALESCE(NULLIF(p.nombre,''), u.nombre, 'otro profe') AS profe_nombre, p.codigo
+         FROM profe_alumnos pa JOIN profes p ON p.id=pa.profe_id LEFT JOIN usuarios u ON u.id=p.usuario_id
+        WHERE pa.tenant_id=$1 AND (pa.usuario_id=$2 OR ($3<>'' AND LOWER(pa.email)=$3)) ORDER BY pa.vence DESC`, [ctx.tenantId, ctx.user.id, email]).catch(() => ({ rows: [] }));
+    const ahora = Date.now();
+    const fecha = (d) => new Date(d).toLocaleDateString('es-AR', { timeZone: 'America/Argentina/Buenos_Aires' });
+    const activo = links.find(l => new Date(l.vence).getTime() > ahora);
+    if (activo) {
+      if (Number(activo.profe_id) !== Number(pf.id)) { out.error = `Tu beneficio de alumno es con ${activo.profe_nombre} hasta el ${fecha(activo.vence)}: usá su código (${activo.codigo}).`; return out; }
+      out.ok = true; out.tipo = 'alumno'; out.vence = activo.vence; return out;
+    }
+    const previo = links.find(l => Number(l.profe_id) === Number(pf.id));
+    if (previo) { out.error = `Tu beneficio de alumno con ${nombre} venció el ${fecha(previo.vence)}. Se renueva cuando hacés otro curso con ${nombre}.`; return out; }
+    // Primera vez con este código: queda vinculado al profe por N meses (se guarda al confirmar la compra)
+    out.ok = true; out.tipo = 'alumno'; out.nuevo = true; out.meses = meses;
+    out.vence = new Date(ahora + meses * 30.44 * 86400000).toISOString();
+    return out;
+  }
+
+  // Saldo a favor del profe (lo que sumó por las compras de sus alumnos)
+  async function saldoProfe(db, ctx) {
+    if (!ctx.user) return null;
+    const { rows } = await db.query(`SELECT p.id, COALESCE((SELECT SUM(monto) FROM profe_movimientos m WHERE m.profe_id=p.id),0)::float AS saldo
+      FROM profes p WHERE p.tenant_id=$1 AND p.usuario_id=$2 AND p.activo=true`, [ctx.tenantId, ctx.user.id]).catch(() => ({ rows: [] }));
+    return rows[0] ? { id: rows[0].id, saldo: round2(rows[0].saldo) } : null;
+  }
+
+  // Cotiza el carrito completo. body = { secciones:[{seccion_id, items, envio_id}], entrega:{tipo, cp}, cupon, metodo_pago, usar_saldo }
   async function cotizarCarrito(db, tenantId, userId, body, opts = {}) {
     const ctx = opts.ctx || await contexto(db, tenantId, userId);
     // Cotización del dólar: solo si alguna tienda tiene el mínimo en USD o muestra precios en dólares
@@ -355,6 +414,12 @@ function createCheckout(pool) {
     }
     const resultado = []; const errores = [];
     let cuponInfo = cuponCodigo ? { codigo: cuponCodigo, ok: false, error: null, seccion_id: null } : null;
+    const prof = cuponCodigo ? await evaluarProfe(db, ctx, cuponCodigo) : null;
+    if (prof) cuponInfo = prof.ok
+      ? { codigo: prof.codigo, ok: true, error: null, seccion_id: null, tipo: 'profe', profe: prof.nombre, propio: prof.tipo === 'propio', pct: prof.pctAlumno, vence: prof.vence, descuento: 0, todas: true }
+      : { codigo: prof.codigo, ok: false, error: prof.error, seccion_id: null, tipo: 'profe' };
+    const saldo = body?.usar_saldo ? await saldoProfe(db, ctx) : null;
+    let saldoRestante = saldo ? Math.max(0, saldo.saldo) : 0;
     for (const [secId, items] of porSec) {
       const sec = ctx.secciones[secId] || { id: secId, nombre: 'Tienda', slug: '', cp_origen: '1888' };
       const ars = items.filter(i => i.moneda === 'ARS');
@@ -364,7 +429,7 @@ function createCheckout(pool) {
       const metodoPago = metodoSec[String(secId)] || (body?.metodo_pago ? String(body.metodo_pago).slice(0, 100) : '');
       // Cupón: se aplica a la primera tienda donde sea válido (el de carrito abandonado, a todo el carrito)
       let descuento = 0, cuponAplicado = null, envioGratisCupon = false;
-      if (cuponInfo && subtotal > 0 && (!cuponInfo.ok || cuponInfo.todas)) {
+      if (cuponInfo && !prof && subtotal > 0 && (!cuponInfo.ok || cuponInfo.todas)) {
         try {
           const r = await evaluarCupon(db, ctx, cuponCodigo, { seccion_id: secId, items: ars, subtotal, metodo_pago: metodoPago, final: !opts.cotizacion });
           descuento = r.descuento; envioGratisCupon = r.envio_gratis; cuponAplicado = r.codigo;
@@ -384,14 +449,36 @@ function createCheckout(pool) {
           costoEnvio = elegido ? elegido.costo : 0;
         }
       }
+      // Beneficio de alumno (código de profe): por producto, según la categoría
+      let descAlumno = 0, comision = 0;
+      if (prof && prof.ok && (!prof.secciones.length || prof.secciones.includes(String(secId)))) {
+        for (const it of ars) {
+          const { a, p } = prof.pct(it.categoria);
+          const linea = it.precio_unitario * it.cantidad;
+          const d = a > 0 ? Math.round(linea * a / 100) : 0;
+          descAlumno += d;
+          if (prof.tipo !== 'propio' && p > 0) comision += (linea - d) * p / 100;
+        }
+        descAlumno = Math.min(descAlumno, subtotal);
+        if (descAlumno > 0) {
+          descuento = round2(descuento + descAlumno);
+          cuponAplicado = prof.codigo;
+          cuponInfo.descuento = round2(num(cuponInfo.descuento) + descAlumno);
+          if (cuponInfo.seccion_id == null) cuponInfo.seccion_id = secId;
+        } else comision = 0;
+      }
       const pctPago = pctDescuentoPago(ctx, metodoPago, secId);
       let descuentoPago = 0;
-      if (pctPago > 0) {
+      // El beneficio de alumno no se suma al descuento por medio de pago
+      if (pctPago > 0 && !(descAlumno > 0)) {
         const baseElegible = round2(ars.filter(i => !i._preventa).reduce((s, i) => s + i.precio_unitario * i.cantidad, 0));
         const base = Math.max(0, Math.min(baseElegible, subtotal - descuento));
         descuentoPago = Math.round(base * pctPago / 100);
       }
-      const total = round2(Math.max(0, subtotal - descuento - descuentoPago) + costoEnvio);
+      let total = round2(Math.max(0, subtotal - descuento - descuentoPago) + costoEnvio);
+      // Saldo a favor del profe: se descuenta del total (hasta lo que alcance)
+      let saldoUsado = 0;
+      if (saldoRestante > 0 && total > 0) { saldoUsado = round2(Math.min(saldoRestante, total)); saldoRestante = round2(saldoRestante - saldoUsado); total = round2(total - saldoUsado); }
       // Compra mínima en pesos o en dólares (en USD se cotiza al momento de cerrar el carrito)
       const minUsd = ctx.config[`compra_minima_moneda_${secId}`] === 'USD';
       const minBase = num(ctx.config[`compra_minima_${secId}`]);
@@ -414,9 +501,13 @@ function createCheckout(pool) {
         metodo_pago: metodoPago || null, descuento_pago: descuentoPago, descuento_pago_pct: descuentoPago > 0 ? pctPago : 0,
         requiere_envio: requiereEnvio, envio: { ...envio, elegido, costo: costoEnvio, a_cotizar: !!(elegido && elegido.a_cotizar), a_coordinar: entregaTipo === 'envio' && requiereEnvio && !envio.opciones.length },
         total, compra_minima: min, compra_minima_usd: minUsd ? minBase : null, falta_minimo: faltaMinimo, minimos_categoria: minimosCat,
+        descuento_alumno: descAlumno, descuento_pago_bloqueado: pctPago > 0 && descAlumno > 0, saldo_usado: saldoUsado,
+        _profe: descAlumno > 0 ? { id: prof.id, tipo: prof.tipo, nuevo: prof.nuevo, vence: prof.vence, comision: Math.round(comision), descuento: descAlumno } : null,
+        _saldo: saldoUsado > 0 ? { id: saldo.id, monto: saldoUsado } : null,
         _items: items,
       });
     }
+    if (prof && prof.ok && !(num(cuponInfo.descuento) > 0) && resultado.length) cuponInfo = { codigo: prof.codigo, ok: false, tipo: 'profe', seccion_id: null, error: 'El beneficio de alumno no aplica a estos productos' };
     if (cuponInfo && !cuponInfo.ok && !cuponInfo.error) cuponInfo.error = 'El cupón no aplica a estos productos';
     const totales = {
       subtotal: round2(resultado.reduce((s, r) => s + r.subtotal, 0)),
@@ -425,20 +516,22 @@ function createCheckout(pool) {
       envio: round2(resultado.reduce((s, r) => s + r.envio.costo, 0)),
       envio_a_cotizar: resultado.some(r => r.envio.a_cotizar),
       total: round2(resultado.reduce((s, r) => s + r.total, 0)),
+      saldo_usado: round2(resultado.reduce((s, r) => s + num(r.saldo_usado), 0)),
+      saldo_disponible: saldo ? saldo.saldo : null,
       total_usdt: round2(resultado.reduce((s, r) => s + r.subtotal_usdt, 0)),
     };
-    return { ctx, entrega: { tipo: entregaTipo, cp }, secciones: resultado, totales, cupon: cuponInfo, errores, avisos: avisos || [], usd };
+    return { ctx, entrega: { tipo: entregaTipo, cp }, secciones: resultado, totales, cupon: cuponInfo, errores, avisos: avisos || [], usd, profe: prof && prof.ok ? prof : null };
   }
 
   // Versión para mandar a la web (sin datos internos)
   function publico(cot) {
     return {
       entrega: cot.entrega, totales: cot.totales, cupon: cot.cupon, errores: cot.errores, avisos: cot.avisos, usd: cot.usd || null,
-      secciones: cot.secciones.map(({ _items, ...s }) => s),
+      secciones: cot.secciones.map(({ _items, _profe, _saldo, ...s }) => s),
     };
   }
 
-  return { contexto, preciarItems, cotizarCarrito, evaluarCupon, publico, CheckoutError };
+  return { contexto, preciarItems, cotizarCarrito, evaluarCupon, evaluarProfe, saldoProfe, publico, CheckoutError };
 }
 
 module.exports = { createCheckout, precioCliente, aplicarPromo, CheckoutError, PROVEEDORES_ENVIO, cotizacionDolar };
