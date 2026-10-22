@@ -46,6 +46,47 @@ app.use(cors({
 
 app.use(express.json({ limit: '10mb' }));
 
+// ═══ Errores: el detalle interno (base de datos, código) va a los registros del servidor, nunca al navegador ═══
+// Antes se mostraba tal cual (ej. "value too long for type character varying(300)"), lo que deja ver cómo está armada la base.
+const PG_AMIGABLE = {
+  '22001': (e) => { const n=(String(e.message||'').match(/varying\((\d+)\)/)||[])[1]; return [400, n ? `Un dato es demasiado largo: el máximo es de ${n} caracteres.` : 'Un dato es demasiado largo.']; },
+  '22003': () => [400, 'Un número está fuera del rango permitido.'],
+  '22P02': () => [400, 'Algún dato tiene un formato inválido.'],
+  '22007': () => [400, 'Una fecha tiene un formato inválido.'],
+  '22008': () => [400, 'Una fecha está fuera de rango.'],
+  '23502': () => [400, 'Falta completar un dato obligatorio.'],
+  '23503': () => [400, 'No se puede completar porque hay datos relacionados.'],
+  '23505': () => [400, 'Ya existe un registro con esos datos.'],
+  '23514': () => [400, 'Algún dato no cumple las reglas permitidas.'],
+};
+const ERROR_GENERICO = 'Ocurrió un error en el servidor. Probá de nuevo en un momento.';
+const esErrorInterno = (e) => !!e && ((typeof e.code === 'string' && (/^[0-9A-Z]{5}$/.test(e.code) || /^E[A-Z_]+$/.test(e.code)))
+  || e instanceof TypeError || e instanceof ReferenceError || e instanceof SyntaxError || e instanceof RangeError);
+// Texto que viene de Postgres o de Node (en inglés): no se muestra
+const PATRON_INTERNO = /violates|duplicate key|value too long|invalid input|syntax error|does not exist|null value in column|out of range|division by zero|deadlock|canceling statement|connection|ECONN|ETIMEDOUT|EAI_AGAIN|socket hang up|Cannot read propert|Cannot set propert|is not a function|is not defined|is not iterable|Unexpected token|in JSON at position|Client has encountered|timeout exceeded|column reference|operator does not exist|could not|permission denied|undefined/i;
+function fallo(res, e, prefijo){
+  console.error('[error]', res.req ? `${res.req.method} ${res.req.originalUrl}` : '', e && (e.stack || e.message) || e);
+  let status = 500, msg;
+  const amigable = e && PG_AMIGABLE[e.code];
+  if (amigable) [status, msg] = amigable(e);
+  else if (esErrorInterno(e) || PATRON_INTERNO.test(String(e && e.message || e))) msg = ERROR_GENERICO;
+  else msg = String(e && e.message || e || ERROR_GENERICO).slice(0, 300);
+  if (res.headersSent) return;
+  return res.status(status).json({ error: prefijo ? `${prefijo}: ${msg}` : msg });
+}
+// Red de seguridad para respuestas de error armadas a mano con e.message
+app.use((req, res, next) => {
+  const json = res.json.bind(res);
+  res.json = (body) => {
+    if (res.statusCode >= 400 && body && typeof body.error === 'string' && PATRON_INTERNO.test(body.error)) {
+      console.error('[error oculto]', req.method, req.originalUrl, body.error);
+      body = { ...body, error: res.statusCode >= 500 ? ERROR_GENERICO : 'No se pudo completar la operación. Revisá los datos e intentá de nuevo.' };
+    }
+    return json(body);
+  };
+  next();
+});
+
 const rateLimit = require('express-rate-limit');
 app.use('/api/auth', rateLimit({ windowMs: 15 * 60 * 1000, max: 30 }));
 // Límite estricto para login/registro (anti fuerza bruta): 10 intentos cada 15 min por IP
@@ -949,7 +990,7 @@ app.get('/api/tenants', authOwner, async (req,res)=>{
         (SELECT COUNT(*)::int FROM usuarios WHERE tenant_id=t.id AND rol='cliente') as clientes
       FROM tenants t ORDER BY t.id`);
     res.json(rows);
-  }catch(e){ res.status(500).json({error:e.message}); }
+  }catch(e){ fallo(res,e); }
 });
 // Estadísticas de negocio de la plataforma (para el panel de dueño)
 app.get('/api/plataforma/stats', authOwner, async (req,res)=>{
@@ -998,7 +1039,7 @@ app.get('/api/plataforma/stats', authOwner, async (req,res)=>{
       nuevas_por_mes: porMes,
       uso_total: uso[0],
     });
-  }catch(e){ res.status(500).json({error:e.message}); }
+  }catch(e){ fallo(res,e); }
 });
 // Leer precios de planes (owner)
 // Precios + oferta públicos (para el landing de ComerciApp, sin login)
@@ -1055,11 +1096,11 @@ app.post('/api/registro-tienda', authLimiter, async (req,res)=>{
     await client.query('COMMIT');
     tenantCache.clear(); tenantDataCache.clear();
     res.json({ ok:true, slug:slugClean, usuario:admUser, dias });
-  }catch(e){ if(client) await client.query('ROLLBACK').catch(()=>{}); res.status(500).json({error:e.message}); }
+  }catch(e){ if(client) await client.query('ROLLBACK').catch(()=>{}); fallo(res,e); }
   finally{ if(client) client.release(); }
 });
 app.get('/api/plataforma/precios', authOwner, async (req,res)=>{
-  try{ res.json(await getPlanPrecios()); }catch(e){ res.status(500).json({error:e.message}); }
+  try{ res.json(await getPlanPrecios()); }catch(e){ fallo(res,e); }
 });
 // Guardar precios de planes (owner) — se guardan en la config de la plataforma (tenant 1)
 app.put('/api/plataforma/precios', authOwner, async (req,res)=>{
@@ -1073,11 +1114,11 @@ app.put('/api/plataforma/precios', authOwner, async (req,res)=>{
       await pool.query("INSERT INTO configuracion (tenant_id,clave,valor) VALUES (1,$1,$2) ON CONFLICT (tenant_id,clave) DO UPDATE SET valor=$2", [clave, String(num)]);
     }
     res.json(await getPlanPrecios());
-  }catch(e){ res.status(500).json({error:e.message}); }
+  }catch(e){ fallo(res,e); }
 });
 // Oferta de lanzamiento (owner): leer / guardar descuento_pct y meses
 app.get('/api/plataforma/oferta', authOwner, async (req,res)=>{
-  try{ res.json(await getOfertaLanzamiento()); }catch(e){ res.status(500).json({error:e.message}); }
+  try{ res.json(await getOfertaLanzamiento()); }catch(e){ fallo(res,e); }
 });
 app.put('/api/plataforma/oferta', authOwner, async (req,res)=>{
   try{
@@ -1091,12 +1132,12 @@ app.put('/api/plataforma/oferta', authOwner, async (req,res)=>{
       if(!isNaN(m) && m>=0) await pool.query("INSERT INTO configuracion (tenant_id,clave,valor) VALUES (1,'oferta_meses',$1) ON CONFLICT (tenant_id,clave) DO UPDATE SET valor=$1", [String(m)]);
     }
     res.json(await getOfertaLanzamiento());
-  }catch(e){ res.status(500).json({error:e.message}); }
+  }catch(e){ fallo(res,e); }
 });
 // Pagos de suscripción (owner)
 app.get('/api/plataforma/pagos/:tenantId', authOwner, async (req,res)=>{
   try{ const {rows}=await pool.query('SELECT * FROM pagos_suscripcion WHERE tenant_id=$1 ORDER BY pagado_en DESC', [req.params.tenantId]); res.json(rows); }
-  catch(e){ res.status(500).json({error:e.message}); }
+  catch(e){ fallo(res,e); }
 });
 app.post('/api/plataforma/pagos', authOwner, async (req,res)=>{
   try{
@@ -1106,11 +1147,11 @@ app.post('/api/plataforma/pagos', authOwner, async (req,res)=>{
       `INSERT INTO pagos_suscripcion (tenant_id, monto, metodo, periodo, notas, proximo_venc) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
       [tenant_id, parseFloat(monto)||0, metodo||'', periodo||'', notas||'', proximo_venc||null]);
     res.json(rows[0]);
-  }catch(e){ res.status(500).json({error:e.message}); }
+  }catch(e){ fallo(res,e); }
 });
 app.delete('/api/plataforma/pagos/:id', authOwner, async (req,res)=>{
   try{ await pool.query('DELETE FROM pagos_suscripcion WHERE id=$1', [req.params.id]); res.json({ok:true}); }
-  catch(e){ res.status(500).json({error:e.message}); }
+  catch(e){ fallo(res,e); }
 });
 // Resumen de cobros del mes en curso (owner)
 app.get('/api/plataforma/cobros', authOwner, async (req,res)=>{
@@ -1121,11 +1162,11 @@ app.get('/api/plataforma/cobros', authOwner, async (req,res)=>{
       FROM pagos_suscripcion p LEFT JOIN tenants t ON t.id=p.tenant_id
       ORDER BY p.pagado_en DESC LIMIT 10`);
     res.json({ mes_total: mes[0].total, mes_cant: mes[0].cant, ultimos: ult });
-  }catch(e){ res.status(500).json({error:e.message}); }
+  }catch(e){ fallo(res,e); }
 });
 app.get('/api/tenants/:id', authOwner, async (req,res)=>{
   try{ const {rows}=await pool.query('SELECT * FROM tenants WHERE id=$1', [req.params.id]); if(!rows[0]) return res.status(404).json({error:'No encontrado'}); res.json(rows[0]); }
-  catch(e){ res.status(500).json({error:e.message}); }
+  catch(e){ fallo(res,e); }
 });
 // Crear tenant nuevo (+ su admin + seed de diseño mínimo)
 app.post('/api/tenants', authOwner, async (req,res)=>{
@@ -1161,7 +1202,7 @@ app.post('/api/tenants', authOwner, async (req,res)=>{
     await client.query('COMMIT');
     tenantCache.clear(); tenantDataCache.clear(); // refrescar caches del tenant
     res.json({ ...tRows[0], admin_usuario:admUser, admin_password:admPass });
-  }catch(e){ if(client) await client.query('ROLLBACK').catch(()=>{}); res.status(500).json({error:e.message}); }
+  }catch(e){ if(client) await client.query('ROLLBACK').catch(()=>{}); fallo(res,e); }
   finally{ if(client) client.release(); }
 });
 // Actualizar tenant (plan, estado, fechas, dominio, notas)
@@ -1183,7 +1224,7 @@ app.put('/api/tenants/:id', authOwner, async (req,res)=>{
     await pool.query(`UPDATE tenants SET ${sets.join(',')} WHERE id=$${pi}`, params);
     tenantCache.clear(); tenantDataCache.clear();
     res.json({ok:true});
-  }catch(e){ res.status(500).json({error:e.message}); }
+  }catch(e){ fallo(res,e); }
 });
 // Activar / suspender rápido
 app.post('/api/tenants/:id/estado', authOwner, async (req,res)=>{
@@ -1193,7 +1234,7 @@ app.post('/api/tenants/:id/estado', authOwner, async (req,res)=>{
     await pool.query('UPDATE tenants SET estado=$1 WHERE id=$2', [estado||'activo', req.params.id]);
     tenantCache.clear(); tenantDataCache.clear();
     res.json({ok:true});
-  }catch(e){ res.status(500).json({error:e.message}); }
+  }catch(e){ fallo(res,e); }
 });
 // Borrar tenant (y TODOS sus datos) — peligroso, nunca el 1
 app.delete('/api/tenants/:id', authOwner, async (req,res)=>{
@@ -1223,7 +1264,7 @@ app.delete('/api/tenants/:id', authOwner, async (req,res)=>{
     await client.query('COMMIT');
     tenantCache.clear(); tenantDataCache.clear();
     res.json({ok:true});
-  }catch(e){ if(client) await client.query('ROLLBACK').catch(()=>{}); res.status(500).json({error:e.message}); }
+  }catch(e){ if(client) await client.query('ROLLBACK').catch(()=>{}); fallo(res,e); }
   finally{ if(client) client.release(); }
 });
 
@@ -1240,7 +1281,7 @@ app.get('/api/maintenance-status', async (req,res)=>{
   try{ const {rows}=await pool.query("SELECT clave,valor FROM configuracion WHERE tenant_id=$1 AND clave IN ('mantenimiento_activo','mantenimiento_mensaje','mantenimiento_countdown')", [req.tenantId]); const cfg={}; rows.forEach(r=>cfg[r.clave]=r.valor); res.json({activo:cfg.mantenimiento_activo==='true', mensaje:cfg.mantenimiento_mensaje||'', countdown:cfg.mantenimiento_countdown||''}); }catch{ res.json({activo:false}); }
 });
 app.post('/api/maintenance-mode', authPerm('config'), async (req,res)=>{
-  try{ const {activo,mensaje,countdown}=req.body; await pool.query("INSERT INTO configuracion (tenant_id,clave,valor) VALUES ($2,'mantenimiento_activo',$1) ON CONFLICT (tenant_id,clave) DO UPDATE SET valor=$1", [activo?'true':'false', req.tenantId]); await pool.query("INSERT INTO configuracion (tenant_id,clave,valor) VALUES ($2,'mantenimiento_mensaje',$1) ON CONFLICT (tenant_id,clave) DO UPDATE SET valor=$1", [mensaje||'', req.tenantId]); await pool.query("INSERT INTO configuracion (tenant_id,clave,valor) VALUES ($2,'mantenimiento_countdown',$1) ON CONFLICT (tenant_id,clave) DO UPDATE SET valor=$1", [countdown||'', req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); }
+  try{ const {activo,mensaje,countdown}=req.body; await pool.query("INSERT INTO configuracion (tenant_id,clave,valor) VALUES ($2,'mantenimiento_activo',$1) ON CONFLICT (tenant_id,clave) DO UPDATE SET valor=$1", [activo?'true':'false', req.tenantId]); await pool.query("INSERT INTO configuracion (tenant_id,clave,valor) VALUES ($2,'mantenimiento_mensaje',$1) ON CONFLICT (tenant_id,clave) DO UPDATE SET valor=$1", [mensaje||'', req.tenantId]); await pool.query("INSERT INTO configuracion (tenant_id,clave,valor) VALUES ($2,'mantenimiento_countdown',$1) ON CONFLICT (tenant_id,clave) DO UPDATE SET valor=$1", [countdown||'', req.tenantId]); res.json({ok:true}); }catch(e){ fallo(res,e); }
 });
 
 // === AUTH ===
@@ -1436,7 +1477,7 @@ app.post('/api/arrepentimiento', optionalAuth, rateLimit({ windowMs: 60*60*1000,
       </div>`, { fromName: tienda, replyTo: email });
     })().catch(()=>{});
     res.json({ ok:true, codigo, fecha, pedido_vinculado: !!pedidoId });
-  }catch(e){ res.status(500).json({error:e.message}); }
+  }catch(e){ fallo(res,e); }
 });
 app.get('/api/arrepentimientos', authPerm('pedidos'), async (req,res)=>{
   try{
@@ -1444,7 +1485,7 @@ app.get('/api/arrepentimientos', authPerm('pedidos'), async (req,res)=>{
       FROM arrepentimientos a LEFT JOIN pedidos p ON p.id=a.pedido_id AND p.tenant_id=a.tenant_id
       WHERE a.tenant_id=$1 ORDER BY (a.estado='pendiente') DESC, a.created_at DESC LIMIT 300`, [req.tenantId]);
     res.json(rows);
-  }catch(e){ res.status(500).json({error:e.message}); }
+  }catch(e){ fallo(res,e); }
 });
 app.put('/api/arrepentimientos/:id', authPerm('pedidos'), async (req,res)=>{
   try{
@@ -1454,7 +1495,7 @@ app.put('/api/arrepentimientos/:id', authPerm('pedidos'), async (req,res)=>{
       [estado, typeof req.body.nota_admin==='string'?req.body.nota_admin.slice(0,2000):null, req.params.id, req.tenantId]);
     if(!r.rowCount) return res.status(404).json({error:'No encontrada'});
     res.json({ok:true});
-  }catch(e){ res.status(500).json({error:e.message}); }
+  }catch(e){ fallo(res,e); }
 });
 const loginAttempts={};
 // Limpieza: los intentos viejos se borran (antes el mapa crecía sin fin con usuarios inventados → memoria)
@@ -1466,18 +1507,23 @@ app.post('/api/login', async (req,res)=>{
     const ip=req.ip; const key=`${ip}_${String(usuario).toLowerCase().slice(0,100)}`; if(Object.keys(loginAttempts).length>50000) for(const k of Object.keys(loginAttempts)) delete loginAttempts[k];
     if(loginAttempts[key] && loginAttempts[key].count>=5 && Date.now()-loginAttempts[key].last<15*60*1000) return res.status(429).json({error:'Bloqueado 15min'});
     const {rows}=await pool.query('SELECT * FROM usuarios WHERE LOWER(usuario)=LOWER($1) AND activo=true AND tenant_id=$2', [usuario, req.tenantId]);
-    if(!rows[0]){ const {rows:pend}=await pool.query('SELECT * FROM usuarios WHERE LOWER(usuario)=LOWER($1) AND aprobado=false AND tenant_id=$2', [usuario, req.tenantId]); if(pend[0]) return res.status(403).json({error:'Pendiente aprobación'}); loginAttempts[key]={count:(loginAttempts[key]?.count||0)+1, last:Date.now()}; return res.status(401).json({error:'Usuario o contraseña incorrectos'}); }
+    if(!rows[0]){
+      // "Pendiente de aprobación" solo se dice con la contraseña correcta: si no, cualquiera podía saber qué usuarios existen
+      const {rows:pend}=await pool.query('SELECT password FROM usuarios WHERE LOWER(usuario)=LOWER($1) AND aprobado=false AND tenant_id=$2', [usuario, req.tenantId]);
+      if(pend[0] && pend[0].password && await bcrypt.compare(String(password), pend[0].password)) return res.status(403).json({error:'Pendiente aprobación'});
+      loginAttempts[key]={count:(loginAttempts[key]?.count||0)+1, last:Date.now()}; return res.status(401).json({error:'Usuario o contraseña incorrectos'});
+    }
     const valid=await bcrypt.compare(password, rows[0].password);
     if(!valid){ loginAttempts[key]={count:(loginAttempts[key]?.count||0)+1, last:Date.now()}; return res.status(401).json({error:'Usuario o contraseña incorrectos'}); }
-    if(rows[0].otp_activo && resend){
+    if(rows[0].otp_activo && resend && process.env.OTP_DESACTIVADO!=='1'){
       if(!otp_code){
         // Máximo 8 códigos por hora; cada código nuevo anula los anteriores
         const {rows:rec}=await pool.query("SELECT COUNT(*)::int AS n FROM otp_codes WHERE usuario_id=$1 AND created_at>NOW()-INTERVAL '1 hour'", [rows[0].id]);
         if((rec[0]?.n||0)>=8) return res.status(429).json({error:'Pediste muchos códigos seguidos. Esperá una hora e intentá de nuevo.'});
         await pool.query('UPDATE otp_codes SET usado=true WHERE usuario_id=$1 AND usado=false', [rows[0].id]);
         const code=String(crypto.randomInt(100000, 1000000));
-        await pool.query('INSERT INTO otp_codes (usuario_id,codigo,expira) VALUES ($1,$2,NOW()+INTERVAL \'10 minutes\')', [rows[0].id, code]);
-        if(rows[0].email) await resend.emails.send({from:process.env.RESEND_FROM||'noreply@resend.dev', to:rows[0].email, subject:'Código verificación', html:`<h2>Código: <strong>${code}</strong></h2>`}).catch(()=>{});
+        await pool.query("INSERT INTO otp_codes (usuario_id,codigo,expira,created_at) VALUES ($1,$2,NOW()+INTERVAL '10 minutes',NOW())", [rows[0].id, code]);
+        if(rows[0].email){ const {tienda}=await _tiendaInfo(req.tenantId); await _sendMail(rows[0].email, `Tu código para ingresar — ${tienda}`, mailCodigo('Código para ingresar', code, 'Vence en 10 minutos. Si no fuiste vos, cambiá tu contraseña.'), { fromName: tienda }); }
         return res.json({requires_otp:true, message:'Código enviado'});
       }
       const {rows:otps}=await pool.query('SELECT * FROM otp_codes WHERE usuario_id=$1 AND codigo=$2 AND expira>NOW() AND usado=false ORDER BY id DESC LIMIT 1', [rows[0].id, String(otp_code).trim()]);
@@ -1491,15 +1537,59 @@ app.post('/api/login', async (req,res)=>{
     delete loginAttempts[key];
     const token=jwt.sign({id:rows[0].id, rol:rows[0].rol, usuario:rows[0].usuario, tenant_id:rows[0].tenant_id||1, es_owner:rows[0].es_owner||false}, JWT_SECRET, {expiresIn:vidaToken(rows[0].rol), jwtid:crypto.randomUUID()});
     res.json({token, user:sanitizeUser(rows[0])});
-  }catch(e){ res.status(500).json({error:e.message}); }
+  }catch(e){ fallo(res,e); }
 });
 app.post('/api/logout', auth(), async (req,res)=>{
-  try{ const decoded=jwt.decode(req._token); const expira=new Date(decoded.exp*1000); await pool.query('INSERT INTO tokens_revocados (token_hash,expira,desde) VALUES ($1,$2,NOW()) ON CONFLICT (token_hash) DO UPDATE SET desde=NOW()', [hashToken(req._token), expira]); await pool.query('DELETE FROM tokens_revocados WHERE expira<NOW()').catch(()=>{}); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); }
+  try{ const decoded=jwt.decode(req._token); const expira=new Date(decoded.exp*1000); await pool.query('INSERT INTO tokens_revocados (token_hash,expira,desde) VALUES ($1,$2,NOW()) ON CONFLICT (token_hash) DO UPDATE SET desde=NOW()', [hashToken(req._token), expira]); await pool.query('DELETE FROM tokens_revocados WHERE expira<NOW()').catch(()=>{}); res.json({ok:true}); }catch(e){ fallo(res,e); }
 });
 app.post('/api/refresh-token', auth(), async (req,res)=>{
-  try{ const {rows}=await pool.query('SELECT id,rol,usuario,activo,tenant_id,es_owner FROM usuarios WHERE id=$1', [req.user.id]); if(!rows[0]||!rows[0].activo) return res.status(401).json({error:'Cuenta desactivada'}); const decoded=jwt.decode(req._token); await pool.query("INSERT INTO tokens_revocados (token_hash,expira,desde) VALUES ($1,$2,NOW()+INTERVAL '2 minutes') ON CONFLICT DO NOTHING", [hashToken(req._token), new Date(decoded.exp*1000)]); const newToken=jwt.sign({id:rows[0].id, rol:rows[0].rol, usuario:rows[0].usuario, tenant_id:rows[0].tenant_id||1, es_owner:rows[0].es_owner||false}, JWT_SECRET, {expiresIn:vidaToken(rows[0].rol), jwtid:crypto.randomUUID()}); res.json({token:newToken}); }catch(e){ res.status(500).json({error:e.message}); }
+  try{ const {rows}=await pool.query('SELECT id,rol,usuario,activo,tenant_id,es_owner FROM usuarios WHERE id=$1', [req.user.id]); if(!rows[0]||!rows[0].activo) return res.status(401).json({error:'Cuenta desactivada'}); const decoded=jwt.decode(req._token); await pool.query("INSERT INTO tokens_revocados (token_hash,expira,desde) VALUES ($1,$2,NOW()+INTERVAL '2 minutes') ON CONFLICT DO NOTHING", [hashToken(req._token), new Date(decoded.exp*1000)]); const newToken=jwt.sign({id:rows[0].id, rol:rows[0].rol, usuario:rows[0].usuario, tenant_id:rows[0].tenant_id||1, es_owner:rows[0].es_owner||false}, JWT_SECRET, {expiresIn:vidaToken(rows[0].rol), jwtid:crypto.randomUUID()}); res.json({token:newToken}); }catch(e){ fallo(res,e); }
 });
-app.put('/api/me/otp', auth(), async (req,res)=>{ try{ const {activo}=req.body; await pool.query('UPDATE usuarios SET otp_activo=$1 WHERE id=$2 AND tenant_id=$3', [activo, req.user.id, req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+// ═══ Verificación en dos pasos (código por mail al ingresar) ═══
+// Para activarla hay que confirmar un código de prueba: así nadie queda afuera por un mail que no llega.
+// Para desactivarla se pide la contraseña. Llave de emergencia: variable OTP_DESACTIVADO=1 en Railway.
+const mailCodigo = (titulo, code, pie) => `<div style="font-family:system-ui,sans-serif;max-width:480px;margin:0 auto"><h2>${titulo}</h2><p style="font-size:28px;font-weight:800;letter-spacing:4px">${code}</p><p style="color:#666">${pie}</p></div>`;
+async function passwordOk(userId, tenantId, pass){
+  const {rows}=await pool.query('SELECT password FROM usuarios WHERE id=$1 AND tenant_id=$2', [userId, tenantId]);
+  return !!(rows[0] && rows[0].password && pass && await bcrypt.compare(String(pass), rows[0].password));
+}
+app.post('/api/me/otp/iniciar', auth(), authLimiter, async (req,res)=>{
+  try{
+    if(!resend) return res.status(400).json({error:'Los mails no están configurados en el servidor: no se puede activar.'});
+    if(!(await passwordOk(req.user.id, req.tenantId, req.body?.password))) return res.status(400).json({error:'La contraseña no es correcta'});
+    const {rows}=await pool.query('SELECT email FROM usuarios WHERE id=$1 AND tenant_id=$2', [req.user.id, req.tenantId]);
+    const email=rows[0]?.email; if(!email) return res.status(400).json({error:'Cargá un email en tu cuenta antes de activarla.'});
+    const {rows:rec}=await pool.query("SELECT COUNT(*)::int AS n FROM otp_codes WHERE usuario_id=$1 AND created_at>NOW()-INTERVAL '1 hour'", [req.user.id]);
+    if((rec[0]?.n||0)>=8) return res.status(429).json({error:'Pediste muchos códigos seguidos. Esperá una hora e intentá de nuevo.'});
+    await pool.query('UPDATE otp_codes SET usado=true WHERE usuario_id=$1 AND usado=false', [req.user.id]);
+    const code=String(crypto.randomInt(100000, 1000000));
+    await pool.query("INSERT INTO otp_codes (usuario_id,codigo,expira,created_at) VALUES ($1,$2,NOW()+INTERVAL '10 minutes',NOW())", [req.user.id, code]);
+    const {tienda}=await _tiendaInfo(req.tenantId);
+    await _sendMail(email, `Código para activar la verificación en dos pasos — ${tienda}`, mailCodigo('Activar verificación en dos pasos', code, 'Vence en 10 minutos. Si no lo pediste, cambiá tu contraseña.'), { fromName: tienda });
+    const [u,d]=email.split('@'); res.json({ok:true, email:`${u.slice(0,2)}***@${d}`});
+  }catch(e){ fallo(res,e); }
+});
+app.post('/api/me/otp/confirmar', auth(), async (req,res)=>{
+  try{
+    const codigo=String(req.body?.codigo||'').replace(/\D/g,'');
+    const {rows}=await pool.query('SELECT id FROM otp_codes WHERE usuario_id=$1 AND codigo=$2 AND expira>NOW() AND usado=false ORDER BY id DESC LIMIT 1', [req.user.id, codigo]);
+    if(!rows[0]){
+      await pool.query("UPDATE otp_codes SET intentos=COALESCE(intentos,0)+1, usado=(COALESCE(intentos,0)+1>=5) WHERE usuario_id=$1 AND usado=false AND expira>NOW()", [req.user.id]).catch(()=>{});
+      return res.status(400).json({error:'Código incorrecto o vencido'});
+    }
+    await pool.query('UPDATE otp_codes SET usado=true WHERE id=$1', [rows[0].id]);
+    await pool.query('UPDATE usuarios SET otp_activo=true WHERE id=$1 AND tenant_id=$2', [req.user.id, req.tenantId]);
+    res.json({ok:true, otp_activo:true});
+  }catch(e){ fallo(res,e); }
+});
+app.put('/api/me/otp', auth(), authLimiter, async (req,res)=>{
+  try{
+    if(req.body?.activo) return res.status(400).json({error:'Para activarla tenés que confirmar el código que te mandamos por mail.'});
+    if(!(await passwordOk(req.user.id, req.tenantId, req.body?.password))) return res.status(400).json({error:'La contraseña no es correcta'});
+    await pool.query('UPDATE usuarios SET otp_activo=false WHERE id=$1 AND tenant_id=$2', [req.user.id, req.tenantId]);
+    res.json({ok:true, otp_activo:false});
+  }catch(e){ fallo(res,e); }
+});
 
 // Recuperar contraseña: el código va SOLO por email. La respuesta es siempre la misma
 // (no confirma si el usuario existe ni devuelve el código: antes cualquiera podía tomar la cuenta del admin).
@@ -1564,7 +1654,7 @@ app.post('/api/me/solicitar-mayorista', auth(), async (req,res)=>{
       if(u[0] && !u[0].mayorista && u[0].mayorista_rechazado_at) return res.status(409).json({ error: 'Tu pedido de acceso ya fue revisado. Si querés, consultanos por WhatsApp.', rechazado: true });
     }
     res.json({ ok: true, solicitado: !!rows[0], ya_autorizado: !rows[0] });
-  }catch(e){ res.status(500).json({error:e.message}); }
+  }catch(e){ fallo(res,e); }
 });
 // Carrito guardado en la cuenta: no se pierde al cerrar sesión, cambiar de dispositivo o si el navegador borra sus datos.
 // Cada guardado lleva la versión que el dispositivo leyó: si otro dispositivo guardó antes, responde 409 con lo último
@@ -1585,7 +1675,7 @@ app.get('/api/me/carrito', auth(), async (req,res)=>{
   try{
     const {rows}=await pool.query('SELECT items, version, updated_at FROM carritos_guardados WHERE tenant_id=$1 AND usuario_id=$2', [req.tenantId, req.user.id]);
     res.json({ items: rows[0] ? rows[0].items : {}, version: rows[0] ? rows[0].version : 0, updated_at: rows[0] ? rows[0].updated_at : null });
-  }catch(e){ res.status(500).json({error:e.message}); }
+  }catch(e){ fallo(res,e); }
 });
 app.put('/api/me/carrito', auth(), async (req,res)=>{
   try{
@@ -1602,9 +1692,9 @@ app.put('/api/me/carrito', auth(), async (req,res)=>{
       return res.status(409).json({ error:'El carrito cambió en otro dispositivo', items: rows[0] ? rows[0].items : {}, version: rows[0] ? rows[0].version : 0 });
     }
     res.json({ ok:true, version: r.rows[0].version });
-  }catch(e){ res.status(500).json({error:e.message}); }
+  }catch(e){ fallo(res,e); }
 });
-app.get('/api/me', auth(), async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM usuarios WHERE id=$1 AND tenant_id=$2', [req.user.id, req.tenantId]); res.json(sanitizeUser(rows[0])); }catch(e){ res.status(500).json({error:e.message}); } });
+app.get('/api/me', auth(), async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM usuarios WHERE id=$1 AND tenant_id=$2', [req.user.id, req.tenantId]); res.json(sanitizeUser(rows[0])); }catch(e){ fallo(res,e); } });
 // Crear cliente rápido desde el panel (venta de mostrador). Genera usuario auto si no se pasa.
 app.post('/api/usuarios/rapido', authPerm('usuarios'), async (req,res)=>{
   try{
@@ -1646,13 +1736,13 @@ app.put('/api/me', auth(), async (req,res)=>{
       nuevoToken=jwt.sign({id:u.id, rol:u.rol, usuario:u.usuario, tenant_id:u.tenant_id||1, es_owner:u.es_owner||false, iat}, JWT_SECRET, {expiresIn:vidaToken(u.rol), jwtid:crypto.randomUUID()});
     }
     res.json(nuevoToken ? {...sanitizeUser(rows[0]), token:nuevoToken} : sanitizeUser(rows[0]));
-  }catch(e){ res.status(500).json({error:e.message}); }
+  }catch(e){ fallo(res,e); }
 });
 
 // CONFIG
 // Config pública: los visitantes no ven datos internos (mails de aviso, claves técnicas). El equipo ve todo.
 const CONFIG_PRIVADA=/^(_|email_|smtp|resend)|token|secret|password|clave_api|api_?key/i;
-app.get('/api/config', optionalAuth, async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM configuracion WHERE tenant_id=$1', [req.tenantId]); let staff=false; if(req.user){ const {rows:u}=await pool.query('SELECT rol FROM usuarios WHERE id=$1 AND tenant_id=$2', [req.user.id, req.tenantId]).catch(()=>({rows:[]})); staff=!!(u[0] && (u[0].rol==='admin'||u[0].rol==='subadmin')); } const cfg={}; rows.forEach(r=>{ if(staff || !CONFIG_PRIVADA.test(r.clave)) cfg[r.clave]=r.valor; }); res.json(cfg); }catch(e){ res.status(500).json({error:e.message}); } });
+app.get('/api/config', optionalAuth, async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM configuracion WHERE tenant_id=$1', [req.tenantId]); let staff=false; if(req.user){ const {rows:u}=await pool.query('SELECT rol FROM usuarios WHERE id=$1 AND tenant_id=$2', [req.user.id, req.tenantId]).catch(()=>({rows:[]})); staff=!!(u[0] && (u[0].rol==='admin'||u[0].rol==='subadmin')); } const cfg={}; rows.forEach(r=>{ if(staff || !CONFIG_PRIVADA.test(r.clave)) cfg[r.clave]=r.valor; }); res.json(cfg); }catch(e){ fallo(res,e); } });
 // Plan y funciones habilitadas del tenant actual (para que el frontend muestre/oculte)
 app.get('/api/mi-plan', async (req,res)=>{
   try{ const d=await getTenantData(req.tenantId);
@@ -1662,7 +1752,7 @@ app.get('/api/mi-plan', async (req,res)=>{
       const m={}; rows.forEach(r=>{ if(r.valor) m[r.clave]=r.valor; }); soporte=m.comerciapp_whatsapp||m.whatsapp_numero||m.whatsapp||m.whatsapp_flotante||'';
     }
     res.json({ plan:d.plan, estado:d.estado, features:d.features, dias_restantes:d.dias_restantes, soporte_whatsapp: soporte||undefined }); }
-  catch(e){ res.status(500).json({error:e.message}); }
+  catch(e){ fallo(res,e); }
 });
 // Claves que no se tocan desde la config de una tienda: las internas ("_...") y, en la tienda 1, los precios y
 // ofertas de los planes de ComerciApp (esas se cambian solo desde el panel de la plataforma, por el dueño).
@@ -1679,22 +1769,22 @@ app.put('/api/config', authPerm('config'), async (req,res)=>{ try{
     if(Number(req.tenantId)===1 && CONFIG_PLATAFORMA.test(k) && !esOwner) continue;
     await pool.query("INSERT INTO configuracion (tenant_id,clave,valor) VALUES ($1,$2,$3) ON CONFLICT (tenant_id,clave) DO UPDATE SET valor=$3", [req.tenantId,k,v]);
   }
-  res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+  res.json({ok:true}); }catch(e){ fallo(res,e); } });
 
 // LISTAS
-app.get('/api/listas', async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM listas_precio WHERE tenant_id=$1 ORDER BY multiplicador', [req.tenantId]); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
+app.get('/api/listas', async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM listas_precio WHERE tenant_id=$1 ORDER BY multiplicador', [req.tenantId]); res.json(rows); }catch(e){ fallo(res,e); } });
 app.put('/api/listas', authPerm('listas'), requiereFeature('listas_precio'), async (req,res)=>{ try{ const {listas}=req.body; if(!Array.isArray(listas)) return res.status(400).json({error:'Faltan las listas'});
   // El código de lista es único en toda la base: nunca pisar la lista de otra tienda
   const {rows:ajenas}=await pool.query('SELECT id FROM listas_precio WHERE id = ANY($1::text[]) AND tenant_id<>$2', [listas.map(l=>String(l&&l.id||'')), req.tenantId]);
   if(ajenas.length) return res.status(409).json({error:`El código de lista "${ajenas[0].id}" ya está en uso. Elegí otro.`});
-  for(const l of listas){ await pool.query('INSERT INTO listas_precio (id,nombre,multiplicador,modo,color,compra_minima,promo_msg,tenant_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (id) DO UPDATE SET nombre=$2,multiplicador=$3,modo=$4,color=$5,compra_minima=$6,promo_msg=$7 WHERE listas_precio.tenant_id=EXCLUDED.tenant_id', [l.id,l.nombre,l.multiplicador,l.modo||'porcentaje',l.color||'#2563eb',l.compra_minima||0,l.promo_msg||'', req.tenantId]); } res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+  for(const l of listas){ await pool.query('INSERT INTO listas_precio (id,nombre,multiplicador,modo,color,compra_minima,promo_msg,tenant_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (id) DO UPDATE SET nombre=$2,multiplicador=$3,modo=$4,color=$5,compra_minima=$6,promo_msg=$7 WHERE listas_precio.tenant_id=EXCLUDED.tenant_id', [l.id,l.nombre,l.multiplicador,l.modo||'porcentaje',l.color||'#2563eb',l.compra_minima||0,l.promo_msg||'', req.tenantId]); } res.json({ok:true}); }catch(e){ fallo(res,e); } });
 app.post('/api/listas', authPerm('listas'), requiereFeature('listas_precio'), async (req,res)=>{ try{ const l=req.body; const {rows:ya}=await pool.query('SELECT 1 FROM listas_precio WHERE id=$1', [String(l.id||'')]); if(ya[0]) return res.status(409).json({error:'Ese código de lista ya está en uso. Elegí otro.'}); const {rows}=await pool.query('INSERT INTO listas_precio (id,nombre,multiplicador,modo,color,compra_minima,promo_msg,tenant_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *', [l.id,l.nombre,l.multiplicador||1,l.modo||'porcentaje',l.color||'#2563eb',l.compra_minima||0,l.promo_msg||'', req.tenantId]); res.json(rows[0]); }catch(e){ res.status(400).json({error:e.message}); } });
-app.put('/api/listas/:id', authPerm('listas'), requiereFeature('listas_precio'), async (req,res)=>{ try{ const l=req.body; await pool.query('UPDATE listas_precio SET nombre=$1,multiplicador=$2,modo=$3,color=$4,compra_minima=$5,promo_msg=$6 WHERE id=$7 AND tenant_id=$8', [l.nombre,l.multiplicador,l.modo,l.color,l.compra_minima||0,l.promo_msg||'',req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
-app.delete('/api/listas/:id', authPerm('listas'), requiereFeature('listas_precio'), async (req,res)=>{ try{ await pool.query('DELETE FROM listas_precio WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.put('/api/listas/:id', authPerm('listas'), requiereFeature('listas_precio'), async (req,res)=>{ try{ const l=req.body; await pool.query('UPDATE listas_precio SET nombre=$1,multiplicador=$2,modo=$3,color=$4,compra_minima=$5,promo_msg=$6 WHERE id=$7 AND tenant_id=$8', [l.nombre,l.multiplicador,l.modo,l.color,l.compra_minima||0,l.promo_msg||'',req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ fallo(res,e); } });
+app.delete('/api/listas/:id', authPerm('listas'), requiereFeature('listas_precio'), async (req,res)=>{ try{ await pool.query('DELETE FROM listas_precio WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ fallo(res,e); } });
 
 // SECCIONES V4 con ignorar_stock
-app.get('/api/secciones', async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM secciones WHERE tenant_id=$1 ORDER BY orden, id', [req.tenantId]); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
-app.get('/api/secciones/:id', async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM secciones WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); if(!rows[0]) return res.status(404).json({error:'No encontrada'}); res.json(rows[0]); }catch(e){ res.status(500).json({error:e.message}); } });
+app.get('/api/secciones', async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM secciones WHERE tenant_id=$1 ORDER BY orden, id', [req.tenantId]); res.json(rows); }catch(e){ fallo(res,e); } });
+app.get('/api/secciones/:id', async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM secciones WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); if(!rows[0]) return res.status(404).json({error:'No encontrada'}); res.json(rows[0]); }catch(e){ fallo(res,e); } });
 app.put('/api/secciones/:id', authPerm('config'), async (req,res)=>{
   try{
     const {nombre,slug,descripcion,imagen,requiere_aprobacion,visible,orden,ignorar_stock,cp_origen,permitir_sin_stock,aviso_titulo,aviso}=req.body;
@@ -1706,7 +1796,7 @@ app.put('/api/secciones/:id', authPerm('config'), async (req,res)=>{
     _secRestrCache.delete(String(req.tenantId));
     await pool.query('UPDATE secciones SET nombre=$1,slug=$2,descripcion=$3,imagen=$4,requiere_aprobacion=$5,visible=$6,orden=$7,ignorar_stock=$8,cp_origen=$9,permitir_sin_stock=$10,aviso_titulo=COALESCE($13,aviso_titulo),aviso=COALESCE($14,aviso) WHERE id=$11 AND tenant_id=$12', [nombre,slug,descripcion,imagen,requiere_aprobacion,visible,orden||0,ignorar_stock||false,cp_origen||'1888',permitir_sin_stock||false,req.params.id, req.tenantId, typeof aviso_titulo==='string'?aviso_titulo.slice(0,200):null, typeof aviso==='string'?aviso.slice(0,3000):null]);
     res.json({ok:true});
-  }catch(e){ res.status(500).json({error:e.message}); }
+  }catch(e){ fallo(res,e); }
 });
 app.post('/api/secciones', authPerm('config'), async (req,res)=>{
   try{
@@ -1730,7 +1820,7 @@ app.get('/api/stock-bajo', authPerm('productos'), async (req,res)=>{
       WHERE p.tenant_id=$1 AND p.stock_minimo>0 AND p.stock<=p.stock_minimo AND p.permitir_sin_stock=false AND p.es_digital=false
       ORDER BY p.stock ASC LIMIT 100`, [req.tenantId]);
     res.json(rows);
-  }catch(e){ res.status(500).json({error:e.message}); }
+  }catch(e){ fallo(res,e); }
 });
 // Contar productos/pedidos de una sección (para borrado seguro)
 app.get('/api/secciones/:id/stats', authPerm('config'), async (req,res)=>{
@@ -1738,7 +1828,7 @@ app.get('/api/secciones/:id/stats', authPerm('config'), async (req,res)=>{
     const {rows:prod}=await pool.query('SELECT COUNT(*)::int as n FROM productos WHERE seccion_id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]);
     const {rows:ped}=await pool.query('SELECT COUNT(*)::int as n FROM pedidos WHERE seccion_id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]);
     res.json({ productos: prod[0].n, pedidos: ped[0].n });
-  }catch(e){ res.status(500).json({error:e.message}); }
+  }catch(e){ fallo(res,e); }
 });
 // Borrado SEGURO: opción mover_a (mueve productos/pedidos a otra sección) o borrar_productos
 app.delete('/api/secciones/:id', authPerm('config'), async (req,res)=>{
@@ -1760,7 +1850,7 @@ app.delete('/api/secciones/:id', authPerm('config'), async (req,res)=>{
     }
     await pool.query('DELETE FROM secciones WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]);
     res.json({ok:true});
-  }catch(e){ res.status(500).json({error:e.message}); }
+  }catch(e){ fallo(res,e); }
 });
 
 // UPLOAD
@@ -1806,7 +1896,7 @@ app.post('/api/upload', authPermAlguno(['config','productos']), upload.single('i
     const name=uuidv4()+ext;
     fs.writeFileSync(path.join(uploadsDir,name), req.file.buffer);
     return res.json({url:`/uploads/${name}`});
-  }catch(e){ res.status(500).json({error:e.message}); }
+  }catch(e){ fallo(res,e); }
 });
 app.post('/api/upload-base64', authPermAlguno(['config','productos']), async (req,res)=>{
   try{
@@ -1826,7 +1916,7 @@ app.post('/api/upload-base64', authPermAlguno(['config','productos']), async (re
       fs.writeFileSync(path.join(uploadsDir,name), buffer);
       return res.json({url:`/uploads/${name}`});
     }
-  }catch(e){ res.status(500).json({error:e.message}); }
+  }catch(e){ fallo(res,e); }
 });
 
 // POST /api/productos/rehost-imagenes — mueve a Cloudinary las imágenes que aún apuntan a rxzweb.com
@@ -1871,7 +1961,7 @@ app.post('/api/productos/rehost-imagenes', authPerm('productos'), async (req,res
        LEFT JOIN producto_imagenes pi ON pi.producto_id=p.id AND pi.tenant_id=p.tenant_id
        WHERE p.tenant_id=$1 AND (p.imagen ILIKE '%rxzweb%' OR pi.url ILIKE '%rxzweb%')`, [t]);
     res.json({ ok:true, migradas, fallidas, restantes: (rest[0] && rest[0].n) || 0, detalle: detalle.length?detalle:undefined });
-  }catch(e){ res.status(500).json({error:e.message}); }
+  }catch(e){ fallo(res,e); }
 });
 
 // PRODUCTOS V4 con permitir_sin_stock y es_digital
@@ -1892,7 +1982,7 @@ app.get('/api/productos/relacionados/:id', optionalAuth, async (req,res)=>{
       rows=[...rows, ...extra];
     }
     res.json(limpiarSiPublico(req, await sinRestringidas(req, await ocultarPreciosAprobacion(req, rows), { conservarConAcceso: true })));
-  }catch(e){ res.status(500).json({error:e.message}); }
+  }catch(e){ fallo(res,e); }
 });
 // Recibir la preventa: pasa el cupo al stock físico, descuenta lo reservado, desactiva preventa
 app.post('/api/productos/:id/recibir-preventa', authPerm('productos'), async (req,res)=>{
@@ -1910,7 +2000,7 @@ app.post('/api/productos/:id/recibir-preventa', authPerm('productos'), async (re
     const aStock = Math.max(0, cantidadRecibida - reservado);
     await pool.query('UPDATE productos SET stock = stock + $1, es_preventa=false, preventa_cupo=0, preventa_reservado=0, preventa_descuento_pct=0 WHERE id=$2 AND tenant_id=$3', [aStock, req.params.id, req.tenantId]);
     res.json({ ok:true, sumado_a_stock: aStock, reservas_tomadas: reservado, recibido: cantidadRecibida });
-  }catch(e){ res.status(500).json({error:e.message}); }
+  }catch(e){ fallo(res,e); }
 });
 // Consultar reservado real (para mostrar en el form antes de recibir)
 app.get('/api/productos/:id/reservado-real', authPerm('productos'), async (req,res)=>{
@@ -1919,7 +2009,7 @@ app.get('/api/productos/:id/reservado-real', authPerm('productos'), async (req,r
       FROM pedido_items pi JOIN pedidos p ON pi.pedido_id=p.id
       WHERE pi.producto_id=$1 AND p.tenant_id=$2 AND p.tipo='pedido' AND LOWER(COALESCE(p.estado,'')) NOT IN ('cancelado','anulado','rechazado')`, [req.params.id, req.tenantId]);
     res.json({ reservado: Number(rows[0].reservado)||0 });
-  }catch(e){ res.status(500).json({error:e.message}); }
+  }catch(e){ fallo(res,e); }
 });
 // Búsqueda sin importar tildes ni mayúsculas ("estacion" encuentra "Estación")
 const SQL_SIN_ACENTOS = (expr) => `translate(lower(${expr}), 'áàäâãéèëêíìïîóòöôõúùüûñç', 'aaaaaeeeeiiiiooooouuuunc')`;
@@ -1989,7 +2079,7 @@ app.get('/api/productos/ofertas', optionalAuth, async (req,res)=>{
         ORDER BY CASE WHEN p.precio_oferta>0 AND p.precio_oferta<p.precio_base THEN 1 - p.precio_oferta/NULLIF(p.precio_base,0) ELSE 0 END DESC, p.created_at DESC
         LIMIT $4`, [t, ids, cats, lim]);
     res.json(limpiarSiPublico(req, await sinRestringidas(req, rows)));
-  }catch(e){ res.status(500).json({error:e.message}); }
+  }catch(e){ fallo(res,e); }
 });
 app.get('/api/productos/preventa', optionalAuth, async (req,res)=>{
   try{
@@ -2000,7 +2090,7 @@ app.get('/api/productos/preventa', optionalAuth, async (req,res)=>{
     q+=' ORDER BY p.preventa_fecha ASC NULLS LAST, p.created_at DESC LIMIT 30';
     const {rows}=await pool.query(q, params);
     res.json(limpiarSiPublico(req, await sinRestringidas(req, await ocultarPreciosAprobacion(req, rows))));
-  }catch(e){ res.status(500).json({error:e.message}); }
+  }catch(e){ fallo(res,e); }
 });
 app.get('/api/productos/novedades', optionalAuth, async (req,res)=>{
   try{
@@ -2011,7 +2101,7 @@ app.get('/api/productos/novedades', optionalAuth, async (req,res)=>{
     q+=` ORDER BY p.created_at DESC LIMIT ${Math.min(Number(limit)||12, 30)}`;
     const {rows}=await pool.query(q, params);
     res.json(limpiarSiPublico(req, await sinRestringidas(req, await ocultarPreciosAprobacion(req, rows))));
-  }catch(e){ res.status(500).json({error:e.message}); }
+  }catch(e){ fallo(res,e); }
 });
 app.get('/api/productos', optionalAuth, async (req,res)=>{
   try{
@@ -2051,9 +2141,9 @@ app.get('/api/productos', optionalAuth, async (req,res)=>{
     }
     if(!esAdminReq) result=result.map(limpiarProducto);
     res.json({productos:result, total, page:pagN, totalPages:Math.ceil(total/limN)});
-  }catch(e){ res.status(500).json({error:e.message}); }
+  }catch(e){ fallo(res,e); }
 });
-app.get('/api/categorias', optionalAuth, async (req,res)=>{ try{ const {seccion_id}=req.query; if(seccion_id && (await seccionesRestringidas(req.tenantId)).includes(parseInt(seccion_id,10)) && !(await accesoMayorista(req))) return res.json([]); let q='SELECT DISTINCT categoria FROM productos WHERE visible=true AND tenant_id=$1'; const params=[req.tenantId]; if(seccion_id){ q+=' AND seccion_id=$2'; params.push(seccion_id); } else { const restr=await seccionesRestringidas(req.tenantId); if(restr.length && !(await accesoMayorista(req))){ q+=' AND NOT (seccion_id = ANY($2::int[]))'; params.push(restr); } } q+=' ORDER BY categoria'; const {rows}=await pool.query(q, params); res.json(rows.map(r=>r.categoria).filter(Boolean)); }catch(e){ res.status(500).json({error:e.message}); } });
+app.get('/api/categorias', optionalAuth, async (req,res)=>{ try{ const {seccion_id}=req.query; if(seccion_id && (await seccionesRestringidas(req.tenantId)).includes(parseInt(seccion_id,10)) && !(await accesoMayorista(req))) return res.json([]); let q='SELECT DISTINCT categoria FROM productos WHERE visible=true AND tenant_id=$1'; const params=[req.tenantId]; if(seccion_id){ q+=' AND seccion_id=$2'; params.push(seccion_id); } else { const restr=await seccionesRestringidas(req.tenantId); if(restr.length && !(await accesoMayorista(req))){ q+=' AND NOT (seccion_id = ANY($2::int[]))'; params.push(restr); } } q+=' ORDER BY categoria'; const {rows}=await pool.query(q, params); res.json(rows.map(r=>r.categoria).filter(Boolean)); }catch(e){ fallo(res,e); } });
 
 // Categorías con metadata (orden, visible, conteo) — para el ABM del panel
 app.get('/api/categorias/admin', authPerm('productos'), async (req,res)=>{
@@ -2071,7 +2161,7 @@ app.get('/api/categorias/admin', authPerm('productos'), async (req,res)=>{
     meta.forEach(m=>{ if(!catSet.has(m.categoria)) result.push({ nombre:m.categoria, cantidad:0, orden:(m.orden??999), visible:(m.visible!==false), min_unidades:Number(m.min_unidades)||0, min_unidad:m.min_unidad||'' }); });
     result.sort((a,b)=> a.orden-b.orden || a.nombre.localeCompare(b.nombre));
     res.json(result);
-  }catch(e){ res.status(500).json({error:e.message}); }
+  }catch(e){ fallo(res,e); }
 });
 // Crear categoría manual (queda en meta hasta que se le asignen productos)
 app.post('/api/categorias/crear', authPerm('productos'), async (req,res)=>{
@@ -2084,7 +2174,7 @@ app.post('/api/categorias/crear', authPerm('productos'), async (req,res)=>{
     if(ex.length || exM.length) return res.status(400).json({error:'Esa categoría ya existe'});
     await pool.query('INSERT INTO categorias_meta (tenant_id, categoria, orden, visible) VALUES ($2, $1, 0, true) ON CONFLICT DO NOTHING', [n, req.tenantId]);
     res.json({ok:true, nombre:n});
-  }catch(e){ res.status(500).json({error:e.message}); }
+  }catch(e){ fallo(res,e); }
 });
 // Renombrar / reasignar en masa: mueve todos los productos de una categoría a otra
 app.post('/api/categorias/renombrar', authPerm('productos'), async (req,res)=>{
@@ -2096,7 +2186,7 @@ app.post('/api/categorias/renombrar', authPerm('productos'), async (req,res)=>{
     const r=await pool.query(q, params);
     await pool.query('UPDATE categorias_meta SET categoria=$1 WHERE categoria=$2 AND tenant_id=$3', [hasta, desde, req.tenantId]).catch(()=>{});
     res.json({ok:true, afectados:r.rowCount});
-  }catch(e){ res.status(500).json({error:e.message}); }
+  }catch(e){ fallo(res,e); }
 });
 // Reasignar en masa un conjunto de productos a una categoría
 app.post('/api/categorias/reasignar', authPerm('productos'), async (req,res)=>{
@@ -2105,7 +2195,7 @@ app.post('/api/categorias/reasignar', authPerm('productos'), async (req,res)=>{
     if(!Array.isArray(producto_ids) || !producto_ids.length || !categoria) return res.status(400).json({error:'Faltan datos'});
     const r=await pool.query('UPDATE productos SET categoria=$1 WHERE id = ANY($2) AND tenant_id=$3', [categoria, producto_ids, req.tenantId]);
     res.json({ok:true, afectados:r.rowCount});
-  }catch(e){ res.status(500).json({error:e.message}); }
+  }catch(e){ fallo(res,e); }
 });
 // Guardar orden y visibilidad de categorías
 // ── Páginas de categoría para Google: /categoria/<slug> ──
@@ -2137,7 +2227,7 @@ app.get('/api/categorias-info', async (req,res)=>{
     const lista = Object.values(grupos).map(({ _max, ...g }) => ({ ...g, titulo: g.titulo || tituloCat(g.nombre) })).sort((a, b) => b.productos - a.productos);
     res.set('Cache-Control', 'public, max-age=300');
     res.json(lista);
-  }catch(e){ res.status(500).json({error:e.message}); }
+  }catch(e){ fallo(res,e); }
 });
 app.post('/api/categorias/seo', authPerm('productos'), async (req,res)=>{
   try{
@@ -2146,7 +2236,7 @@ app.post('/api/categorias/seo', authPerm('productos'), async (req,res)=>{
     const titulo = String(req.body?.titulo || '').trim().slice(0, 200), descripcion = String(req.body?.descripcion || '').trim().slice(0, 3000);
     await pool.query(`INSERT INTO categorias_meta (tenant_id, categoria, titulo, descripcion, orden) VALUES ($1,$2,$3,$4,999) ON CONFLICT (tenant_id, categoria) DO UPDATE SET titulo=$3, descripcion=$4`, [req.tenantId, nombre, titulo, descripcion]);
     res.json({ok:true});
-  }catch(e){ res.status(500).json({error:e.message}); }
+  }catch(e){ fallo(res,e); }
 });
 // Compra mínima por categoría: N unidades sumando cualquier producto de la categoría (0 = sin mínimo)
 app.post('/api/categorias/minimo', authPerm('productos'), async (req,res)=>{
@@ -2159,14 +2249,14 @@ app.post('/api/categorias/minimo', authPerm('productos'), async (req,res)=>{
     await pool.query(`INSERT INTO categorias_meta (tenant_id, categoria, orden, visible, min_unidades, min_unidad) VALUES ($1,$2,999,true,$3,$4)
       ON CONFLICT (tenant_id, categoria) DO UPDATE SET min_unidades=$3, min_unidad=$4`, [req.tenantId, nombre, min, unidad]);
     res.json({ok:true, min_unidades:min, min_unidad:unidad});
-  }catch(e){ res.status(500).json({error:e.message}); }
+  }catch(e){ fallo(res,e); }
 });
 app.get('/api/categorias-minimos', async (req,res)=>{
   try{
     const {rows} = await pool.query('SELECT categoria, min_unidades AS minimo, min_unidad AS unidad FROM categorias_meta WHERE tenant_id=$1 AND min_unidades>1', [req.tenantId]);
     res.set('Cache-Control', 'public, max-age=60');
     res.json(rows.map(r => ({ categoria:r.categoria, minimo:Number(r.minimo), unidad:r.unidad || 'unidades' })));
-  }catch(e){ res.status(500).json({error:e.message}); }
+  }catch(e){ fallo(res,e); }
 });
 // ==== PROGRAMA DE PROFES (panel, cuenta del cliente y academia) ====
 const pctONull = (v) => { if (v === null || v === undefined || String(v).trim() === '') return null; const n = parseFloat(String(v).replace(',', '.')); return Number.isFinite(n) ? Math.max(0, Math.min(100, Math.round(n * 100) / 100)) : null; };
@@ -2195,14 +2285,14 @@ app.get('/api/profes', authPerm('usuarios'), async (req,res)=>{
     const {rows}=await pool.query(`SELECT p.*, u.nombre AS usuario_nombre, u.email AS usuario_email, u.usuario AS usuario_usuario, ${PROFE_STATS}
       FROM profes p LEFT JOIN usuarios u ON u.id=p.usuario_id WHERE p.tenant_id=$1 ORDER BY p.activo DESC, LOWER(COALESCE(NULLIF(p.nombre,''), u.nombre, ''))`, [req.tenantId]);
     res.json(rows);
-  }catch(e){ res.status(500).json({error:e.message}); }
+  }catch(e){ fallo(res,e); }
 });
 app.get('/api/profes/config', authPerm('usuarios'), async (req,res)=>{
   try{
     const cfg=await configProfes(req.tenantId);
     const {rows:cats}=await pool.query('SELECT categoria, profe_pct_alumno AS pct_alumno, profe_pct_profe AS pct_profe FROM categorias_meta WHERE tenant_id=$1 AND (profe_pct_alumno IS NOT NULL OR profe_pct_profe IS NOT NULL) ORDER BY categoria', [req.tenantId]);
     res.json({ ...cfg, categorias: cats, integracion: !!process.env.INTEGRACION_SECRET });
-  }catch(e){ res.status(500).json({error:e.message}); }
+  }catch(e){ fallo(res,e); }
 });
 app.put('/api/profes/config', authPerm('usuarios'), async (req,res)=>{
   try{
@@ -2215,7 +2305,7 @@ app.put('/api/profes/config', authPerm('usuarios'), async (req,res)=>{
     };
     for(const [k,v] of Object.entries(upd)) await pool.query("INSERT INTO configuracion (tenant_id,clave,valor) VALUES ($1,$2,$3) ON CONFLICT (tenant_id,clave) DO UPDATE SET valor=$3", [req.tenantId,k,v]);
     res.json({ok:true});
-  }catch(e){ res.status(500).json({error:e.message}); }
+  }catch(e){ fallo(res,e); }
 });
 // % propio de una categoría (vacío = usa el del profe o el general; 0 = no aplica en esa categoría)
 app.post('/api/profes/categoria', authPerm('usuarios'), async (req,res)=>{
@@ -2226,7 +2316,7 @@ app.post('/api/profes/categoria', authPerm('usuarios'), async (req,res)=>{
     await pool.query(`INSERT INTO categorias_meta (tenant_id, categoria, orden, visible, profe_pct_alumno, profe_pct_profe) VALUES ($1,$2,999,true,$3,$4)
       ON CONFLICT (tenant_id, categoria) DO UPDATE SET profe_pct_alumno=$3, profe_pct_profe=$4`, [req.tenantId, nombre, a, p]);
     res.json({ok:true});
-  }catch(e){ res.status(500).json({error:e.message}); }
+  }catch(e){ fallo(res,e); }
 });
 async function datosProfe(req, b, id){
   const codigo=codigoProfe(b.codigo);
@@ -2268,7 +2358,7 @@ app.get('/api/profes/:id/detalle', authPerm('usuarios'), async (req,res)=>{
         FROM pedidos pe LEFT JOIN usuarios u ON u.id=pe.usuario_id WHERE pe.profe_id=$1 AND pe.tenant_id=$2 ORDER BY pe.created_at DESC LIMIT 200`, [req.params.id, req.tenantId]),
     ]);
     res.json({ alumnos: al.rows, movimientos: mov.rows, pedidos: ped.rows });
-  }catch(e){ res.status(500).json({error:e.message}); }
+  }catch(e){ fallo(res,e); }
 });
 app.post('/api/profes/:id/alumnos', authPerm('usuarios'), async (req,res)=>{
   try{
@@ -2280,11 +2370,11 @@ app.post('/api/profes/:id/alumnos', authPerm('usuarios'), async (req,res)=>{
     const {rows:u}=await pool.query('SELECT id, nombre FROM usuarios WHERE tenant_id=$1 AND LOWER(email)=$2 LIMIT 1', [req.tenantId, email]);
     const r=await vincularAlumno(pool, req.tenantId, pf[0].id, { email, usuario_id:u[0]?.id, nombre:req.body?.nombre||u[0]?.nombre||'', origen:'manual', meses:req.body?.meses||cfg.meses, renovar:true });
     res.json(r||{ok:true});
-  }catch(e){ res.status(500).json({error:e.message}); }
+  }catch(e){ fallo(res,e); }
 });
 app.delete('/api/profes/:id/alumnos/:aid', authPerm('usuarios'), async (req,res)=>{
   try{ await pool.query('DELETE FROM profe_alumnos a USING profes p WHERE a.id=$1 AND a.profe_id=p.id AND p.id=$2 AND p.tenant_id=$3', [req.params.aid, req.params.id, req.tenantId]); res.json({ok:true}); }
-  catch(e){ res.status(500).json({error:e.message}); }
+  catch(e){ fallo(res,e); }
 });
 app.post('/api/profes/:id/ajuste', authPerm('usuarios'), async (req,res)=>{
   try{
@@ -2294,7 +2384,7 @@ app.post('/api/profes/:id/ajuste', authPerm('usuarios'), async (req,res)=>{
     if(!pf[0]) return res.status(404).json({error:'No encontrado'});
     await pool.query("INSERT INTO profe_movimientos (tenant_id,profe_id,tipo,monto,detalle) VALUES ($1,$2,'ajuste',$3,$4)", [req.tenantId, pf[0].id, monto, String(req.body?.detalle||'Ajuste manual').slice(0,300)]);
     res.json({ok:true});
-  }catch(e){ res.status(500).json({error:e.message}); }
+  }catch(e){ fallo(res,e); }
 });
 // Cuenta del cliente: su programa de profe (si es profe) y su beneficio de alumno (si está vinculado)
 app.get('/api/profes/mi', auth(), async (req,res)=>{
@@ -2323,7 +2413,7 @@ app.get('/api/profes/mi', auth(), async (req,res)=>{
         compras:ped.rows, movimientos:mov.rows };
     }
     res.json({ profe, beneficio });
-  }catch(e){ res.status(500).json({error:e.message}); }
+  }catch(e){ fallo(res,e); }
 });
 // La academia avisa que un alumno confirmó un curso con un profe: queda vinculado (o se renueva) por N meses.
 // Se autentica con INTEGRACION_SECRET (la misma variable en la tienda y en la academia).
@@ -2345,7 +2435,7 @@ app.post('/api/profes/academia/vincular', async (req,res)=>{
     const link=await vincularAlumno(pool, req.tenantId, pf[0].id, { email, usuario_id:u[0]?.id, nombre:req.body?.nombre||'', origen:'academia', curso:req.body?.curso||'', meses:cfg.meses, desde:req.body?.desde||null, renovar:true });
     if(!link) return res.json({ok:true, vinculado:false, motivo:'vencido'});
     res.json({ ok:true, vinculado:true, codigo:pf[0].codigo, profe:pf[0].nombre||pf[0].usuario_nombre||'', pct_alumno: pf[0].pct_alumno!=null?Number(pf[0].pct_alumno):cfg.pct_alumno, vence:link?.vence||null, tiendas: await nombresSecciones(req.tenantId, cfg.secciones) });
-  }catch(e){ res.status(500).json({error:e.message}); }
+  }catch(e){ fallo(res,e); }
 });
 app.post('/api/categorias/meta', authPerm('productos'), async (req,res)=>{
   try{
@@ -2355,7 +2445,7 @@ app.post('/api/categorias/meta', authPerm('productos'), async (req,res)=>{
         ON CONFLICT (tenant_id, categoria) DO UPDATE SET orden=$2, visible=$3`, [c.nombre, c.orden||0, c.visible!==false, req.tenantId]);
     }
     res.json({ok:true});
-  }catch(e){ res.status(500).json({error:e.message}); }
+  }catch(e){ fallo(res,e); }
 });
 app.post('/api/productos', authPerm('productos'), async (req,res)=>{
   try{
@@ -2363,7 +2453,7 @@ app.post('/api/productos', authPerm('productos'), async (req,res)=>{
     const {rows}=await pool.query(`INSERT INTO productos (tenant_id,seccion_id,categoria,modelo,nombre,precio_base,precio_original,stock,stock_minimo,imagen,notas,compatibilidad,descripcion,sku,tipo,moneda,precio_oferta,envio_gratis,visible,peso,alto,ancho,largo,permitir_sin_stock,es_digital,marca,es_preventa,preventa_precio,preventa_fecha,preventa_mostrar_fecha,preventa_descuento_pct,preventa_cupo,excluir_envio_gratis) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33) RETURNING *`,
       [req.tenantId, p.seccion_id, p.categoria||'', p.modelo||'', p.nombre||'', p.precio_base||0, p.precio_original||0, p.stock||0, p.stock_minimo||0, p.imagen||'', p.notas||'', p.compatibilidad||'', p.descripcion||'', p.sku||'', p.tipo||'fisico', p.moneda||'ARS', p.precio_oferta||0, p.envio_gratis||false, p.visible!==false, p.peso||0, p.alto||0, p.ancho||0, p.largo||0, p.permitir_sin_stock||false, p.es_digital||false, p.marca||'', p.es_preventa||false, p.preventa_precio||0, p.preventa_fecha||null, p.preventa_mostrar_fecha||false, p.preventa_descuento_pct||0, p.preventa_cupo||0, !!p.excluir_envio_gratis]);
     res.json(rows[0]);
-  }catch(e){ res.status(500).json({error:e.message}); }
+  }catch(e){ fallo(res,e); }
 });
 app.post('/api/productos/:id/duplicar', authPerm('productos'), async (req,res)=>{
   const client=await pool.connect();
@@ -2397,7 +2487,7 @@ app.post('/api/productos/:id/duplicar', authPerm('productos'), async (req,res)=>
     for(const f of pf){ await client.query('INSERT INTO precios_fijos (tenant_id,producto_id,lista_precio_id,precio_fijo) VALUES ($1,$2,$3,$4) ON CONFLICT (producto_id,lista_precio_id) DO NOTHING', [t, nuevo.id, f.lista_precio_id, f.precio_fijo]); }
     await client.query('COMMIT');
     res.json(nuevo);
-  }catch(e){ await client.query('ROLLBACK').catch(()=>{}); res.status(500).json({error:e.message}); }
+  }catch(e){ await client.query('ROLLBACK').catch(()=>{}); fallo(res,e); }
   finally{ client.release(); }
 });
 app.put('/api/productos/:id', authPerm('productos'), async (req,res)=>{
@@ -2420,7 +2510,7 @@ app.put('/api/productos/:id', authPerm('productos'), async (req,res)=>{
     // Evita que un guardado con imagen vacía (en edición se oculta el recuadro viejo) borre la foto.
     await syncImagenPrincipal(req.params.id, req.tenantId);
     res.json({ok:true});
-  }catch(e){ res.status(500).json({error:e.message}); }
+  }catch(e){ fallo(res,e); }
 });
 app.delete('/api/productos/:id', authPerm('productos'), async (req,res)=>{
   try{
@@ -2436,7 +2526,7 @@ app.delete('/api/productos/:id', authPerm('productos'), async (req,res)=>{
     const r=await pool.query('DELETE FROM productos WHERE id=$1 AND tenant_id=$2', [id, tid]);
     if(r.rowCount===0) return res.status(404).json({error:'Producto no encontrado'});
     res.json({ok:true});
-  }catch(e){ res.status(500).json({error:e.message}); }
+  }catch(e){ fallo(res,e); }
 });
 // Importación masiva desde Excel. Se manda por partes (lotes) desde el panel.
 // Los productos existentes se buscan SOLO dentro de la sección destino (antes buscaba en toda la tienda
@@ -2555,10 +2645,10 @@ app.post('/api/productos/bulk', authPerm('productos'), async (req,res)=>{
       }catch(e){ fallo(e, p); }
     }
     res.json({ok:true, modo: modo || 'crear_actualizar', insertados, actualizados, saltados, errores, primer_error: primerError || undefined});
-  }catch(e){ res.status(500).json({error:e.message}); }
+  }catch(e){ fallo(res,e); }
 });
-app.delete('/api/categorias/:categoria', authPerm('productos'), async (req,res)=>{ try{ const {mover_a}=req.query; const destino = mover_a || 'Sin categoría'; const r=await pool.query('UPDATE productos SET categoria=$1 WHERE categoria=$2 AND tenant_id=$3', [destino, req.params.categoria, req.tenantId]); await pool.query('DELETE FROM categorias_meta WHERE categoria=$1 AND tenant_id=$2', [req.params.categoria, req.tenantId]).catch(()=>{}); res.json({ok:true, movidos:r.rowCount, destino}); }catch(e){ res.status(500).json({error:e.message}); } });
-app.delete('/api/productos/all', authPerm('productos'), async (req,res)=>{ try{ await pool.query('DELETE FROM productos WHERE tenant_id=$1', [req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.delete('/api/categorias/:categoria', authPerm('productos'), async (req,res)=>{ try{ const {mover_a}=req.query; const destino = mover_a || 'Sin categoría'; const r=await pool.query('UPDATE productos SET categoria=$1 WHERE categoria=$2 AND tenant_id=$3', [destino, req.params.categoria, req.tenantId]); await pool.query('DELETE FROM categorias_meta WHERE categoria=$1 AND tenant_id=$2', [req.params.categoria, req.tenantId]).catch(()=>{}); res.json({ok:true, movidos:r.rowCount, destino}); }catch(e){ fallo(res,e); } });
+app.delete('/api/productos/all', authPerm('productos'), async (req,res)=>{ try{ await pool.query('DELETE FROM productos WHERE tenant_id=$1', [req.tenantId]); res.json({ok:true}); }catch(e){ fallo(res,e); } });
 
 // ═══════════════════════════════════════════════════════════════
 // BOT DE DROPSHIPPING — sync desde el proveedor (rxzweb)
@@ -2598,7 +2688,7 @@ app.get('/api/bot/fotos-externas', botAuth, async (req, res) => {
        LEFT JOIN producto_imagenes pi ON pi.producto_id=p.id AND pi.tenant_id=p.tenant_id
        WHERE p.tenant_id=$1 AND (p.imagen ILIKE $2 OR pi.url ILIKE $2)`, [t, patron]);
     res.json({ ok: true, total: rows.length, productos: (np[0] && np[0].n) || 0, urls: rows.map(r => r.url) });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { fallo(res, e); }
 });
 
 // POST /api/bot/foto — el bot manda una foto que bajó del proveedor (multipart: imagen + origen).
@@ -2636,7 +2726,7 @@ app.post('/api/bot/foto', botAuth, (req, res, next) => uploadBot.single('imagen'
     const a = await pool.query('UPDATE productos SET imagen=$1 WHERE tenant_id=$2 AND imagen=$3', [nueva, t, origen]);
     const b = await pool.query('UPDATE producto_imagenes SET url=$1 WHERE tenant_id=$2 AND url=$3', [nueva, t, origen]);
     res.json({ ok: true, url: nueva, reemplazos: a.rowCount + b.rowCount });
-  } catch (e) { res.status(500).json({ error: String(e.message || e).slice(0, 200) }); }
+  } catch (e) { fallo(res, e); }
 });
 
 // POST /api/bot/sync — recibe un lote de productos del proveedor y hace upsert por SKU.
@@ -2764,7 +2854,7 @@ app.post('/api/bot/sync', botAuth, async (req, res) => {
 
     res.json({ ok: true, seccion_id: secId, total: productos.length, insertados, actualizados, sin_cambios: sinCambios, cambios_precio: cambiosPrecio, cambios_stock: cambiosStock, cambios_costo: cambiosCosto, sin_stock: sinStock, con_stock: conStock, errores, nuevos, ocultos: ocultarNuevos, primer_error: primerError || undefined, detalles: detalles.length ? detalles : undefined });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    fallo(res, e);
   }
 });
 
@@ -2809,7 +2899,7 @@ app.post('/api/bot/limpiar-deposito', botAuth, async (req, res) => {
     }
 
     res.json({ ok: true, seccion_id: secId, borrados, total_previo: total, conservados_en_pedidos: usados.size });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { fallo(res, e); }
 });
 
 // POST /api/bot/deduplicar — elimina productos duplicados por SKU (deja el de menor id).
@@ -2846,7 +2936,7 @@ app.post('/api/bot/deduplicar', botAuth, async (req, res) => {
     res.json({ ok: true, grupos_afectados, borrados });
   } catch (e) {
     await client.query('ROLLBACK').catch(()=>{});
-    res.status(500).json({ error: e.message });
+    fallo(res, e);
   } finally {
     client.release();
   }
@@ -2911,7 +3001,7 @@ app.post('/api/bot/fotos-por-nombre', botAuth, async (req, res) => {
       sin_match: sinMatch, aplicados,
       ejemplos_sin_match: noMatch.length ? noMatch.slice(0, 30) : undefined
     });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { fallo(res, e); }
 });
 
 // Productos nuevos del proveedor que esperan aprobación (ocultos hasta que Leandro los publique por Telegram)
@@ -2922,7 +3012,7 @@ app.get('/api/bot/pendientes', botAuth, async (req, res) => {
       `SELECT id, sku, nombre, imagen, categoria, CASE WHEN precio_oferta>0 THEN precio_oferta ELSE precio_base END AS precio
          FROM productos WHERE tenant_id=$1 AND pendiente_aprobacion=true AND visible=false ORDER BY id DESC LIMIT 300`, [t]);
     res.json({ ok: true, total: rows.length, productos: rows });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { fallo(res, e); }
 });
 // POST /api/bot/aprobar — { skus:[...] | todos:true, publicar:true|false }. publicar=false los deja ocultos y sale de pendientes.
 app.post('/api/bot/aprobar', botAuth, async (req, res) => {
@@ -2936,7 +3026,7 @@ app.post('/api/bot/aprobar', botAuth, async (req, res) => {
       ? await pool.query('UPDATE productos SET visible=$1, pendiente_aprobacion=false WHERE tenant_id=$2 AND pendiente_aprobacion=true RETURNING sku, nombre', [publicar, t])
       : await pool.query('UPDATE productos SET visible=$1, pendiente_aprobacion=false WHERE tenant_id=$2 AND UPPER(sku) = ANY($3) RETURNING sku, nombre', [publicar, t, skus]);
     res.json({ ok: true, afectados: r.rowCount, productos: r.rows.slice(0, 50) });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { fallo(res, e); }
 });
 
 app.get('/api/bot/skus', botAuth, async (req, res) => {
@@ -2945,7 +3035,7 @@ app.get('/api/bot/skus', botAuth, async (req, res) => {
     // Con categoría (el bot no marca "caídos" de categorías excluidas) y costo (referencia para precios raros)
     const { rows } = await pool.query("SELECT sku, stock, categoria, costo_proveedor FROM productos WHERE tenant_id=$1 AND sku LIKE 'RXZ-%'", [t]);
     res.json({ ok: true, skus: rows });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { fallo(res, e); }
 });
 
 // POST /api/bot/stock-cero — pone stock 0 a una lista de SKU (los que se cayeron del proveedor)
@@ -2956,7 +3046,7 @@ app.post('/api/bot/stock-cero', botAuth, async (req, res) => {
     if (!Array.isArray(skus) || !skus.length) return res.json({ ok: true, afectados: 0 });
     const r = await pool.query("UPDATE productos SET stock=0 WHERE tenant_id=$1 AND sku = ANY($2)", [t, skus]);
     res.json({ ok: true, afectados: r.rowCount });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { fallo(res, e); }
 });
 // ── Vigilancia del bot ─────────────────────────────────────────────────────────
 // El bot manda un latido en cada vuelta. Si deja de llegar (caído, trabado o sin crédito en Railway),
@@ -2979,7 +3069,7 @@ app.get('/api/bot/ajustes', botAuth, async (req, res) => {
     const { rows } = await pool.query("SELECT valor FROM configuracion WHERE tenant_id=$1 AND clave='_bot_ajustes'", [req.botTenantId]);
     let ajustes = {}; try { ajustes = rows[0] ? JSON.parse(rows[0].valor || '{}') : {}; } catch {}
     res.json({ ok: true, ajustes });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { fallo(res, e); }
 });
 app.put('/api/bot/ajustes', botAuth, async (req, res) => {
   try {
@@ -2991,7 +3081,7 @@ app.put('/api/bot/ajustes', botAuth, async (req, res) => {
     if (typeof a.aprobar_nuevos === 'boolean') limpio.aprobar_nuevos = a.aprobar_nuevos;
     await pool.query("INSERT INTO configuracion (tenant_id,clave,valor) VALUES ($1,'_bot_ajustes',$2) ON CONFLICT (tenant_id,clave) DO UPDATE SET valor=$2", [req.botTenantId, JSON.stringify(limpio)]);
     res.json({ ok: true });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { fallo(res, e); }
 });
 app.post('/api/bot/latido', botAuth, async (req, res) => {
   const t = req.botTenantId;
@@ -3008,7 +3098,7 @@ app.post('/api/bot/latido', botAuth, async (req, res) => {
       [t, !!b.scraping_activo, ciclo, datos, String(b.tg_token || '').slice(0, 200), String(b.tg_chat || '').slice(0, 50), nombre]);
     if (prev[0] && prev[0].alerta_at) avisarTelegramBot(t, `✅ *[${nombre}] El bot volvió a andar*\nEstuvo ${durTxt(minsDesde(prev[0].actualizado_at))} sin dar señales.`).catch(() => {});
     res.json({ ok: true });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { fallo(res, e); }
 });
 // Monitor externo (healthchecks.io): cada 5 min avisa "estoy vivo" si la base responde.
 // Si deja de llegar (Railway caído o sin crédito), healthchecks.io avisa por Telegram desde afuera.
@@ -3051,9 +3141,9 @@ app.get('/api/bot/vendidos', botAuth, async (req, res) => {
         AND COALESCE(p.is_test,false)=false AND COALESCE(p.tipo,'pedido')='pedido' AND LOWER(COALESCE(p.estado,'')) NOT IN ('cancelado','anulado')
       GROUP BY pr.sku ORDER BY unidades DESC LIMIT 500`, [t, dias]);
     res.json({ ok: true, dias, productos: rows });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { fallo(res, e); }
 });
-app.get('/api/productos/buscar', optionalAuth, async (req,res)=>{ try{ const {q}=req.query; if(!q) return res.json([]); const toks=String(q).trim().split(/\s+/).filter(Boolean).slice(0,8); const campos=`(coalesce(p.nombre,'')||' '||coalesce(p.modelo,'')||' '||coalesce(p.categoria,'')||' '||coalesce(p.marca,'')||' '||coalesce(p.sku,'')||' '||coalesce(p.compatibilidad,'')||' '||coalesce(p.descripcion,''))`; const cond=[]; const params=[req.tenantId]; let pi=2; for(const tk of toks){ cond.push(`${SQL_SIN_ACENTOS(campos)} LIKE $${pi}`); params.push(tokenBusqueda(tk)); pi++; } const whereTok=cond.length?(' AND '+cond.join(' AND ')):''; const {rows}=await pool.query(`SELECT p.id,p.nombre,p.modelo,p.categoria,p.precio_base,p.precio_oferta,p.stock,p.imagen,p.sku,p.codigo_barras,p.seccion_id,p.permitir_sin_stock,p.es_digital,p.usa_variantes,${sqlDesde('p')},s.nombre as seccion_nombre,s.color as seccion_color FROM productos p LEFT JOIN secciones s ON p.seccion_id=s.id WHERE p.tenant_id=$1${whereTok}${esStaffReq(req)?'':' AND p.visible=true'} ORDER BY p.stock DESC NULLS LAST, p.nombre LIMIT 100`, params); res.json(esStaffReq(req) ? rows : (await sinRestringidas(req, rows, { conservarConAcceso: true })).map(limpiarProducto)); }catch(e){ res.status(500).json({error:e.message}); } });
+app.get('/api/productos/buscar', optionalAuth, async (req,res)=>{ try{ const {q}=req.query; if(!q) return res.json([]); const toks=String(q).trim().split(/\s+/).filter(Boolean).slice(0,8); const campos=`(coalesce(p.nombre,'')||' '||coalesce(p.modelo,'')||' '||coalesce(p.categoria,'')||' '||coalesce(p.marca,'')||' '||coalesce(p.sku,'')||' '||coalesce(p.compatibilidad,'')||' '||coalesce(p.descripcion,''))`; const cond=[]; const params=[req.tenantId]; let pi=2; for(const tk of toks){ cond.push(`${SQL_SIN_ACENTOS(campos)} LIKE $${pi}`); params.push(tokenBusqueda(tk)); pi++; } const whereTok=cond.length?(' AND '+cond.join(' AND ')):''; const {rows}=await pool.query(`SELECT p.id,p.nombre,p.modelo,p.categoria,p.precio_base,p.precio_oferta,p.stock,p.imagen,p.sku,p.codigo_barras,p.seccion_id,p.permitir_sin_stock,p.es_digital,p.usa_variantes,${sqlDesde('p')},s.nombre as seccion_nombre,s.color as seccion_color FROM productos p LEFT JOIN secciones s ON p.seccion_id=s.id WHERE p.tenant_id=$1${whereTok}${esStaffReq(req)?'':' AND p.visible=true'} ORDER BY p.stock DESC NULLS LAST, p.nombre LIMIT 100`, params); res.json(esStaffReq(req) ? rows : (await sinRestringidas(req, rows, { conservarConAcceso: true })).map(limpiarProducto)); }catch(e){ fallo(res,e); } });
 // Buscar producto por código de barras/SKU exacto (para el escáner). Devuelve 1 producto.
 app.get('/api/productos/por-codigo/:codigo', optionalAuth, async (req,res)=>{
   try{
@@ -3064,7 +3154,7 @@ app.get('/api/productos/por-codigo/:codigo', optionalAuth, async (req,res)=>{
     if(!rows[0] || (!esStaffReq(req) && rows[0].visible===false)) return res.status(404).json({error:'No se encontró ningún producto con ese código'});
     if(!esStaffReq(req) && (await sinRestringidas(req, rows, { conservarConAcceso: true })).length===0) return res.status(404).json({error:'No se encontró ningún producto con ese código'});
     res.json(esStaffReq(req) ? rows[0] : limpiarProducto(rows[0]));
-  }catch(e){ res.status(500).json({error:e.message}); }
+  }catch(e){ fallo(res,e); }
 });
 // Generar código de barras automático para productos que no tienen (basado en ID). Opcional: seccion_id
 app.post('/api/productos/generar-codigos', authPerm('productos'), async (req,res)=>{
@@ -3081,9 +3171,9 @@ app.post('/api/productos/generar-codigos', authPerm('productos'), async (req,res
       generados++;
     }
     res.json({ok:true, generados});
-  }catch(e){ res.status(500).json({error:e.message}); }
+  }catch(e){ fallo(res,e); }
 });
-app.get('/api/productos/id/:id', optionalAuth, async (req,res)=>{ try{ if(!/^\d{1,9}$/.test(String(req.params.id))) return res.status(404).json({error:'No encontrado'}); const {rows}=await pool.query(`SELECT *, ${sqlDesde('productos')} FROM productos WHERE id=$1 AND tenant_id=$2`, [req.params.id, req.tenantId]); if(!rows[0] || (!esStaffReq(req) && rows[0].visible===false)) return res.status(404).json({error:'No encontrado'}); if(!esStaffReq(req) && (await sinRestringidas(req, rows, { conservarConAcceso: true })).length===0) return res.status(404).json({error:'Este producto es solo para clientes mayoristas autorizados'}); if(esStaffReq(req)) return res.json(rows[0]); const [r]=await ocultarPreciosAprobacion(req, rows); res.json(limpiarProducto(r)); }catch(e){ res.status(500).json({error:e.message}); } });
+app.get('/api/productos/id/:id', optionalAuth, async (req,res)=>{ try{ if(!/^\d{1,9}$/.test(String(req.params.id))) return res.status(404).json({error:'No encontrado'}); const {rows}=await pool.query(`SELECT *, ${sqlDesde('productos')} FROM productos WHERE id=$1 AND tenant_id=$2`, [req.params.id, req.tenantId]); if(!rows[0] || (!esStaffReq(req) && rows[0].visible===false)) return res.status(404).json({error:'No encontrado'}); if(!esStaffReq(req) && (await sinRestringidas(req, rows, { conservarConAcceso: true })).length===0) return res.status(404).json({error:'Este producto es solo para clientes mayoristas autorizados'}); if(esStaffReq(req)) return res.json(rows[0]); const [r]=await ocultarPreciosAprobacion(req, rows); res.json(limpiarProducto(r)); }catch(e){ fallo(res,e); } });
 
 // Validar presupuesto antes de convertir: chequear stock y precios actuales
 app.post('/api/pedidos/:id/validar-conversion', authPerm('pedidos'), async (req,res)=>{
@@ -3101,7 +3191,7 @@ app.post('/api/pedidos/:id/validar-conversion', authPerm('pedidos'), async (req,
       if(Number(prod.precio_base)!==Number(it.precio_unitario)) cambios.push({item:it.nombre_producto, tipo:'precio', detalle:`Precio actual: ${prod.precio_base}, presupuesto: ${it.precio_unitario}`, precio_actual:prod.precio_base, precio_presup:it.precio_unitario});
     });
     res.json({ok:true, cambios, tiene_cambios:cambios.length>0});
-  }catch(e){ res.status(500).json({error:e.message}); }
+  }catch(e){ fallo(res,e); }
 });
 
 // IMAGENES y VARIANTES (igual que antes)
@@ -3111,10 +3201,10 @@ async function syncImagenPrincipal(productoId, tenantId){
     await pool.query(`UPDATE productos SET imagen = COALESCE((SELECT url FROM producto_imagenes WHERE producto_id=$1 AND tenant_id=$2 ORDER BY orden ASC, id ASC LIMIT 1), imagen) WHERE id=$1 AND tenant_id=$2`, [productoId, tenantId]);
   }catch(e){ console.log('sync img principal warn', e.message.slice(0,80)); }
 }
-app.get('/api/producto-imagenes/:producto_id', optionalAuth, async (req,res)=>{ try{ const b=await bloqueoProductoPublico(req, req.params.producto_id); if(b) return res.status(b.status).json({error:b.error}); const {rows}=await pool.query('SELECT * FROM producto_imagenes WHERE producto_id=$1 AND tenant_id=$2 ORDER BY orden', [req.params.producto_id, req.tenantId]); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
-app.post('/api/producto-imagenes', authPerm('productos'), async (req,res)=>{ try{ const {producto_id,url,orden}=req.body; if(!url||!String(url).trim()) return res.status(400).json({error:'Falta la URL de la imagen'}); const {rows:pp}=await pool.query('SELECT 1 FROM productos WHERE id=$1 AND tenant_id=$2', [producto_id, req.tenantId]); if(!pp[0]) return res.status(404).json({error:'Producto no encontrado'}); const {rows}=await pool.query('INSERT INTO producto_imagenes (tenant_id,producto_id,url,orden) VALUES ($4,$1,$2,$3) RETURNING *', [producto_id,url,orden||0, req.tenantId]); await syncImagenPrincipal(producto_id, req.tenantId); res.json(rows[0]); }catch(e){ res.status(500).json({error:e.message}); } });
-app.delete('/api/producto-imagenes/:id', authPerm('productos'), async (req,res)=>{ try{ const {rows:pv}=await pool.query('SELECT producto_id FROM producto_imagenes WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); await pool.query('DELETE FROM producto_imagenes WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); if(pv[0]) await syncImagenPrincipal(pv[0].producto_id, req.tenantId); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
-app.put('/api/producto-imagenes/reorder', authPerm('productos'), async (req,res)=>{ try{ const {items}=req.body; for(const it of items){ await pool.query('UPDATE producto_imagenes SET orden=$1 WHERE id=$2 AND tenant_id=$3', [it.orden,it.id, req.tenantId]); } if(items&&items[0]){ const {rows:pv}=await pool.query('SELECT producto_id FROM producto_imagenes WHERE id=$1 AND tenant_id=$2', [items[0].id, req.tenantId]); if(pv[0]) await syncImagenPrincipal(pv[0].producto_id, req.tenantId); } res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.get('/api/producto-imagenes/:producto_id', optionalAuth, async (req,res)=>{ try{ const b=await bloqueoProductoPublico(req, req.params.producto_id); if(b) return res.status(b.status).json({error:b.error}); const {rows}=await pool.query('SELECT * FROM producto_imagenes WHERE producto_id=$1 AND tenant_id=$2 ORDER BY orden', [req.params.producto_id, req.tenantId]); res.json(rows); }catch(e){ fallo(res,e); } });
+app.post('/api/producto-imagenes', authPerm('productos'), async (req,res)=>{ try{ const {producto_id,url,orden}=req.body; if(!url||!String(url).trim()) return res.status(400).json({error:'Falta la URL de la imagen'}); const {rows:pp}=await pool.query('SELECT 1 FROM productos WHERE id=$1 AND tenant_id=$2', [producto_id, req.tenantId]); if(!pp[0]) return res.status(404).json({error:'Producto no encontrado'}); const {rows}=await pool.query('INSERT INTO producto_imagenes (tenant_id,producto_id,url,orden) VALUES ($4,$1,$2,$3) RETURNING *', [producto_id,url,orden||0, req.tenantId]); await syncImagenPrincipal(producto_id, req.tenantId); res.json(rows[0]); }catch(e){ fallo(res,e); } });
+app.delete('/api/producto-imagenes/:id', authPerm('productos'), async (req,res)=>{ try{ const {rows:pv}=await pool.query('SELECT producto_id FROM producto_imagenes WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); await pool.query('DELETE FROM producto_imagenes WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); if(pv[0]) await syncImagenPrincipal(pv[0].producto_id, req.tenantId); res.json({ok:true}); }catch(e){ fallo(res,e); } });
+app.put('/api/producto-imagenes/reorder', authPerm('productos'), async (req,res)=>{ try{ const {items}=req.body; for(const it of items){ await pool.query('UPDATE producto_imagenes SET orden=$1 WHERE id=$2 AND tenant_id=$3', [it.orden,it.id, req.tenantId]); } if(items&&items[0]){ const {rows:pv}=await pool.query('SELECT producto_id FROM producto_imagenes WHERE id=$1 AND tenant_id=$2', [items[0].id, req.tenantId]); if(pv[0]) await syncImagenPrincipal(pv[0].producto_id, req.tenantId); } res.json({ok:true}); }catch(e){ fallo(res,e); } });
 // Un producto que el visitante no puede ver (oculto, o de una tienda con aprobación sin acceso) tampoco expone sus variantes ni sus precios
 async function bloqueoProductoPublico(req, pid){
   const {rows}=await pool.query('SELECT id,seccion_id,visible FROM productos WHERE id=$1 AND tenant_id=$2', [pid, req.tenantId]);
@@ -3124,10 +3214,10 @@ async function bloqueoProductoPublico(req, pid){
   if((await sinRestringidas(req, rows, { conservarConAcceso: true })).length===0) return { status:404, error:'Este producto es solo para clientes mayoristas autorizados' };
   return null;
 }
-app.get('/api/variantes/:producto_id', optionalAuth, async (req,res)=>{ try{ const b=await bloqueoProductoPublico(req, req.params.producto_id); if(b) return res.status(b.status).json({error:b.error}); const {rows}=await pool.query('SELECT * FROM variantes WHERE producto_id=$1 AND tenant_id=$2 ORDER BY id', [req.params.producto_id, req.tenantId]); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
-app.post('/api/variantes', authPerm('productos'), async (req,res)=>{ try{ const {producto_id,nombre,valor,stock,precio_extra,precio}=req.body; if(!(await productoDeTienda(pool, req.tenantId, producto_id))) return res.status(404).json({error:'Producto no encontrado'}); const {rows}=await pool.query('INSERT INTO variantes (tenant_id,producto_id,nombre,valor,stock,precio_extra,precio) VALUES ($7,$1,$2,$3,$4,$5,$6) RETURNING *', [producto_id,nombre,valor||'',stock||0,precio_extra||0,precio||0, req.tenantId]); res.json(rows[0]); }catch(e){ res.status(500).json({error:e.message}); } });
-app.put('/api/variantes/:id', authPerm('productos'), async (req,res)=>{ try{ const v=req.body; const r=await pool.query('UPDATE variantes SET nombre=$1,valor=$2,stock=$3,precio_extra=$4,precio=$5 WHERE id=$6 AND tenant_id=$7', [v.nombre,v.valor,v.stock||0,v.precio_extra||0,v.precio||0,req.params.id, req.tenantId]); if(!r.rowCount) return res.status(404).json({error:'Variante no encontrada'}); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
-app.delete('/api/variantes/:id', authPerm('productos'), async (req,res)=>{ try{ await pool.query('DELETE FROM variantes WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.get('/api/variantes/:producto_id', optionalAuth, async (req,res)=>{ try{ const b=await bloqueoProductoPublico(req, req.params.producto_id); if(b) return res.status(b.status).json({error:b.error}); const {rows}=await pool.query('SELECT * FROM variantes WHERE producto_id=$1 AND tenant_id=$2 ORDER BY id', [req.params.producto_id, req.tenantId]); res.json(rows); }catch(e){ fallo(res,e); } });
+app.post('/api/variantes', authPerm('productos'), async (req,res)=>{ try{ const {producto_id,nombre,valor,stock,precio_extra,precio}=req.body; if(!(await productoDeTienda(pool, req.tenantId, producto_id))) return res.status(404).json({error:'Producto no encontrado'}); const {rows}=await pool.query('INSERT INTO variantes (tenant_id,producto_id,nombre,valor,stock,precio_extra,precio) VALUES ($7,$1,$2,$3,$4,$5,$6) RETURNING *', [producto_id,nombre,valor||'',stock||0,precio_extra||0,precio||0, req.tenantId]); res.json(rows[0]); }catch(e){ fallo(res,e); } });
+app.put('/api/variantes/:id', authPerm('productos'), async (req,res)=>{ try{ const v=req.body; const r=await pool.query('UPDATE variantes SET nombre=$1,valor=$2,stock=$3,precio_extra=$4,precio=$5 WHERE id=$6 AND tenant_id=$7', [v.nombre,v.valor,v.stock||0,v.precio_extra||0,v.precio||0,req.params.id, req.tenantId]); if(!r.rowCount) return res.status(404).json({error:'Variante no encontrada'}); res.json({ok:true}); }catch(e){ fallo(res,e); } });
+app.delete('/api/variantes/:id', authPerm('productos'), async (req,res)=>{ try{ await pool.query('DELETE FROM variantes WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ fallo(res,e); } });
 
 // ── ATRIBUTOS + VARIANTES COMBINADAS (modelo Empretienda) ──
 // Lee atributos + valores + variantes (combinaciones) de un producto en una sola llamada
@@ -3146,7 +3236,7 @@ app.get('/api/productos/:id/variantes-full', optionalAuth, async (req,res)=>{
     }
     const {rows:variantes}=await pool.query('SELECT id,combinacion,precio,precio_oferta,stock,moneda,sku,orden FROM variantes WHERE producto_id=$1 AND tenant_id=$2 ORDER BY orden,id',[pid,t]);
     res.json({ usa_variantes: !!prod[0].usa_variantes, atributos, variantes });
-  }catch(e){ res.status(500).json({error:e.message}); }
+  }catch(e){ fallo(res,e); }
 });
 
 // Guarda TODO junto: reemplaza atributos, valores y variantes del producto (transaccional)
@@ -3174,7 +3264,7 @@ app.put('/api/productos/:id/variantes-full', authPerm('productos'), async (req,r
     }
     await client.query('COMMIT');
     res.json({ok:true});
-  }catch(e){ await client.query('ROLLBACK').catch(()=>{}); res.status(500).json({error:e.message}); }
+  }catch(e){ await client.query('ROLLBACK').catch(()=>{}); fallo(res,e); }
   finally{ client.release(); }
 });
 
@@ -3193,15 +3283,15 @@ app.post('/api/precios/ajustar', authPerm('productos'), async (req,res)=>{
     const usr = (req.user.usuario||'admin') + ' (ajuste masivo ' + (porcentaje>0?'+':'') + porcentaje + '%' + (categoria?' '+categoria:'') + ')';
     for(const a of antes){ const nuevo = Math.round(Number(a.precio_base) * factor * 100)/100; if(Number(a.precio_base)!==nuevo) await pool.query('INSERT INTO historial_precios (tenant_id,producto_id,precio_anterior,precio_nuevo,usuario) VALUES ($5,$1,$2,$3,$4)', [a.id, a.precio_base, nuevo.toFixed(2), usr, req.tenantId]).catch(()=>{}); }
     res.json({ok:true, ajustados:antes.length});
-  }catch(e){ res.status(500).json({error:e.message}); }
+  }catch(e){ fallo(res,e); }
 });
 app.post('/api/precios/reset', authPerm('productos'), (req,res)=>{ res.status(410).json({error:'Esta opción ya no está disponible. Usá el historial de precios del producto.'}); });
-app.get('/api/historial-precios', authPerm('productos'), async (req,res)=>{ try{ const {rows}=await pool.query('SELECT h.*, p.nombre, p.modelo, p.categoria FROM historial_precios h LEFT JOIN productos p ON h.producto_id=p.id AND p.tenant_id=h.tenant_id WHERE h.tenant_id=$1 ORDER BY h.created_at DESC LIMIT 200', [req.tenantId]); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
+app.get('/api/historial-precios', authPerm('productos'), async (req,res)=>{ try{ const {rows}=await pool.query('SELECT h.*, p.nombre, p.modelo, p.categoria FROM historial_precios h LEFT JOIN productos p ON h.producto_id=p.id AND p.tenant_id=h.tenant_id WHERE h.tenant_id=$1 ORDER BY h.created_at DESC LIMIT 200', [req.tenantId]); res.json(rows); }catch(e){ fallo(res,e); } });
 
 // ── ÓRDENES DE COMPRA (compras a proveedores) ──
 app.get('/api/ordenes-compra', authPerm('pedidos'), requiereFeature('ordenes_compra'), async (req,res)=>{
   try{ const {rows}=await pool.query('SELECT o.*, s.nombre as seccion_nombre FROM ordenes_compra o LEFT JOIN secciones s ON o.seccion_id=s.id WHERE o.tenant_id=$1 ORDER BY o.created_at DESC LIMIT 200', [req.tenantId]); res.json(rows); }
-  catch(e){ res.status(500).json({error:e.message}); }
+  catch(e){ fallo(res,e); }
 });
 app.get('/api/ordenes-compra/:id', authPerm('pedidos'), requiereFeature('ordenes_compra'), async (req,res)=>{
   try{
@@ -3209,7 +3299,7 @@ app.get('/api/ordenes-compra/:id', authPerm('pedidos'), requiereFeature('ordenes
     if(!o[0]) return res.status(404).json({error:'No encontrada'});
     const {rows:items}=await pool.query("SELECT oi.*, COALESCE(pr.imagen,'') AS imagen FROM orden_compra_items oi LEFT JOIN productos pr ON pr.id=oi.producto_id AND pr.tenant_id=$2 WHERE oi.orden_id=$1 ORDER BY oi.id", [req.params.id, req.tenantId]);
     res.json({ ...o[0], items });
-  }catch(e){ res.status(500).json({error:e.message}); }
+  }catch(e){ fallo(res,e); }
 });
 app.post('/api/ordenes-compra', authPerm('pedidos'), requiereFeature('ordenes_compra'), async (req,res)=>{
   try{
@@ -3219,7 +3309,7 @@ app.post('/api/ordenes-compra', authPerm('pedidos'), requiereFeature('ordenes_co
       await pool.query('INSERT INTO orden_compra_items (orden_id,producto_id,nombre_producto,cantidad,costo_unitario,tenant_id) VALUES ($1,$2,$3,$4,$5,$6)', [rows[0].id, it.producto_id||null, it.nombre_producto||'', it.cantidad||1, it.costo_unitario||0, req.tenantId]);
     }
     res.json(rows[0]);
-  }catch(e){ res.status(500).json({error:e.message}); }
+  }catch(e){ fallo(res,e); }
 });
 // Marcar recibida: SUMA el stock de cada item a los productos
 app.post('/api/ordenes-compra/:id/recibir', authPerm('pedidos'), requiereFeature('ordenes_compra'), async (req,res)=>{
@@ -3237,18 +3327,18 @@ app.post('/api/ordenes-compra/:id/recibir', authPerm('pedidos'), requiereFeature
     }
     await pool.query('UPDATE ordenes_compra SET recibida=true, estado=$1 WHERE id=$2 AND tenant_id=$3', ['recibida', req.params.id, req.tenantId]);
     res.json({ok:true, items_recibidos:items.length});
-  }catch(e){ res.status(500).json({error:e.message}); }
+  }catch(e){ fallo(res,e); }
 });
 app.delete('/api/ordenes-compra/:id', authPerm('pedidos'), requiereFeature('ordenes_compra'), async (req,res)=>{
   try{ await pool.query('DELETE FROM ordenes_compra WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); res.json({ok:true}); }
-  catch(e){ res.status(500).json({error:e.message}); }
+  catch(e){ fallo(res,e); }
 });
 // Precios fijos por lista: el personal ve todos; cada cliente solo los de SU lista (para que la tienda le muestre su precio real)
-app.get('/api/precios-fijos', optionalAuth, async (req,res)=>{ try{ if(!req.user) return res.json([]); const {rows:u}=await pool.query('SELECT rol, permisos, lista_precio_id FROM usuarios WHERE id=$1 AND tenant_id=$2', [req.user.id, req.tenantId]); const me=u[0]; if(!me) return res.json([]); const staff=me.rol==='admin' || (me.rol==='subadmin' && String(me.permisos||'').split(',').includes('productos')); if(staff){ const {rows}=await pool.query('SELECT * FROM precios_fijos WHERE tenant_id=$1', [req.tenantId]); return res.json(rows); } if(!me.lista_precio_id) return res.json([]); const {rows}=await pool.query('SELECT producto_id, lista_precio_id, precio_fijo FROM precios_fijos WHERE tenant_id=$1 AND lista_precio_id=$2', [req.tenantId, me.lista_precio_id]); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
+app.get('/api/precios-fijos', optionalAuth, async (req,res)=>{ try{ if(!req.user) return res.json([]); const {rows:u}=await pool.query('SELECT rol, permisos, lista_precio_id FROM usuarios WHERE id=$1 AND tenant_id=$2', [req.user.id, req.tenantId]); const me=u[0]; if(!me) return res.json([]); const staff=me.rol==='admin' || (me.rol==='subadmin' && String(me.permisos||'').split(',').includes('productos')); if(staff){ const {rows}=await pool.query('SELECT * FROM precios_fijos WHERE tenant_id=$1', [req.tenantId]); return res.json(rows); } if(!me.lista_precio_id) return res.json([]); const {rows}=await pool.query('SELECT producto_id, lista_precio_id, precio_fijo FROM precios_fijos WHERE tenant_id=$1 AND lista_precio_id=$2', [req.tenantId, me.lista_precio_id]); res.json(rows); }catch(e){ fallo(res,e); } });
 app.post('/api/precios-fijos', authPerm('productos'), requiereFeature('listas_precio'), async (req,res)=>{ try{ const {producto_id,lista_precio_id,precio_fijo}=req.body;
   if(!(await productoDeTienda(pool, req.tenantId, producto_id))) return res.status(404).json({error:'Producto no encontrado'});
   const {rows:lp}=await pool.query('SELECT 1 FROM listas_precio WHERE id=$1 AND tenant_id=$2', [lista_precio_id, req.tenantId]); if(!lp[0]) return res.status(404).json({error:'Lista no encontrada'});
-  await pool.query('INSERT INTO precios_fijos (tenant_id,producto_id,lista_precio_id,precio_fijo) VALUES ($4,$1,$2,$3) ON CONFLICT (producto_id,lista_precio_id) DO UPDATE SET precio_fijo=$3 WHERE precios_fijos.tenant_id=EXCLUDED.tenant_id', [producto_id,lista_precio_id,precio_fijo, req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+  await pool.query('INSERT INTO precios_fijos (tenant_id,producto_id,lista_precio_id,precio_fijo) VALUES ($4,$1,$2,$3) ON CONFLICT (producto_id,lista_precio_id) DO UPDATE SET precio_fijo=$3 WHERE precios_fijos.tenant_id=EXCLUDED.tenant_id', [producto_id,lista_precio_id,precio_fijo, req.tenantId]); res.json({ok:true}); }catch(e){ fallo(res,e); } });
 
 // USUARIOS
 app.get('/api/usuarios/:id/cuenta', authPerm('usuarios'), requiereFeature('cuenta_corriente'), async (req,res)=>{
@@ -3256,7 +3346,7 @@ app.get('/api/usuarios/:id/cuenta', authPerm('usuarios'), requiereFeature('cuent
     const {rows:movs}=await pool.query('SELECT cc.*, p.tipo as pedido_tipo FROM cuenta_corriente cc LEFT JOIN pedidos p ON cc.pedido_id=p.id WHERE cc.usuario_id=$1 AND cc.tenant_id=$2 ORDER BY cc.created_at DESC LIMIT 200', [req.params.id, req.tenantId]);
     const saldo=movs.reduce((s,m)=> s + (m.tipo==='cargo' ? Number(m.monto) : -Number(m.monto)), 0);
     res.json({ movimientos: movs, saldo });
-  }catch(e){ res.status(500).json({error:e.message}); }
+  }catch(e){ fallo(res,e); }
 });
 app.post('/api/usuarios/:id/cuenta', authPerm('usuarios'), requiereFeature('cuenta_corriente'), async (req,res)=>{
   try{
@@ -3264,11 +3354,11 @@ app.post('/api/usuarios/:id/cuenta', authPerm('usuarios'), requiereFeature('cuen
     if(!['cargo','pago'].includes(tipo) || !monto) return res.status(400).json({error:'Datos inválidos'});
     const {rows}=await pool.query('INSERT INTO cuenta_corriente (tenant_id,usuario_id,tipo,monto,concepto) VALUES ($5,$1,$2,$3,$4) RETURNING *', [req.params.id, tipo, monto, concepto||'', req.tenantId]);
     res.json(rows[0]);
-  }catch(e){ res.status(500).json({error:e.message}); }
+  }catch(e){ fallo(res,e); }
 });
 app.delete('/api/cuenta-corriente/:id', authPerm('usuarios'), requiereFeature('cuenta_corriente'), async (req,res)=>{
   try{ await pool.query('DELETE FROM cuenta_corriente WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); res.json({ok:true}); }
-  catch(e){ res.status(500).json({error:e.message}); }
+  catch(e){ fallo(res,e); }
 });
 app.get('/api/usuarios/:id/historial', authPerm('usuarios'), async (req,res)=>{
   try{
@@ -3278,7 +3368,7 @@ app.get('/api/usuarios/:id/historial', authPerm('usuarios'), async (req,res)=>{
     const cantPedidos=pedidos.filter(p=>p.tipo==='pedido').length;
     const cantPresup=pedidos.filter(p=>p.tipo==='presupuesto').length;
     res.json({ pedidos, resumen:{ totalGastado, cantPedidos, cantPresup, ultimaCompra: pedidos.find(p=>p.tipo==='pedido')?.created_at || null } });
-  }catch(e){ res.status(500).json({error:e.message}); }
+  }catch(e){ fallo(res,e); }
 });
 app.get('/api/usuarios', authPerm('usuarios'), async (req,res)=>{
   try{
@@ -3296,7 +3386,7 @@ app.get('/api/usuarios', authPerm('usuarios'), async (req,res)=>{
       ) c ON c.usuario_id=u.id
       WHERE u.tenant_id=$1${filtro} ORDER BY u.created_at DESC`, params);
     res.json(rows.map(u=>({...u, password:undefined, reset_codigo:undefined, reset_expira:undefined})));
-  }catch(e){ res.status(500).json({error:e.message}); }
+  }catch(e){ fallo(res,e); }
 });
 app.get('/api/usuarios/pendientes/count', authPerm('usuarios'), async (req,res)=>{ try{ const {rows}=await pool.query("SELECT COUNT(*) FROM usuarios WHERE aprobado=false AND activo=false AND tenant_id=$1", [req.tenantId]); res.json({count:parseInt(rows[0].count)}); }catch{ res.json({count:0}); } });
 // Un sub-admin con permiso "usuarios" puede gestionar clientes, pero NO al equipo (admin/sub-admins):
@@ -3364,9 +3454,9 @@ app.put('/api/usuarios/:id', authPerm('usuarios'), async (req,res)=>{
     params.push(req.params.id); params.push(req.tenantId);
     await pool.query(`UPDATE usuarios SET ${sets.join(',')} WHERE id=$${pi} AND tenant_id=$${pi+1}`, params);
     res.json({ok:true});
-  }catch(e){ res.status(500).json({error:e.message}); }
+  }catch(e){ fallo(res,e); }
 });
-app.post('/api/usuarios/:id/aprobar', authPerm('usuarios'), async (req,res)=>{ try{ const bloqueo=await staffProtegido(req, req.params.id); if(bloqueo) return res.status(403).json({error:bloqueo}); const lp=await listaPrecioValida(req.tenantId, req.body && req.body.lista_precio_id); await pool.query('UPDATE usuarios SET aprobado=true, activo=true, lista_precio_id=$1 WHERE id=$2 AND tenant_id=$3', [lp||null, req.params.id, req.tenantId]); const {rows}=await pool.query('SELECT * FROM usuarios WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); res.json({ok:true, user:sanitizeUser(rows[0])}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.post('/api/usuarios/:id/aprobar', authPerm('usuarios'), async (req,res)=>{ try{ const bloqueo=await staffProtegido(req, req.params.id); if(bloqueo) return res.status(403).json({error:bloqueo}); const lp=await listaPrecioValida(req.tenantId, req.body && req.body.lista_precio_id); await pool.query('UPDATE usuarios SET aprobado=true, activo=true, lista_precio_id=$1 WHERE id=$2 AND tenant_id=$3', [lp||null, req.params.id, req.tenantId]); const {rows}=await pool.query('SELECT * FROM usuarios WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); res.json({ok:true, user:sanitizeUser(rows[0])}); }catch(e){ fallo(res,e); } });
 // Rechazar el pedido de acceso mayorista (la cuenta sigue activa para comprar en la tienda común)
 app.post('/api/usuarios/:id/rechazar-mayorista', authPerm('usuarios'), async (req,res)=>{
   try{
@@ -3374,10 +3464,10 @@ app.post('/api/usuarios/:id/rechazar-mayorista', authPerm('usuarios'), async (re
     const { rows } = await pool.query('UPDATE usuarios SET mayorista_solicitado_at=NULL, mayorista_rechazado_at=NOW() WHERE id=$1 AND tenant_id=$2 AND COALESCE(mayorista,false)=false RETURNING id', [req.params.id, req.tenantId]);
     if(!rows[0]) return res.status(404).json({error:'No encontrado o ya es mayorista'});
     res.json({ ok:true });
-  }catch(e){ res.status(500).json({error:e.message}); }
+  }catch(e){ fallo(res,e); }
 });
-app.post('/api/usuarios/:id/rechazar', authPerm('usuarios'), async (req,res)=>{ try{ const bloqueo=await staffProtegido(req, req.params.id); if(bloqueo) return res.status(403).json({error:bloqueo}); await pool.query('UPDATE usuarios SET activo=false WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
-app.post('/api/usuarios/:id/suspender', authPerm('usuarios'), async (req,res)=>{ try{ const bloqueo=await staffProtegido(req, req.params.id); if(bloqueo) return res.status(403).json({error:bloqueo}); if(String(req.params.id)===String(req.user?.id)) return res.status(400).json({error:'No podés suspender tu propia cuenta'}); const activo=req.body && (req.body.activo===true || req.body.activo==='true'); await pool.query('UPDATE usuarios SET activo=$1 WHERE id=$2 AND tenant_id=$3', [activo, req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.post('/api/usuarios/:id/rechazar', authPerm('usuarios'), async (req,res)=>{ try{ const bloqueo=await staffProtegido(req, req.params.id); if(bloqueo) return res.status(403).json({error:bloqueo}); await pool.query('UPDATE usuarios SET activo=false WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ fallo(res,e); } });
+app.post('/api/usuarios/:id/suspender', authPerm('usuarios'), async (req,res)=>{ try{ const bloqueo=await staffProtegido(req, req.params.id); if(bloqueo) return res.status(403).json({error:bloqueo}); if(String(req.params.id)===String(req.user?.id)) return res.status(400).json({error:'No podés suspender tu propia cuenta'}); const activo=req.body && (req.body.activo===true || req.body.activo==='true'); await pool.query('UPDATE usuarios SET activo=$1 WHERE id=$2 AND tenant_id=$3', [activo, req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ fallo(res,e); } });
 // RESET MEJORADO - codigo largo
 app.post('/api/usuarios/:id/reset-password', authPerm('usuarios'), async (req,res)=>{
   try{
@@ -3387,7 +3477,7 @@ app.post('/api/usuarios/:id/reset-password', authPerm('usuarios'), async (req,re
     await pool.query('UPDATE usuarios SET password=$1, reset_codigo=$2, reset_expira=NOW()+INTERVAL \'24 hours\', sesiones_desde=CASE WHEN id=$5 THEN sesiones_desde ELSE NOW() END WHERE id=$3 AND tenant_id=$4', [hash, codigo, req.params.id, req.tenantId, req.user?.id||0]);
     const {rows}=await pool.query('SELECT nombre,telefono,email FROM usuarios WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]);
     res.json({ok:true, codigo, nombre:rows[0]?.nombre, telefono:rows[0]?.telefono, email:rows[0]?.email});
-  }catch(e){ res.status(500).json({error:e.message}); }
+  }catch(e){ fallo(res,e); }
 });
 // Borrar un cliente: si tiene pedidos reales NO se borra (antes se borraban sus pedidos y se perdía el historial de ventas).
 // Para esos casos está "Suspender". Los pedidos de prueba sí se borran con él. Todo en una transacción.
@@ -3435,9 +3525,9 @@ app.get('/api/pedidos', auth(), async (req,res)=>{
     if(tipo){ where.push(`p.tipo=$${params.length+1}`); params.push(tipo); }
     const {rows}=await pool.query(`SELECT p.*, u.nombre as usuario_nombre, u.telefono as usuario_telefono, u.email as usuario_email, u.nombre_fantasia, s.nombre as seccion_nombre, s.color as seccion_color, pv.moneda as vinculado_moneda, pv.total as vinculado_total FROM pedidos p LEFT JOIN usuarios u ON p.usuario_id=u.id LEFT JOIN secciones s ON p.seccion_id=s.id LEFT JOIN pedidos pv ON pv.id=p.pedido_vinculado AND pv.tenant_id=p.tenant_id WHERE ${where.join(' AND ')} ORDER BY p.created_at DESC, p.id DESC LIMIT 500`, params);
     res.json(rows);
-  }catch(e){ res.status(500).json({error:e.message}); }
+  }catch(e){ fallo(res,e); }
 });
-app.get('/api/pedidos/:id', auth(), async (req,res)=>{ try{ const {rows}=await pool.query('SELECT p.*, u.nombre as usuario_nombre, u.telefono as usuario_telefono, u.email as usuario_email, u.nombre_fantasia, u.direccion as usuario_direccion, s.nombre as seccion_nombre, s.color as seccion_color, pv.moneda as vinculado_moneda, pv.total as vinculado_total FROM pedidos p LEFT JOIN usuarios u ON p.usuario_id=u.id LEFT JOIN secciones s ON p.seccion_id=s.id LEFT JOIN pedidos pv ON pv.id=p.pedido_vinculado AND pv.tenant_id=p.tenant_id WHERE p.id=$1 AND p.tenant_id=$2', [req.params.id, req.tenantId]); if(!rows[0]) return res.status(404).json({error:'No encontrado'}); const staffPed=await esStaffPedidos(req); if(Number(rows[0].usuario_id)!==Number(req.user.id) && !staffPed) return res.status(404).json({error:'No encontrado'}); let {rows:items}=await pool.query("SELECT pi.*, COALESCE(NULLIF(pi.imagen,''), pr.imagen, '') AS imagen, pr.sku AS producto_sku FROM pedido_items pi LEFT JOIN productos pr ON pr.id=pi.producto_id AND pr.tenant_id=pi.tenant_id WHERE pi.pedido_id=$1 AND pi.tenant_id=$2 ORDER BY pi.id", [req.params.id, req.tenantId]); const {rows:pagos}=await pool.query('SELECT * FROM pedido_pagos WHERE pedido_id=$1 AND tenant_id=$2 ORDER BY created_at', [req.params.id, req.tenantId]); if(!staffPed) items=items.map(({costo_unitario, producto_sku, ...it})=>it); res.json({...rows[0], items, pagos}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.get('/api/pedidos/:id', auth(), async (req,res)=>{ try{ const {rows}=await pool.query('SELECT p.*, u.nombre as usuario_nombre, u.telefono as usuario_telefono, u.email as usuario_email, u.nombre_fantasia, u.direccion as usuario_direccion, s.nombre as seccion_nombre, s.color as seccion_color, pv.moneda as vinculado_moneda, pv.total as vinculado_total FROM pedidos p LEFT JOIN usuarios u ON p.usuario_id=u.id LEFT JOIN secciones s ON p.seccion_id=s.id LEFT JOIN pedidos pv ON pv.id=p.pedido_vinculado AND pv.tenant_id=p.tenant_id WHERE p.id=$1 AND p.tenant_id=$2', [req.params.id, req.tenantId]); if(!rows[0]) return res.status(404).json({error:'No encontrado'}); const staffPed=await esStaffPedidos(req); if(Number(rows[0].usuario_id)!==Number(req.user.id) && !staffPed) return res.status(404).json({error:'No encontrado'}); let {rows:items}=await pool.query("SELECT pi.*, COALESCE(NULLIF(pi.imagen,''), pr.imagen, '') AS imagen, pr.sku AS producto_sku FROM pedido_items pi LEFT JOIN productos pr ON pr.id=pi.producto_id AND pr.tenant_id=pi.tenant_id WHERE pi.pedido_id=$1 AND pi.tenant_id=$2 ORDER BY pi.id", [req.params.id, req.tenantId]); const {rows:pagos}=await pool.query('SELECT * FROM pedido_pagos WHERE pedido_id=$1 AND tenant_id=$2 ORDER BY created_at', [req.params.id, req.tenantId]); if(!staffPed) items=items.map(({costo_unitario, producto_sku, ...it})=>it); res.json({...rows[0], items, pagos}); }catch(e){ fallo(res,e); } });
 
 // ═══ PEDIDOS ═══
 // Helpers compartidos: stock (siempre filtrado por tienda) e inserción de ítems.
@@ -3548,7 +3638,25 @@ function errorPedido(res, e){
 }
 
 // Cotiza el carrito: precios, envío por tienda, cupón y totales. Es lo que muestra el carrito y el checkout.
-app.post('/api/carrito/cotizar', optionalAuth, async (req,res)=>{
+// Probar códigos de cupón/profe al azar: cada conexión puede probar hasta 15 códigos DISTINTOS cada 15 minutos.
+// Un código ya probado (por ejemplo el que el cliente tiene aplicado) no vuelve a contar.
+const codigosProbados = new Map(); // ip -> { desde, codigos:Set }
+function limiteCodigos(campo){
+  return (req, res, next) => {
+    const cod = String((req.body && req.body[campo]) || '').trim().toUpperCase().slice(0, 60);
+    if (!cod) return next();
+    const ahora = Date.now(), k = `${req.tenantId}|${req.ip}`;
+    if (codigosProbados.size > 20000) for (const [kk, v] of codigosProbados) if (ahora - v.desde > 15 * 60 * 1000) codigosProbados.delete(kk);
+    let r = codigosProbados.get(k);
+    if (!r || ahora - r.desde > 15 * 60 * 1000) { r = { desde: ahora, codigos: new Set() }; codigosProbados.set(k, r); }
+    if (!r.codigos.has(cod)) {
+      if (r.codigos.size >= 15) return res.status(429).json({ error: 'Probaste demasiados códigos seguidos. Esperá unos minutos e intentá de nuevo.' });
+      r.codigos.add(cod);
+    }
+    next();
+  };
+}
+app.post('/api/carrito/cotizar', optionalAuth, limiteCodigos('cupon'), async (req,res)=>{
   try{
     const cot=await checkout.cotizarCarrito(pool, req.tenantId, req.user?.id, req.body||{}, { cotizacion:true });
     res.json(checkout.publico(cot));
@@ -3815,13 +3923,13 @@ app.get('/api/pedidos/:id/pagos', auth(), async (req,res)=>{
     const {rows:ped}=await pool.query('SELECT usuario_id FROM pedidos WHERE id=$1 AND tenant_id=$2',[req.params.id, req.tenantId]);
     if(!ped[0] || (Number(ped[0].usuario_id)!==Number(req.user.id) && !(await esStaffPedidos(req)))) return res.status(404).json({error:'No encontrado'});
     const {rows}=await pool.query('SELECT * FROM pedido_pagos WHERE pedido_id=$1 AND tenant_id=$2 ORDER BY created_at',[req.params.id, req.tenantId]); res.json(rows); }
-  catch(e){ res.status(500).json({error:e.message}); }
+  catch(e){ fallo(res,e); }
 });
 
 // Historial de cambios del pedido (estado de pago, quién y cuándo) — para auditoría
 app.get('/api/pedidos/:id/historial', authPerm('pedidos'), async (req,res)=>{
   try{ const {rows}=await pool.query('SELECT * FROM pedido_historial WHERE pedido_id=$1 AND tenant_id=$2 ORDER BY created_at DESC',[req.params.id, req.tenantId]); res.json(rows); }
-  catch(e){ res.status(500).json({error:e.message}); }
+  catch(e){ fallo(res,e); }
 });
 app.post('/api/pedidos/:id/pagos', authPerm('pedidos'), async (req,res)=>{
   try{
@@ -3837,7 +3945,7 @@ app.post('/api/pedidos/:id/pagos', authPerm('pedidos'), async (req,res)=>{
     const r=await recalcularEstadoPago(req.params.id);
     await sincronizarProfe(req.params.id).catch(e=>console.log('[profes]', e.message));
     res.json({ok:true, ...r});
-  }catch(e){ res.status(500).json({error:e.message}); }
+  }catch(e){ fallo(res,e); }
 });
 app.delete('/api/pedidos/:id/pagos/:pagoId', authPerm('pedidos'), async (req,res)=>{
   try{
@@ -3847,7 +3955,7 @@ app.delete('/api/pedidos/:id/pagos/:pagoId', authPerm('pedidos'), async (req,res
     const r=await recalcularEstadoPago(req.params.id);
     await sincronizarProfe(req.params.id).catch(e=>console.log('[profes]', e.message));
     res.json({ok:true, ...r});
-  }catch(e){ res.status(500).json({error:e.message}); }
+  }catch(e){ fallo(res,e); }
 });
 
 // Editar un pedido (estado, pago, ítems). Todo en UNA transacción y con el pedido bloqueado:
@@ -3968,7 +4076,7 @@ app.put('/api/pedidos/:id', authPerm('pedidos'), async (req,res)=>{
     if(client) await client.query('ROLLBACK').catch(()=>{});
     if(client){ client.release(); client=null; }
     console.log('[editar pedido]', e.message);
-    return res.status(500).json({error:'No se pudo guardar el pedido: '+e.message});
+    return fallo(res, e, 'No se pudo guardar el pedido');
   }finally{ if(client) client.release(); }
   // Después de confirmar: historial y cupos de preventa (leen lo ya guardado)
   if(historial) pool.query('INSERT INTO pedido_historial (tenant_id,pedido_id,tipo,detalle,usuario_id,usuario_nombre) VALUES ($1,$2,$3,$4,$5,$6)', [req.tenantId, req.params.id, 'estado_pago', historial.detalle, req.user?.id || null, historial.quien]).catch(()=>{});
@@ -3976,8 +4084,8 @@ app.put('/api/pedidos/:id', authPerm('pedidos'), async (req,res)=>{
   await sincronizarProfe(req.params.id).catch(e=>console.log('[profes]', e.message));
   res.json({ok:true});
 });
-app.post('/api/pedidos/:id/archivar', authPerm('pedidos'), async (req,res)=>{ try{ await pool.query('UPDATE pedidos SET archivado=true WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
-app.post('/api/pedidos/:id/desarchivar', authPerm('pedidos'), async (req,res)=>{ try{ await pool.query('UPDATE pedidos SET archivado=false WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.post('/api/pedidos/:id/archivar', authPerm('pedidos'), async (req,res)=>{ try{ await pool.query('UPDATE pedidos SET archivado=true WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ fallo(res,e); } });
+app.post('/api/pedidos/:id/desarchivar', authPerm('pedidos'), async (req,res)=>{ try{ await pool.query('UPDATE pedidos SET archivado=false WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ fallo(res,e); } });
 // Borrar un pedido: devuelve el stock si lo había descontado, quita el cargo de cuenta corriente y el historial.
 // Si tiene pagos registrados no se borra (la plata ya entró a la caja): hay que borrar los pagos primero o cancelarlo.
 app.delete('/api/pedidos/:id', authPerm('pedidos'), async (req,res)=>{
@@ -4017,7 +4125,7 @@ app.delete('/api/pedidos/:id', authPerm('pedidos'), async (req,res)=>{
     await client.query('COMMIT');
   }catch(e){
     if(client){ await client.query('ROLLBACK').catch(()=>{}); client.release(); client=null; }
-    return res.status(500).json({error:'No se pudo borrar el pedido: '+e.message});
+    return fallo(res, e, 'No se pudo borrar el pedido');
   }finally{ if(client) client.release(); }
   for(const pid of preIds) await recalcReservado(pid, req.tenantId);
   res.json({ok:true});
@@ -4037,7 +4145,7 @@ app.get('/api/costos-proveedor', authPerm('config'), async (req,res)=>{
       categorias: cats.map(c => ({ ...c, pct: pctDescProveedor({ ...cfg, marcas: {} }, { categoria: c.categoria === 'Sin categoría' ? '' : c.categoria }) })),
       productos_marca: porMarca, total: prods.length,
     });
-  }catch(e){ res.status(500).json({error:e.message}); }
+  }catch(e){ fallo(res,e); }
 });
 app.put('/api/costos-proveedor', authPerm('config'), async (req,res)=>{
   try{
@@ -4050,7 +4158,7 @@ app.put('/api/costos-proveedor', authPerm('config'), async (req,res)=>{
     await pool.query("INSERT INTO configuracion (tenant_id,clave,valor) VALUES ($1,'_desc_proveedor',$2) ON CONFLICT (tenant_id,clave) DO UPDATE SET valor=$2", [req.tenantId, JSON.stringify(cfg)]);
     const actualizados = await recalcularCostosProveedor(req.tenantId);
     res.json({ ok: true, actualizados });
-  }catch(e){ res.status(500).json({error:e.message}); }
+  }catch(e){ fallo(res,e); }
 });
 
 // REPORTES: más vendidos, ventas por sección, por mes, ganancias
@@ -4068,7 +4176,7 @@ app.get('/api/caja', authPerm('stats'), requiereFeature('caja'), async (req,res)
     const {rows:porMetodoU}=await pool.query(`SELECT COALESCE(NULLIF(pp.metodo,''),'sin método') as metodo, COALESCE(SUM(pp.recibido),0) as recibido, COALESCE(SUM(pp.cuenta_como),0) as saldado ${J} AND p.moneda='USDT' GROUP BY pp.metodo ORDER BY recibido DESC`, params);
     const {rows:ajU}=await pool.query(`SELECT COALESCE(SUM(pp.recibido),0) as total_recibido, COALESCE(SUM(pp.cuenta_como),0) as total_saldado ${J} AND p.moneda='USDT'`, params);
     res.json({ porMetodo, ...aj[0], usdt: { porMetodo: porMetodoU, total_recibido: Number(ajU[0].total_recibido), total_saldado: Number(ajU[0].total_saldado) } });
-  }catch(e){ res.status(500).json({error:e.message}); }
+  }catch(e){ fallo(res,e); }
 });
 
 app.get('/api/reportes', authPerm('stats'), requiereFeature('reportes'), async (req,res)=>{
@@ -4099,7 +4207,7 @@ app.get('/api/reportes', authPerm('stats'), requiereFeature('reportes'), async (
       ganancias: { facturado: Number(g.facturado), costo: Number(g.costo), ganancia: Number(g.facturado)-Number(g.costo) },
       usdt: { facturado: Number(gu.facturado), costo: Number(gu.costo), ganancia: Number(gu.facturado)-Number(gu.costo), unidades: Number(gu.unidades), pedidos: Number(pedU.rows[0].pedidos) }
     });
-  }catch(e){ res.status(500).json({error:e.message}); }
+  }catch(e){ fallo(res,e); }
 });
 
 // Fechas del dashboard en hora de Argentina (la base guarda en la zona del servidor, que en Railway es UTC):
@@ -4189,7 +4297,7 @@ app.get('/api/analytics/visitas', authPerm('stats'), requiereFeature('analytics'
     let nombres={}; if(ids.length){ const {rows}=await pool.query('SELECT id, nombre FROM productos WHERE tenant_id=$1 AND id = ANY($2::int[])', [t, ids]); rows.forEach(r=>nombres[r.id]=r.nombre); }
     paginas.forEach(p=>{ const m=/^\/producto\/.*-(\d+)$/.exec(p.k||''); if(m && nombres[m[1]]) p.nombre=nombres[m[1]]; });
     res.json({ desde, hasta, ...k, tiempo_promedio_seg: tp ? tp.seg : 0, dias, dispositivos: disp, bots, origenes, paginas_top: paginas, busquedas_top: busq, busquedas_sin_resultado: sinRes });
-  }catch(e){ res.status(500).json({error:e.message}); }
+  }catch(e){ fallo(res,e); }
 });
 app.get('/api/stats', authPerm('stats'), async (req,res)=>{
   try{
@@ -4275,7 +4383,7 @@ app.get('/api/stats', authPerm('stats'), async (req,res)=>{
       productos_sin_stock: sinStock.rows[0].n,
       usdt: { total_ventas: parseFloat(u.total||0), pedidos: parseInt(u.pedidos||0), pedidos_pagados: parseInt(u.pagados||0), total_a_cobrar: parseFloat(u.a_cobrar||0) }
     });
-  }catch(e){ res.status(500).json({error:e.message}); }
+  }catch(e){ fallo(res,e); }
 });
 
 // GET /api/stats/detalle?tipo=…&valor=… — lo que hay detrás de cada número del dashboard (mismos filtros que /api/stats).
@@ -4338,12 +4446,12 @@ app.get('/api/stats/detalle', authPerm('stats'), async (req,res)=>{
     const {rows:tot}=await pool.query(`SELECT COUNT(*)::int AS cantidad, COALESCE(SUM(p.total),0) AS total, COALESCE(SUM(${COBR}),0) AS cobrado, COALESCE(SUM(p.total-(${COBR})),0) AS saldo FROM pedidos p WHERE ${w}${extra}`, params);
     const t=tot[0]||{};
     res.json({ modo:'pedidos', filas: rows, resumen:{ cantidad: t.cantidad||0, total: parseFloat(t.total||0), cobrado: parseFloat(t.cobrado||0), saldo: parseFloat(t.saldo||0) } });
-  }catch(e){ res.status(500).json({error:e.message}); }
+  }catch(e){ fallo(res,e); }
 });
 
 // CUPONES, PROMOS, POPUPS, REDES, MENU, DESIGN, PAGOS, PAGINAS, BADGES, ENVIO, BUSQUEDA, SLIDER, FAVORITOS, STOCK, ANDREANI (se mantienen igual + fixes Andreani env)
-app.get('/api/cupones', authPerm('config'), requiereFeature('marketing'), async (req,res)=>{ try{ const {rows}=await pool.query('SELECT c.*, array_agg(cp.producto_id) FILTER (WHERE cp.producto_id IS NOT NULL) as productos_ids FROM cupones c LEFT JOIN cupon_productos cp ON c.id=cp.cupon_id WHERE c.tenant_id=$1 AND c.origen IS DISTINCT FROM \'carrito\' GROUP BY c.id ORDER BY c.created_at DESC', [req.tenantId]); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
-app.post('/api/cupones/validar', optionalAuth, async (req,res)=>{
+app.get('/api/cupones', authPerm('config'), requiereFeature('marketing'), async (req,res)=>{ try{ const {rows}=await pool.query('SELECT c.*, array_agg(cp.producto_id) FILTER (WHERE cp.producto_id IS NOT NULL) as productos_ids FROM cupones c LEFT JOIN cupon_productos cp ON c.id=cp.cupon_id WHERE c.tenant_id=$1 AND c.origen IS DISTINCT FROM \'carrito\' GROUP BY c.id ORDER BY c.created_at DESC', [req.tenantId]); res.json(rows); }catch(e){ fallo(res,e); } });
+app.post('/api/cupones/validar', optionalAuth, limiteCodigos('codigo'), async (req,res)=>{
   try{
     const {codigo,seccion_id,metodo_pago,items}=req.body;
     const ctx=await checkout.contexto(pool, req.tenantId, req.user?.id);
@@ -4353,20 +4461,20 @@ app.post('/api/cupones/validar', optionalAuth, async (req,res)=>{
     res.json(r);
   }catch(e){ if(e instanceof CheckoutError) return res.status(400).json({error:e.message}); res.status(500).json({error:'No se pudo validar el cupón'}); }
 });
-app.post('/api/cupones', authPerm('config'), requiereFeature('marketing'), async (req,res)=>{ try{ const c=req.body; const {rows}=await pool.query('INSERT INTO cupones (codigo,tipo,valor,secciones_ids,categoria,uso_maximo,monto_minimo,metodo_pago,activo,fecha_desde,fecha_hasta,solo_primera_compra,tenant_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *', [c.codigo,c.tipo||'porcentaje',c.valor||0,c.secciones_ids||'',c.categoria||'',c.uso_maximo||0,c.monto_minimo||0,c.metodo_pago||'',c.activo!==false,c.fecha_desde||null,c.fecha_hasta||null,c.solo_primera_compra||false, req.tenantId]); if(c.productos_ids){ for(const pid of c.productos_ids){ await pool.query('INSERT INTO cupon_productos (cupon_id,producto_id,tenant_id) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING', [rows[0].id,pid, req.tenantId]); } } res.json(rows[0]); }catch(e){ res.status(500).json({error:e.message}); } });
+app.post('/api/cupones', authPerm('config'), requiereFeature('marketing'), async (req,res)=>{ try{ const c=req.body; const {rows}=await pool.query('INSERT INTO cupones (codigo,tipo,valor,secciones_ids,categoria,uso_maximo,monto_minimo,metodo_pago,activo,fecha_desde,fecha_hasta,solo_primera_compra,tenant_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *', [c.codigo,c.tipo||'porcentaje',c.valor||0,c.secciones_ids||'',c.categoria||'',c.uso_maximo||0,c.monto_minimo||0,c.metodo_pago||'',c.activo!==false,c.fecha_desde||null,c.fecha_hasta||null,c.solo_primera_compra||false, req.tenantId]); if(c.productos_ids){ for(const pid of c.productos_ids){ await pool.query('INSERT INTO cupon_productos (cupon_id,producto_id,tenant_id) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING', [rows[0].id,pid, req.tenantId]); } } res.json(rows[0]); }catch(e){ fallo(res,e); } });
 app.put('/api/cupones/:id', authPerm('config'), requiereFeature('marketing'), async (req,res)=>{ try{ const c=req.body; await pool.query('UPDATE cupones SET codigo=$1,tipo=$2,valor=$3,secciones_ids=$4,categoria=$5,uso_maximo=$6,monto_minimo=$7,metodo_pago=$8,activo=$9,fecha_desde=$10,fecha_hasta=$11,solo_primera_compra=$12 WHERE id=$13 AND tenant_id=$14', [c.codigo,c.tipo,c.valor,c.secciones_ids||'',c.categoria||'',c.uso_maximo||0,c.monto_minimo||0,c.metodo_pago||'',c.activo!==false,c.fecha_desde||null,c.fecha_hasta||null,c.solo_primera_compra||false,req.params.id, req.tenantId]).then(r=>{ if(!r.rowCount) throw Object.assign(new Error('Cupón no encontrado'),{status:404}); }); await pool.query('DELETE FROM cupon_productos WHERE cupon_id=$1', [req.params.id]); if(Array.isArray(c.productos_ids)){ const propios=await idsProductosDeTienda(pool, req.tenantId, c.productos_ids); for(const pid of propios){ await pool.query('INSERT INTO cupon_productos (cupon_id,producto_id,tenant_id) VALUES ($1,$2,$3)', [req.params.id,pid, req.tenantId]); } } res.json({ok:true}); }catch(e){ res.status(e.status||500).json({error:e.message}); } });
-app.delete('/api/cupones/:id', authPerm('config'), requiereFeature('marketing'), async (req,res)=>{ try{ await pool.query('DELETE FROM cupones WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.delete('/api/cupones/:id', authPerm('config'), requiereFeature('marketing'), async (req,res)=>{ try{ await pool.query('DELETE FROM cupones WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ fallo(res,e); } });
 
 // PROMOCIONES
-app.get('/api/promociones', authPerm('config'), requiereFeature('marketing'), async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM promociones WHERE tenant_id=$1 ORDER BY created_at DESC', [req.tenantId]); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
-app.get('/api/promociones/activas', async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM promociones WHERE tenant_id=$1 AND activo=true AND (fecha_desde IS NULL OR fecha_desde<=CURRENT_DATE) AND (fecha_hasta IS NULL OR fecha_hasta>=CURRENT_DATE)', [req.tenantId]); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
-app.post('/api/promociones', authPerm('config'), requiereFeature('marketing'), async (req,res)=>{ try{ const p=req.body; const {rows}=await pool.query('INSERT INTO promociones (nombre,tipo,valor,secciones_ids,categoria,productos_ids,activo,fecha_desde,fecha_hasta,tenant_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *', [p.nombre,p.tipo,p.valor,p.secciones_ids||'',p.categoria||'',p.productos_ids||'',p.activo!==false,p.fecha_desde||null,p.fecha_hasta||null, req.tenantId]); res.json(rows[0]); }catch(e){ res.status(500).json({error:e.message}); } });
-app.put('/api/promociones/:id', authPerm('config'), requiereFeature('marketing'), async (req,res)=>{ try{ const p=req.body; await pool.query('UPDATE promociones SET nombre=$1,tipo=$2,valor=$3,secciones_ids=$4,categoria=$5,productos_ids=$6,activo=$7,fecha_desde=$8,fecha_hasta=$9 WHERE id=$10 AND tenant_id=$11', [p.nombre,p.tipo,p.valor,p.secciones_ids||'',p.categoria||'',p.productos_ids||'',p.activo!==false,p.fecha_desde||null,p.fecha_hasta||null,req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
-app.delete('/api/promociones/:id', authPerm('config'), requiereFeature('marketing'), async (req,res)=>{ try{ await pool.query('DELETE FROM promociones WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.get('/api/promociones', authPerm('config'), requiereFeature('marketing'), async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM promociones WHERE tenant_id=$1 ORDER BY created_at DESC', [req.tenantId]); res.json(rows); }catch(e){ fallo(res,e); } });
+app.get('/api/promociones/activas', async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM promociones WHERE tenant_id=$1 AND activo=true AND (fecha_desde IS NULL OR fecha_desde<=CURRENT_DATE) AND (fecha_hasta IS NULL OR fecha_hasta>=CURRENT_DATE)', [req.tenantId]); res.json(rows); }catch(e){ fallo(res,e); } });
+app.post('/api/promociones', authPerm('config'), requiereFeature('marketing'), async (req,res)=>{ try{ const p=req.body; const {rows}=await pool.query('INSERT INTO promociones (nombre,tipo,valor,secciones_ids,categoria,productos_ids,activo,fecha_desde,fecha_hasta,tenant_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *', [p.nombre,p.tipo,p.valor,p.secciones_ids||'',p.categoria||'',p.productos_ids||'',p.activo!==false,p.fecha_desde||null,p.fecha_hasta||null, req.tenantId]); res.json(rows[0]); }catch(e){ fallo(res,e); } });
+app.put('/api/promociones/:id', authPerm('config'), requiereFeature('marketing'), async (req,res)=>{ try{ const p=req.body; await pool.query('UPDATE promociones SET nombre=$1,tipo=$2,valor=$3,secciones_ids=$4,categoria=$5,productos_ids=$6,activo=$7,fecha_desde=$8,fecha_hasta=$9 WHERE id=$10 AND tenant_id=$11', [p.nombre,p.tipo,p.valor,p.secciones_ids||'',p.categoria||'',p.productos_ids||'',p.activo!==false,p.fecha_desde||null,p.fecha_hasta||null,req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ fallo(res,e); } });
+app.delete('/api/promociones/:id', authPerm('config'), requiereFeature('marketing'), async (req,res)=>{ try{ await pool.query('DELETE FROM promociones WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ fallo(res,e); } });
 
 // POPUPS, REDES, MENU, DESIGN, METODOS PAGO, PAGINAS, BADGES, ENVIO CONFIG
-app.get('/api/popups', async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM popups WHERE activo=true AND tenant_id=$1 ORDER BY created_at DESC', [req.tenantId]); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
-app.get('/api/popups/all', authPerm('config'), async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM popups WHERE tenant_id=$1 ORDER BY created_at DESC', [req.tenantId]); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
+app.get('/api/popups', async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM popups WHERE activo=true AND tenant_id=$1 ORDER BY created_at DESC', [req.tenantId]); res.json(rows); }catch(e){ fallo(res,e); } });
+app.get('/api/popups/all', authPerm('config'), async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM popups WHERE tenant_id=$1 ORDER BY created_at DESC', [req.tenantId]); res.json(rows); }catch(e){ fallo(res,e); } });
 // Pop-ups: varias imágenes (carrusel). 'imagen' queda como la primera, por compatibilidad.
 const popupImagenes = (p) => {
   const arr = (Array.isArray(p.imagenes) ? p.imagenes : []).map(u => String(u || '').trim()).filter(u => /^(https?:\/\/|\/)/i.test(u)).slice(0, 10);
@@ -4377,51 +4485,51 @@ const popupImagenes = (p) => {
 // (el navegador ignora espacios y saltos dentro del esquema, por eso se sacan antes de revisar)
 function limpiarUrl(u){ const v=String(u==null?'':u).trim(); if(!v) return ''; const compacta=v.replace(/[\u0000-\u0020\u007F]+/g,''); if(/^(javascript|data|vbscript|file|blob):/i.test(compacta)) return ''; return v.slice(0,1000); }
 const sanearLinks=(campos)=>(req,res,next)=>{ const b=req.body||{}; for(const c of campos){ if(b[c]!==undefined) b[c]=limpiarUrl(b[c]); } if(Array.isArray(b.redes)) b.redes=b.redes.map(r=>({...(r||{}), url:limpiarUrl(r&&r.url)})); next(); };
-app.post('/api/popups', authPerm('config'), sanearLinks(['url_destino']), async (req,res)=>{ try{ const p=req.body||{}; const imgs=popupImagenes(p); const {rows}=await pool.query('INSERT INTO popups (titulo,imagen,imagenes,url_destino,secciones_ids,activo,tenant_id) VALUES ($1,$2,$3::jsonb,$4,$5,$6,$7) RETURNING *', [p.titulo||'',imgs[0]||'',JSON.stringify(imgs),p.url_destino||'',p.secciones_ids||'',p.activo!==false, req.tenantId]); res.json(rows[0]); }catch(e){ res.status(500).json({error:e.message}); } });
-app.put('/api/popups/:id', authPerm('config'), sanearLinks(['url_destino']), async (req,res)=>{ try{ const p=req.body||{}; const imgs=popupImagenes(p); await pool.query('UPDATE popups SET titulo=$1,imagen=$2,imagenes=$3::jsonb,url_destino=$4,secciones_ids=$5,activo=$6 WHERE id=$7 AND tenant_id=$8', [p.titulo||'',imgs[0]||'',JSON.stringify(imgs),p.url_destino||'',p.secciones_ids||'',p.activo!==false,req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
-app.delete('/api/popups/:id', authPerm('config'), async (req,res)=>{ try{ await pool.query('DELETE FROM popups WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.post('/api/popups', authPerm('config'), sanearLinks(['url_destino']), async (req,res)=>{ try{ const p=req.body||{}; const imgs=popupImagenes(p); const {rows}=await pool.query('INSERT INTO popups (titulo,imagen,imagenes,url_destino,secciones_ids,activo,tenant_id) VALUES ($1,$2,$3::jsonb,$4,$5,$6,$7) RETURNING *', [p.titulo||'',imgs[0]||'',JSON.stringify(imgs),p.url_destino||'',p.secciones_ids||'',p.activo!==false, req.tenantId]); res.json(rows[0]); }catch(e){ fallo(res,e); } });
+app.put('/api/popups/:id', authPerm('config'), sanearLinks(['url_destino']), async (req,res)=>{ try{ const p=req.body||{}; const imgs=popupImagenes(p); await pool.query('UPDATE popups SET titulo=$1,imagen=$2,imagenes=$3::jsonb,url_destino=$4,secciones_ids=$5,activo=$6 WHERE id=$7 AND tenant_id=$8', [p.titulo||'',imgs[0]||'',JSON.stringify(imgs),p.url_destino||'',p.secciones_ids||'',p.activo!==false,req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ fallo(res,e); } });
+app.delete('/api/popups/:id', authPerm('config'), async (req,res)=>{ try{ await pool.query('DELETE FROM popups WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ fallo(res,e); } });
 
-app.get('/api/redes-sociales', async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM redes_sociales WHERE tenant_id=$1 ORDER BY orden', [req.tenantId]); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
-app.put('/api/redes-sociales', authPerm('config'), sanearLinks([]), async (req,res)=>{ const client=await pool.connect(); try{ const {redes}=req.body; await client.query('BEGIN'); await client.query('DELETE FROM redes_sociales WHERE tenant_id=$1', [req.tenantId]); let orden=0; for(const r of (redes||[])){ if(!r.url || !r.url.trim()) continue; await client.query('INSERT INTO redes_sociales (tipo,url,activo,orden,tenant_id) VALUES ($1,$2,$3,$4,$5)', [r.tipo, r.url.trim(), r.activo!==false, orden++, req.tenantId]); } await client.query('COMMIT'); res.json({ok:true}); }catch(e){ await client.query('ROLLBACK').catch(()=>{}); res.status(500).json({error:e.message}); } finally{ client.release(); } });
+app.get('/api/redes-sociales', async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM redes_sociales WHERE tenant_id=$1 ORDER BY orden', [req.tenantId]); res.json(rows); }catch(e){ fallo(res,e); } });
+app.put('/api/redes-sociales', authPerm('config'), sanearLinks([]), async (req,res)=>{ const client=await pool.connect(); try{ const {redes}=req.body; await client.query('BEGIN'); await client.query('DELETE FROM redes_sociales WHERE tenant_id=$1', [req.tenantId]); let orden=0; for(const r of (redes||[])){ if(!r.url || !r.url.trim()) continue; await client.query('INSERT INTO redes_sociales (tipo,url,activo,orden,tenant_id) VALUES ($1,$2,$3,$4,$5)', [r.tipo, r.url.trim(), r.activo!==false, orden++, req.tenantId]); } await client.query('COMMIT'); res.json({ok:true}); }catch(e){ await client.query('ROLLBACK').catch(()=>{}); fallo(res,e); } finally{ client.release(); } });
 
-app.get('/api/menu', async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM menu_items WHERE visible=true AND tenant_id=$1 ORDER BY orden', [req.tenantId]); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
-app.get('/api/menu/all', authPerm('config'), async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM menu_items WHERE tenant_id=$1 ORDER BY orden', [req.tenantId]); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
-app.post('/api/menu', authPerm('config'), sanearLinks(['url']), async (req,res)=>{ try{ const m=req.body; const {rows}=await pool.query('INSERT INTO menu_items (titulo,url,tipo,visible,orden,seccion_id,tenant_id) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *', [m.titulo,m.url||'',m.tipo||'link',m.visible!==false,m.orden||0,m.seccion_id||null, req.tenantId]); res.json(rows[0]); }catch(e){ res.status(500).json({error:e.message}); } });
-app.put('/api/menu/:id', authPerm('config'), sanearLinks(['url']), async (req,res)=>{ try{ const m=req.body; await pool.query('UPDATE menu_items SET titulo=$1,url=$2,tipo=$3,visible=$4,orden=$5,seccion_id=$6 WHERE id=$7 AND tenant_id=$8', [m.titulo,m.url,m.tipo,m.visible!==false,m.orden||0,m.seccion_id||null,req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
-app.delete('/api/menu/:id', authPerm('config'), async (req,res)=>{ try{ await pool.query('DELETE FROM menu_items WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.get('/api/menu', async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM menu_items WHERE visible=true AND tenant_id=$1 ORDER BY orden', [req.tenantId]); res.json(rows); }catch(e){ fallo(res,e); } });
+app.get('/api/menu/all', authPerm('config'), async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM menu_items WHERE tenant_id=$1 ORDER BY orden', [req.tenantId]); res.json(rows); }catch(e){ fallo(res,e); } });
+app.post('/api/menu', authPerm('config'), sanearLinks(['url']), async (req,res)=>{ try{ const m=req.body; const {rows}=await pool.query('INSERT INTO menu_items (titulo,url,tipo,visible,orden,seccion_id,tenant_id) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *', [m.titulo,m.url||'',m.tipo||'link',m.visible!==false,m.orden||0,m.seccion_id||null, req.tenantId]); res.json(rows[0]); }catch(e){ fallo(res,e); } });
+app.put('/api/menu/:id', authPerm('config'), sanearLinks(['url']), async (req,res)=>{ try{ const m=req.body; await pool.query('UPDATE menu_items SET titulo=$1,url=$2,tipo=$3,visible=$4,orden=$5,seccion_id=$6 WHERE id=$7 AND tenant_id=$8', [m.titulo,m.url,m.tipo,m.visible!==false,m.orden||0,m.seccion_id||null,req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ fallo(res,e); } });
+app.delete('/api/menu/:id', authPerm('config'), async (req,res)=>{ try{ await pool.query('DELETE FROM menu_items WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ fallo(res,e); } });
 
-app.get('/api/design', async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM design_config WHERE tenant_id=$1', [req.tenantId]); const cfg={}; rows.forEach(r=>cfg[r.clave]=r.valor); res.json(cfg); }catch(e){ res.status(500).json({error:e.message}); } });
-app.put('/api/design', authPerm('config'), async (req,res)=>{ try{ for(const [k,v] of Object.entries(req.body)){ await pool.query("INSERT INTO design_config (tenant_id,clave,valor) VALUES ($1,$2,$3) ON CONFLICT (tenant_id,clave) DO UPDATE SET valor=$3", [req.tenantId,k,v]); } res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.get('/api/design', async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM design_config WHERE tenant_id=$1', [req.tenantId]); const cfg={}; rows.forEach(r=>cfg[r.clave]=r.valor); res.json(cfg); }catch(e){ fallo(res,e); } });
+app.put('/api/design', authPerm('config'), async (req,res)=>{ try{ for(const [k,v] of Object.entries(req.body)){ await pool.query("INSERT INTO design_config (tenant_id,clave,valor) VALUES ($1,$2,$3) ON CONFLICT (tenant_id,clave) DO UPDATE SET valor=$3", [req.tenantId,k,v]); } res.json({ok:true}); }catch(e){ fallo(res,e); } });
 
-app.get('/api/metodos-pago', async (req,res)=>{ try{ const {seccion_id}=req.query; let q='SELECT * FROM metodos_pago WHERE activo=true AND tenant_id=$1'; const params=[req.tenantId]; if(seccion_id){ q+=' AND (seccion_id=$2 OR seccion_id IS NULL)'; params.push(seccion_id); } q+=' ORDER BY orden'; const {rows}=await pool.query(q, params); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
-app.get('/api/metodos-pago/all', authPerm('config'), async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM metodos_pago WHERE tenant_id=$1 ORDER BY orden', [req.tenantId]); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
-app.post('/api/metodos-pago', authPerm('config'), async (req,res)=>{ try{ const m=req.body; const {rows}=await pool.query('INSERT INTO metodos_pago (nombre,descripcion,instrucciones,icono,seccion_id,activo,orden,tenant_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *', [m.nombre,m.descripcion||'',m.instrucciones||'',m.icono||'',m.seccion_id||null,m.activo!==false,m.orden||0, req.tenantId]); res.json(rows[0]); }catch(e){ res.status(500).json({error:e.message}); } });
-app.put('/api/metodos-pago/:id', authPerm('config'), async (req,res)=>{ try{ const m=req.body; await pool.query('UPDATE metodos_pago SET nombre=$1,descripcion=$2,instrucciones=$3,icono=$4,seccion_id=$5,activo=$6,orden=$7 WHERE id=$8 AND tenant_id=$9', [m.nombre,m.descripcion,m.instrucciones,m.icono,m.seccion_id,m.activo!==false,m.orden||0,req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
-app.delete('/api/metodos-pago/:id', authPerm('config'), async (req,res)=>{ try{ await pool.query('DELETE FROM metodos_pago WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.get('/api/metodos-pago', async (req,res)=>{ try{ const {seccion_id}=req.query; let q='SELECT * FROM metodos_pago WHERE activo=true AND tenant_id=$1'; const params=[req.tenantId]; if(seccion_id){ q+=' AND (seccion_id=$2 OR seccion_id IS NULL)'; params.push(seccion_id); } q+=' ORDER BY orden'; const {rows}=await pool.query(q, params); res.json(rows); }catch(e){ fallo(res,e); } });
+app.get('/api/metodos-pago/all', authPerm('config'), async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM metodos_pago WHERE tenant_id=$1 ORDER BY orden', [req.tenantId]); res.json(rows); }catch(e){ fallo(res,e); } });
+app.post('/api/metodos-pago', authPerm('config'), async (req,res)=>{ try{ const m=req.body; const {rows}=await pool.query('INSERT INTO metodos_pago (nombre,descripcion,instrucciones,icono,seccion_id,activo,orden,tenant_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *', [m.nombre,m.descripcion||'',m.instrucciones||'',m.icono||'',m.seccion_id||null,m.activo!==false,m.orden||0, req.tenantId]); res.json(rows[0]); }catch(e){ fallo(res,e); } });
+app.put('/api/metodos-pago/:id', authPerm('config'), async (req,res)=>{ try{ const m=req.body; await pool.query('UPDATE metodos_pago SET nombre=$1,descripcion=$2,instrucciones=$3,icono=$4,seccion_id=$5,activo=$6,orden=$7 WHERE id=$8 AND tenant_id=$9', [m.nombre,m.descripcion,m.instrucciones,m.icono,m.seccion_id,m.activo!==false,m.orden||0,req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ fallo(res,e); } });
+app.delete('/api/metodos-pago/:id', authPerm('config'), async (req,res)=>{ try{ await pool.query('DELETE FROM metodos_pago WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ fallo(res,e); } });
 
-app.get('/api/paginas', async (req,res)=>{ try{ const {seccion_id}=req.query; let q='SELECT * FROM paginas_info WHERE visible=true AND tenant_id=$1'; const params=[req.tenantId]; if(seccion_id){ q+=' AND (seccion_id=$2 OR seccion_id IS NULL)'; params.push(seccion_id); } q+=' ORDER BY orden'; const {rows}=await pool.query(q, params); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
-app.get('/api/paginas/:id', optionalAuth, async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM paginas_info WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); if(!rows[0] || (rows[0].visible===false && !esStaffReq(req))) return res.status(404).json({error:'No encontrada'}); res.json(rows[0]); }catch(e){ res.status(500).json({error:e.message}); } });
-app.post('/api/paginas', authPerm('config'), async (req,res)=>{ try{ const p=req.body; const {rows}=await pool.query('INSERT INTO paginas_info (titulo,slug,contenido,seccion_id,visible,orden,tenant_id) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *', [p.titulo,p.slug,p.contenido||'',p.seccion_id||null,p.visible!==false,p.orden||0, req.tenantId]); res.json(rows[0]); }catch(e){ res.status(500).json({error:e.message}); } });
-app.put('/api/paginas/:id', authPerm('config'), async (req,res)=>{ try{ const p=req.body; await pool.query('UPDATE paginas_info SET titulo=$1,slug=$2,contenido=$3,seccion_id=$4,visible=$5,orden=$6 WHERE id=$7 AND tenant_id=$8', [p.titulo,p.slug,p.contenido||'',p.seccion_id||null,p.visible!==false,p.orden||0,req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
-app.delete('/api/paginas/:id', authPerm('config'), async (req,res)=>{ try{ await pool.query('DELETE FROM paginas_info WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.get('/api/paginas', async (req,res)=>{ try{ const {seccion_id}=req.query; let q='SELECT * FROM paginas_info WHERE visible=true AND tenant_id=$1'; const params=[req.tenantId]; if(seccion_id){ q+=' AND (seccion_id=$2 OR seccion_id IS NULL)'; params.push(seccion_id); } q+=' ORDER BY orden'; const {rows}=await pool.query(q, params); res.json(rows); }catch(e){ fallo(res,e); } });
+app.get('/api/paginas/:id', optionalAuth, async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM paginas_info WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); if(!rows[0] || (rows[0].visible===false && !esStaffReq(req))) return res.status(404).json({error:'No encontrada'}); res.json(rows[0]); }catch(e){ fallo(res,e); } });
+app.post('/api/paginas', authPerm('config'), async (req,res)=>{ try{ const p=req.body; const {rows}=await pool.query('INSERT INTO paginas_info (titulo,slug,contenido,seccion_id,visible,orden,tenant_id) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *', [p.titulo,p.slug,p.contenido||'',p.seccion_id||null,p.visible!==false,p.orden||0, req.tenantId]); res.json(rows[0]); }catch(e){ fallo(res,e); } });
+app.put('/api/paginas/:id', authPerm('config'), async (req,res)=>{ try{ const p=req.body; await pool.query('UPDATE paginas_info SET titulo=$1,slug=$2,contenido=$3,seccion_id=$4,visible=$5,orden=$6 WHERE id=$7 AND tenant_id=$8', [p.titulo,p.slug,p.contenido||'',p.seccion_id||null,p.visible!==false,p.orden||0,req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ fallo(res,e); } });
+app.delete('/api/paginas/:id', authPerm('config'), async (req,res)=>{ try{ await pool.query('DELETE FROM paginas_info WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ fallo(res,e); } });
 
-app.get('/api/badges', async (req,res)=>{ try{ const {seccion_id}=req.query; let q='SELECT * FROM badges WHERE visible=true AND tenant_id=$1'; const params=[req.tenantId]; if(seccion_id){ q+=` AND (secciones_ids='' OR secciones_ids IS NULL OR ',' || secciones_ids || ',' LIKE $2)`; params.push(`%,${seccion_id},%`); } q+=' ORDER BY orden'; const {rows}=await pool.query(q, params); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
-app.get('/api/badges/all', authPerm('config'), async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM badges WHERE tenant_id=$1 ORDER BY orden', [req.tenantId]); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
-app.post('/api/badges', authPerm('config'), async (req,res)=>{ try{ const b=req.body; const {rows}=await pool.query('INSERT INTO badges (icono,texto,color,visible,secciones_ids,orden,tenant_id) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *', [b.icono||'',b.texto||'',b.color||'#2563eb',b.visible!==false,b.secciones_ids||'',b.orden||0, req.tenantId]); res.json(rows[0]); }catch(e){ res.status(500).json({error:e.message}); } });
-app.put('/api/badges/:id', authPerm('config'), async (req,res)=>{ try{ const b=req.body; await pool.query('UPDATE badges SET icono=$1,texto=$2,color=$3,visible=$4,secciones_ids=$5,orden=$6 WHERE id=$7 AND tenant_id=$8', [b.icono,b.texto,b.color,b.visible!==false,b.secciones_ids||'',b.orden||0,req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
-app.delete('/api/badges/:id', authPerm('config'), async (req,res)=>{ try{ await pool.query('DELETE FROM badges WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.get('/api/badges', async (req,res)=>{ try{ const {seccion_id}=req.query; let q='SELECT * FROM badges WHERE visible=true AND tenant_id=$1'; const params=[req.tenantId]; if(seccion_id){ q+=` AND (secciones_ids='' OR secciones_ids IS NULL OR ',' || secciones_ids || ',' LIKE $2)`; params.push(`%,${seccion_id},%`); } q+=' ORDER BY orden'; const {rows}=await pool.query(q, params); res.json(rows); }catch(e){ fallo(res,e); } });
+app.get('/api/badges/all', authPerm('config'), async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM badges WHERE tenant_id=$1 ORDER BY orden', [req.tenantId]); res.json(rows); }catch(e){ fallo(res,e); } });
+app.post('/api/badges', authPerm('config'), async (req,res)=>{ try{ const b=req.body; const {rows}=await pool.query('INSERT INTO badges (icono,texto,color,visible,secciones_ids,orden,tenant_id) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *', [b.icono||'',b.texto||'',b.color||'#2563eb',b.visible!==false,b.secciones_ids||'',b.orden||0, req.tenantId]); res.json(rows[0]); }catch(e){ fallo(res,e); } });
+app.put('/api/badges/:id', authPerm('config'), async (req,res)=>{ try{ const b=req.body; await pool.query('UPDATE badges SET icono=$1,texto=$2,color=$3,visible=$4,secciones_ids=$5,orden=$6 WHERE id=$7 AND tenant_id=$8', [b.icono,b.texto,b.color,b.visible!==false,b.secciones_ids||'',b.orden||0,req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ fallo(res,e); } });
+app.delete('/api/badges/:id', authPerm('config'), async (req,res)=>{ try{ await pool.query('DELETE FROM badges WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ fallo(res,e); } });
 
 // ENVIO CONFIG + CUSTOM
-app.get('/api/envio/config/:seccion_id', async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM config_envio WHERE seccion_id=$1 AND tenant_id=$2', [req.params.seccion_id, req.tenantId]); res.json(rows[0]||{metodo:'manual',costo_fijo:0,gratis_desde:0,cp_origen:'1888'}); }catch(e){ res.status(500).json({error:e.message}); } });
-app.put('/api/envio/config/:seccion_id', authPerm('config'), async (req,res)=>{ try{ const c=req.body; const {rows:sp}=await pool.query('SELECT 1 FROM secciones WHERE id=$1 AND tenant_id=$2', [req.params.seccion_id, req.tenantId]); if(!sp[0]) return res.status(404).json({error:'Sección no encontrada'}); await pool.query('INSERT INTO config_envio (seccion_id,metodo,costo_fijo,gratis_desde,zonas,cp_origen,tenant_id) VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT (seccion_id) DO UPDATE SET metodo=$2,costo_fijo=$3,gratis_desde=$4,zonas=$5,cp_origen=$6 WHERE config_envio.tenant_id=EXCLUDED.tenant_id', [req.params.seccion_id,c.metodo||'manual',c.costo_fijo||0,c.gratis_desde||0,JSON.stringify(c.zonas||[]),c.cp_origen||'1888', req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
-app.post('/api/envio/cotizar', async (req,res)=>{ try{ const {seccion_id,codigo_postal}=req.body; const {rows}=await pool.query('SELECT * FROM config_envio WHERE seccion_id=$1 AND tenant_id=$2', [seccion_id, req.tenantId]); const cfg=rows[0]||{metodo:'manual',costo_fijo:0}; res.json({costo:cfg.costo_fijo, metodo:cfg.metodo, gratis_desde:cfg.gratis_desde}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.get('/api/envio/config/:seccion_id', async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM config_envio WHERE seccion_id=$1 AND tenant_id=$2', [req.params.seccion_id, req.tenantId]); res.json(rows[0]||{metodo:'manual',costo_fijo:0,gratis_desde:0,cp_origen:'1888'}); }catch(e){ fallo(res,e); } });
+app.put('/api/envio/config/:seccion_id', authPerm('config'), async (req,res)=>{ try{ const c=req.body; const {rows:sp}=await pool.query('SELECT 1 FROM secciones WHERE id=$1 AND tenant_id=$2', [req.params.seccion_id, req.tenantId]); if(!sp[0]) return res.status(404).json({error:'Sección no encontrada'}); await pool.query('INSERT INTO config_envio (seccion_id,metodo,costo_fijo,gratis_desde,zonas,cp_origen,tenant_id) VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT (seccion_id) DO UPDATE SET metodo=$2,costo_fijo=$3,gratis_desde=$4,zonas=$5,cp_origen=$6 WHERE config_envio.tenant_id=EXCLUDED.tenant_id', [req.params.seccion_id,c.metodo||'manual',c.costo_fijo||0,c.gratis_desde||0,JSON.stringify(c.zonas||[]),c.cp_origen||'1888', req.tenantId]); res.json({ok:true}); }catch(e){ fallo(res,e); } });
+app.post('/api/envio/cotizar', async (req,res)=>{ try{ const {seccion_id,codigo_postal}=req.body; const {rows}=await pool.query('SELECT * FROM config_envio WHERE seccion_id=$1 AND tenant_id=$2', [seccion_id, req.tenantId]); const cfg=rows[0]||{metodo:'manual',costo_fijo:0}; res.json({costo:cfg.costo_fijo, metodo:cfg.metodo, gratis_desde:cfg.gratis_desde}); }catch(e){ fallo(res,e); } });
 
 // METODOS ENVIO CUSTOM - Uber, Didi, etc
-app.get('/api/envio/custom', async (req,res)=>{ try{ const {seccion_id}=req.query; let q='SELECT * FROM metodos_envio_custom WHERE activo=true AND tenant_id=$1'; const params=[req.tenantId]; if(seccion_id){ q+=' AND (seccion_id=$2 OR seccion_id IS NULL)'; params.push(seccion_id); } q+=' ORDER BY orden'; const {rows}=await pool.query(q, params); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
-app.get('/api/envio/custom/all', authPerm('config'), async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM metodos_envio_custom WHERE tenant_id=$1 ORDER BY seccion_id, orden', [req.tenantId]); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
-app.post('/api/envio/custom', authPerm('config'), async (req,res)=>{ try{ const m=req.body; const {rows}=await pool.query('INSERT INTO metodos_envio_custom (seccion_id,nombre,descripcion,precio,tipo,activo,gratis_desde,tiempo_estimado,icono,orden,tenant_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *', [m.seccion_id||null,m.nombre,m.descripcion||'',m.precio||0,m.tipo||'fijo',m.activo!==false,m.gratis_desde||0,m.tiempo_estimado||'',m.icono||'',m.orden||0, req.tenantId]); res.json(rows[0]); }catch(e){ res.status(500).json({error:e.message}); } });
-app.put('/api/envio/custom/:id', authPerm('config'), async (req,res)=>{ try{ const m=req.body; await pool.query('UPDATE metodos_envio_custom SET seccion_id=$1,nombre=$2,descripcion=$3,precio=$4,tipo=$5,activo=$6,gratis_desde=$7,tiempo_estimado=$8,icono=$9,orden=$10 WHERE id=$11 AND tenant_id=$12', [m.seccion_id||null,m.nombre,m.descripcion,m.precio,m.tipo,m.activo!==false,m.gratis_desde||0,m.tiempo_estimado||'',m.icono||'',m.orden||0,req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
-app.delete('/api/envio/custom/:id', authPerm('config'), async (req,res)=>{ try{ await pool.query('DELETE FROM metodos_envio_custom WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.get('/api/envio/custom', async (req,res)=>{ try{ const {seccion_id}=req.query; let q='SELECT * FROM metodos_envio_custom WHERE activo=true AND tenant_id=$1'; const params=[req.tenantId]; if(seccion_id){ q+=' AND (seccion_id=$2 OR seccion_id IS NULL)'; params.push(seccion_id); } q+=' ORDER BY orden'; const {rows}=await pool.query(q, params); res.json(rows); }catch(e){ fallo(res,e); } });
+app.get('/api/envio/custom/all', authPerm('config'), async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM metodos_envio_custom WHERE tenant_id=$1 ORDER BY seccion_id, orden', [req.tenantId]); res.json(rows); }catch(e){ fallo(res,e); } });
+app.post('/api/envio/custom', authPerm('config'), async (req,res)=>{ try{ const m=req.body; const {rows}=await pool.query('INSERT INTO metodos_envio_custom (seccion_id,nombre,descripcion,precio,tipo,activo,gratis_desde,tiempo_estimado,icono,orden,tenant_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *', [m.seccion_id||null,m.nombre,m.descripcion||'',m.precio||0,m.tipo||'fijo',m.activo!==false,m.gratis_desde||0,m.tiempo_estimado||'',m.icono||'',m.orden||0, req.tenantId]); res.json(rows[0]); }catch(e){ fallo(res,e); } });
+app.put('/api/envio/custom/:id', authPerm('config'), async (req,res)=>{ try{ const m=req.body; await pool.query('UPDATE metodos_envio_custom SET seccion_id=$1,nombre=$2,descripcion=$3,precio=$4,tipo=$5,activo=$6,gratis_desde=$7,tiempo_estimado=$8,icono=$9,orden=$10 WHERE id=$11 AND tenant_id=$12', [m.seccion_id||null,m.nombre,m.descripcion,m.precio,m.tipo,m.activo!==false,m.gratis_desde||0,m.tiempo_estimado||'',m.icono||'',m.orden||0,req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ fallo(res,e); } });
+app.delete('/api/envio/custom/:id', authPerm('config'), async (req,res)=>{ try{ await pool.query('DELETE FROM metodos_envio_custom WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ fallo(res,e); } });
 
 // BUSQUEDA GLOBAL con debounce ready
 app.get('/api/busqueda-global', optionalAuth, async (req,res)=>{
@@ -4439,27 +4547,27 @@ app.get('/api/busqueda-global', optionalAuth, async (req,res)=>{
       if(rows.length){ const hidePrice=sec.slug==='mayorista' && !req.user; resultados.push({seccion:sec, productos: hidePrice? rows.map(r=>({...r, precio_base:0, precio_oferta:0, precio_desde:null})) : rows}); }
     }
     res.json({resultados, total: resultados.reduce((s,r)=>s+r.productos.length,0)});
-  }catch(e){ res.status(500).json({error:e.message}); }
+  }catch(e){ fallo(res,e); }
 });
 
 // SLIDER, FAVORITOS, NOTIF STOCK
-app.get('/api/slider', async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM slider_banners WHERE activo=true AND tenant_id=$1 ORDER BY orden', [req.tenantId]); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
-app.get('/api/slider/all', authPerm('config'), async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM slider_banners WHERE tenant_id=$1 ORDER BY orden', [req.tenantId]); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
-app.post('/api/slider', authPerm('config'), sanearLinks(['url_destino']), async (req,res)=>{ try{ const {titulo,subtitulo,etiqueta,imagen,imagen_mobile,url_destino,orden,activo}=req.body; const {rows}=await pool.query('INSERT INTO slider_banners (titulo,subtitulo,etiqueta,imagen,url_destino,orden,activo,tenant_id,imagen_mobile) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *', [titulo||'',subtitulo||'',etiqueta||'',imagen||'',url_destino||'',orden||0,activo!==false, req.tenantId, imagen_mobile||'']); res.json(rows[0]); }catch(e){ res.status(500).json({error:e.message}); } });
-app.put('/api/slider/:id', authPerm('config'), sanearLinks(['url_destino']), async (req,res)=>{ try{ const {titulo,subtitulo,etiqueta,imagen,imagen_mobile,url_destino,orden,activo}=req.body; await pool.query('UPDATE slider_banners SET titulo=$1,subtitulo=$2,etiqueta=$3,imagen=$4,url_destino=$5,orden=$6,activo=$7,imagen_mobile=$10 WHERE id=$8 AND tenant_id=$9', [titulo,subtitulo||'',etiqueta||'',imagen,url_destino,orden,activo,req.params.id, req.tenantId, imagen_mobile||'']); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
-app.delete('/api/slider/:id', authPerm('config'), async (req,res)=>{ try{ await pool.query('DELETE FROM slider_banners WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.get('/api/slider', async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM slider_banners WHERE activo=true AND tenant_id=$1 ORDER BY orden', [req.tenantId]); res.json(rows); }catch(e){ fallo(res,e); } });
+app.get('/api/slider/all', authPerm('config'), async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM slider_banners WHERE tenant_id=$1 ORDER BY orden', [req.tenantId]); res.json(rows); }catch(e){ fallo(res,e); } });
+app.post('/api/slider', authPerm('config'), sanearLinks(['url_destino']), async (req,res)=>{ try{ const {titulo,subtitulo,etiqueta,imagen,imagen_mobile,url_destino,orden,activo}=req.body; const {rows}=await pool.query('INSERT INTO slider_banners (titulo,subtitulo,etiqueta,imagen,url_destino,orden,activo,tenant_id,imagen_mobile) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *', [titulo||'',subtitulo||'',etiqueta||'',imagen||'',url_destino||'',orden||0,activo!==false, req.tenantId, imagen_mobile||'']); res.json(rows[0]); }catch(e){ fallo(res,e); } });
+app.put('/api/slider/:id', authPerm('config'), sanearLinks(['url_destino']), async (req,res)=>{ try{ const {titulo,subtitulo,etiqueta,imagen,imagen_mobile,url_destino,orden,activo}=req.body; await pool.query('UPDATE slider_banners SET titulo=$1,subtitulo=$2,etiqueta=$3,imagen=$4,url_destino=$5,orden=$6,activo=$7,imagen_mobile=$10 WHERE id=$8 AND tenant_id=$9', [titulo,subtitulo||'',etiqueta||'',imagen,url_destino,orden,activo,req.params.id, req.tenantId, imagen_mobile||'']); res.json({ok:true}); }catch(e){ fallo(res,e); } });
+app.delete('/api/slider/:id', authPerm('config'), async (req,res)=>{ try{ await pool.query('DELETE FROM slider_banners WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ fallo(res,e); } });
 // ── BARRAS DE TEXTO DESLIZANTES ──
-app.get('/api/barras', async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM barras_texto WHERE activo=true AND tenant_id=$1 ORDER BY id', [req.tenantId]); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
-app.get('/api/barras/all', authPerm('config'), async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM barras_texto WHERE tenant_id=$1 ORDER BY id', [req.tenantId]); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
-app.post('/api/barras', authPerm('config'), async (req,res)=>{ try{ const b=req.body; const {rows}=await pool.query('INSERT INTO barras_texto (posicion,frases,estilo,color_fondo,color_texto,velocidad,activo,tenant_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *', [b.posicion||'top',b.frases||'',b.estilo||'negro',b.color_fondo||'',b.color_texto||'',b.velocidad||25,b.activo!==false, req.tenantId]); res.json(rows[0]); }catch(e){ res.status(500).json({error:e.message}); } });
-app.put('/api/barras/:id', authPerm('config'), async (req,res)=>{ try{ const b=req.body; await pool.query('UPDATE barras_texto SET posicion=$1,frases=$2,estilo=$3,color_fondo=$4,color_texto=$5,velocidad=$6,activo=$7 WHERE id=$8 AND tenant_id=$9', [b.posicion||'top',b.frases||'',b.estilo||'negro',b.color_fondo||'',b.color_texto||'',b.velocidad||25,b.activo!==false,req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
-app.delete('/api/barras/:id', authPerm('config'), async (req,res)=>{ try{ await pool.query('DELETE FROM barras_texto WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.get('/api/barras', async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM barras_texto WHERE activo=true AND tenant_id=$1 ORDER BY id', [req.tenantId]); res.json(rows); }catch(e){ fallo(res,e); } });
+app.get('/api/barras/all', authPerm('config'), async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM barras_texto WHERE tenant_id=$1 ORDER BY id', [req.tenantId]); res.json(rows); }catch(e){ fallo(res,e); } });
+app.post('/api/barras', authPerm('config'), async (req,res)=>{ try{ const b=req.body; const {rows}=await pool.query('INSERT INTO barras_texto (posicion,frases,estilo,color_fondo,color_texto,velocidad,activo,tenant_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *', [b.posicion||'top',b.frases||'',b.estilo||'negro',b.color_fondo||'',b.color_texto||'',b.velocidad||25,b.activo!==false, req.tenantId]); res.json(rows[0]); }catch(e){ fallo(res,e); } });
+app.put('/api/barras/:id', authPerm('config'), async (req,res)=>{ try{ const b=req.body; await pool.query('UPDATE barras_texto SET posicion=$1,frases=$2,estilo=$3,color_fondo=$4,color_texto=$5,velocidad=$6,activo=$7 WHERE id=$8 AND tenant_id=$9', [b.posicion||'top',b.frases||'',b.estilo||'negro',b.color_fondo||'',b.color_texto||'',b.velocidad||25,b.activo!==false,req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ fallo(res,e); } });
+app.delete('/api/barras/:id', authPerm('config'), async (req,res)=>{ try{ await pool.query('DELETE FROM barras_texto WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ fallo(res,e); } });
 // ── CONTACTOS (widget WhatsApp multi-agente) ──
-app.get('/api/contactos', async (req,res)=>{ try{ const {seccion_id}=req.query; let q='SELECT * FROM contactos WHERE activo=true AND tenant_id=$1'; const params=[req.tenantId]; if(seccion_id){ q+=' AND (seccion_id IS NULL OR seccion_id=$2)'; params.push(seccion_id); } q+=' ORDER BY orden, id'; const {rows}=await pool.query(q, params); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
-app.get('/api/contactos/all', authPerm('config'), async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM contactos WHERE tenant_id=$1 ORDER BY orden, id', [req.tenantId]); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
-app.post('/api/contactos', authPerm('config'), async (req,res)=>{ try{ const c=req.body; const {rows}=await pool.query('INSERT INTO contactos (nombre,rol,telefono,avatar,seccion_id,online,mensaje_default,orden,activo,tenant_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *', [c.nombre||'',c.rol||'',c.telefono||'',c.avatar||'',c.seccion_id||null,c.online!==false,c.mensaje_default||'',c.orden||0,c.activo!==false, req.tenantId]); res.json(rows[0]); }catch(e){ res.status(500).json({error:e.message}); } });
-app.put('/api/contactos/:id', authPerm('config'), async (req,res)=>{ try{ const c=req.body; await pool.query('UPDATE contactos SET nombre=$1,rol=$2,telefono=$3,avatar=$4,seccion_id=$5,online=$6,mensaje_default=$7,orden=$8,activo=$9 WHERE id=$10 AND tenant_id=$11', [c.nombre||'',c.rol||'',c.telefono||'',c.avatar||'',c.seccion_id||null,c.online!==false,c.mensaje_default||'',c.orden||0,c.activo!==false,req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
-app.delete('/api/contactos/:id', authPerm('config'), async (req,res)=>{ try{ await pool.query('DELETE FROM contactos WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.get('/api/contactos', async (req,res)=>{ try{ const {seccion_id}=req.query; let q='SELECT * FROM contactos WHERE activo=true AND tenant_id=$1'; const params=[req.tenantId]; if(seccion_id){ q+=' AND (seccion_id IS NULL OR seccion_id=$2)'; params.push(seccion_id); } q+=' ORDER BY orden, id'; const {rows}=await pool.query(q, params); res.json(rows); }catch(e){ fallo(res,e); } });
+app.get('/api/contactos/all', authPerm('config'), async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM contactos WHERE tenant_id=$1 ORDER BY orden, id', [req.tenantId]); res.json(rows); }catch(e){ fallo(res,e); } });
+app.post('/api/contactos', authPerm('config'), async (req,res)=>{ try{ const c=req.body; const {rows}=await pool.query('INSERT INTO contactos (nombre,rol,telefono,avatar,seccion_id,online,mensaje_default,orden,activo,tenant_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *', [c.nombre||'',c.rol||'',c.telefono||'',c.avatar||'',c.seccion_id||null,c.online!==false,c.mensaje_default||'',c.orden||0,c.activo!==false, req.tenantId]); res.json(rows[0]); }catch(e){ fallo(res,e); } });
+app.put('/api/contactos/:id', authPerm('config'), async (req,res)=>{ try{ const c=req.body; await pool.query('UPDATE contactos SET nombre=$1,rol=$2,telefono=$3,avatar=$4,seccion_id=$5,online=$6,mensaje_default=$7,orden=$8,activo=$9 WHERE id=$10 AND tenant_id=$11', [c.nombre||'',c.rol||'',c.telefono||'',c.avatar||'',c.seccion_id||null,c.online!==false,c.mensaje_default||'',c.orden||0,c.activo!==false,req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ fallo(res,e); } });
+app.delete('/api/contactos/:id', authPerm('config'), async (req,res)=>{ try{ await pool.query('DELETE FROM contactos WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ fallo(res,e); } });
 // ── LEADS (capturados por el widget de contacto) ──
 const formLimiter = rateLimit({ windowMs: 10*60*1000, max: 15, standardHeaders: true, legacyHeaders: false, message: { error: 'Demasiados envíos seguidos. Probá en unos minutos.' } });
 app.post('/api/leads', formLimiter, optionalAuth, async (req,res)=>{ try{ const l=req.body||{};
@@ -4468,28 +4576,28 @@ app.post('/api/leads', formLimiter, optionalAuth, async (req,res)=>{ try{ const 
   if(contactoId){ const {rows:c}=await pool.query('SELECT 1 FROM contactos WHERE id=$1 AND tenant_id=$2', [contactoId, req.tenantId]); if(!c[0]) contactoId=null; }
   const {rows}=await pool.query('INSERT INTO leads (nombre,telefono,contacto_id,contacto_nombre,usuario_id,tenant_id) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id', [String(l.nombre||'').slice(0,160), String(l.telefono||'').slice(0,40), contactoId, String(l.contacto_nombre||'').slice(0,120), req.user?.id||null, req.tenantId]);
   res.json(rows[0]); }catch(e){ res.status(500).json({error:'No se pudo guardar'}); } });
-app.get('/api/leads', authPerm('stats'), requiereFeature('marketing'), async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM leads WHERE tenant_id=$1 ORDER BY created_at DESC LIMIT 500', [req.tenantId]); res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
-app.put('/api/leads/:id', authPerm('stats'), requiereFeature('marketing'), async (req,res)=>{ try{ await pool.query('UPDATE leads SET contactado=$1 WHERE id=$2 AND tenant_id=$3', [req.body.contactado!==false, req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
-app.delete('/api/leads/:id', authPerm('stats'), requiereFeature('marketing'), async (req,res)=>{ try{ await pool.query('DELETE FROM leads WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.get('/api/leads', authPerm('stats'), requiereFeature('marketing'), async (req,res)=>{ try{ const {rows}=await pool.query('SELECT * FROM leads WHERE tenant_id=$1 ORDER BY created_at DESC LIMIT 500', [req.tenantId]); res.json(rows); }catch(e){ fallo(res,e); } });
+app.put('/api/leads/:id', authPerm('stats'), requiereFeature('marketing'), async (req,res)=>{ try{ await pool.query('UPDATE leads SET contactado=$1 WHERE id=$2 AND tenant_id=$3', [req.body.contactado!==false, req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ fallo(res,e); } });
+app.delete('/api/leads/:id', authPerm('stats'), requiereFeature('marketing'), async (req,res)=>{ try{ await pool.query('DELETE FROM leads WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ fallo(res,e); } });
 
-app.get('/api/favoritos', auth(), async (req,res)=>{ try{ const {rows}=await pool.query(`SELECT f.*, p.nombre, p.modelo, p.marca, p.imagen, p.precio_base, p.precio_oferta, p.moneda, p.stock, p.categoria, p.seccion_id, p.usa_variantes, p.envio_gratis, p.permitir_sin_stock, p.es_digital, p.es_preventa, p.preventa_descuento_pct, p.preventa_fecha, p.preventa_mostrar_fecha, p.preventa_cupo, p.preventa_reservado, p.visible, p.created_at AS creado, ${IMG2('p')} FROM favoritos f JOIN productos p ON f.producto_id=p.id AND p.tenant_id=f.tenant_id WHERE f.usuario_id=$1 AND f.tenant_id=$2 ORDER BY f.created_at DESC`, [req.user.id, req.tenantId]); if(esStaffReq(req)) return res.json(rows); res.json((await sinRestringidas(req, rows.filter(r=>r.visible!==false), { conservarConAcceso: true })).map(limpiarProducto)); }catch(e){ res.status(500).json({error:e.message}); } });
-app.post('/api/favoritos/:producto_id', auth(), async (req,res)=>{ try{ const b=await bloqueoProductoPublico(req, req.params.producto_id); if(b) return res.status(b.status).json({error:b.error}); await pool.query('INSERT INTO favoritos (usuario_id,producto_id,tenant_id) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING', [req.user.id, req.params.producto_id, req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
-app.delete('/api/favoritos/:producto_id', auth(), async (req,res)=>{ try{ await pool.query('DELETE FROM favoritos WHERE usuario_id=$1 AND producto_id=$2 AND tenant_id=$3', [req.user.id, req.params.producto_id, req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.get('/api/favoritos', auth(), async (req,res)=>{ try{ const {rows}=await pool.query(`SELECT f.*, p.nombre, p.modelo, p.marca, p.imagen, p.precio_base, p.precio_oferta, p.moneda, p.stock, p.categoria, p.seccion_id, p.usa_variantes, p.envio_gratis, p.permitir_sin_stock, p.es_digital, p.es_preventa, p.preventa_descuento_pct, p.preventa_fecha, p.preventa_mostrar_fecha, p.preventa_cupo, p.preventa_reservado, p.visible, p.created_at AS creado, ${IMG2('p')} FROM favoritos f JOIN productos p ON f.producto_id=p.id AND p.tenant_id=f.tenant_id WHERE f.usuario_id=$1 AND f.tenant_id=$2 ORDER BY f.created_at DESC`, [req.user.id, req.tenantId]); if(esStaffReq(req)) return res.json(rows); res.json((await sinRestringidas(req, rows.filter(r=>r.visible!==false), { conservarConAcceso: true })).map(limpiarProducto)); }catch(e){ fallo(res,e); } });
+app.post('/api/favoritos/:producto_id', auth(), async (req,res)=>{ try{ const b=await bloqueoProductoPublico(req, req.params.producto_id); if(b) return res.status(b.status).json({error:b.error}); await pool.query('INSERT INTO favoritos (usuario_id,producto_id,tenant_id) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING', [req.user.id, req.params.producto_id, req.tenantId]); res.json({ok:true}); }catch(e){ fallo(res,e); } });
+app.delete('/api/favoritos/:producto_id', auth(), async (req,res)=>{ try{ await pool.query('DELETE FROM favoritos WHERE usuario_id=$1 AND producto_id=$2 AND tenant_id=$3', [req.user.id, req.params.producto_id, req.tenantId]); res.json({ok:true}); }catch(e){ fallo(res,e); } });
 
-app.post('/api/notificar-stock', formLimiter, async (req,res)=>{ try{ const {producto_id,canal}=req.body||{}; const email=String((req.body||{}).email||'').trim().slice(0,200); const telefono=String((req.body||{}).telefono||'').trim().slice(0,50); if(!producto_id||(!email&&!telefono)) return res.status(400).json({error:'Falta email o teléfono'}); if(!(await productoDeTienda(pool, req.tenantId, producto_id))) return res.status(404).json({error:'Producto no encontrado'}); await pool.query('INSERT INTO notificaciones_stock (producto_id,email,telefono,canal,tenant_id) VALUES ($1,$2,$3,$4,$5)', [producto_id,email||'',telefono||'',['whatsapp','email'].includes(canal)?canal:(telefono?'whatsapp':'email'), req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+app.post('/api/notificar-stock', formLimiter, async (req,res)=>{ try{ const {producto_id,canal}=req.body||{}; const email=String((req.body||{}).email||'').trim().slice(0,200); const telefono=String((req.body||{}).telefono||'').trim().slice(0,50); if(!producto_id||(!email&&!telefono)) return res.status(400).json({error:'Falta email o teléfono'}); if(!(await productoDeTienda(pool, req.tenantId, producto_id))) return res.status(404).json({error:'Producto no encontrado'}); await pool.query('INSERT INTO notificaciones_stock (producto_id,email,telefono,canal,tenant_id) VALUES ($1,$2,$3,$4,$5)', [producto_id,email||'',telefono||'',['whatsapp','email'].includes(canal)?canal:(telefono?'whatsapp':'email'), req.tenantId]); res.json({ok:true}); }catch(e){ fallo(res,e); } });
 // Admin: ver quién espera stock de qué producto
 app.get('/api/notificaciones-stock', authPerm('productos'), async (req,res)=>{
   try{ const {rows}=await pool.query(`SELECT n.*, p.nombre, p.modelo, p.stock FROM notificaciones_stock n LEFT JOIN productos p ON n.producto_id=p.id AND p.tenant_id=n.tenant_id WHERE n.notificado=false AND n.tenant_id=$1 ORDER BY n.created_at DESC LIMIT 200`, [req.tenantId]); res.json(rows); }
-  catch(e){ res.status(500).json({error:e.message}); }
+  catch(e){ fallo(res,e); }
 });
 // Admin: marcar una notificación como avisada
 app.post('/api/notificaciones-stock/:id/avisar', authPerm('productos'), async (req,res)=>{
   try{ await pool.query('UPDATE notificaciones_stock SET notificado=true WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); res.json({ok:true}); }
-  catch(e){ res.status(500).json({error:e.message}); }
+  catch(e){ fallo(res,e); }
 });
 app.delete('/api/notificaciones-stock/:id', authPerm('productos'), async (req,res)=>{
   try{ await pool.query('DELETE FROM notificaciones_stock WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); res.json({ok:true}); }
-  catch(e){ res.status(500).json({error:e.message}); }
+  catch(e){ fallo(res,e); }
 });
 
 // CARRITOS ABANDONADOS
@@ -4540,7 +4648,7 @@ app.post('/api/carritos-abandonados', optionalAuth, rateLimit({ windowMs: 60*100
     }
     const {rows}=await pool.query('INSERT INTO carritos_abandonados (usuario_id,email,telefono,items,total,seccion_id,tenant_id) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *', [usuario_id||null,email||'',telefono||'',its,total||0,seccion_id||null, req.tenantId]);
     res.json(rows[0]);
-  }catch(e){ res.status(500).json({error:e.message}); }
+  }catch(e){ fallo(res,e); }
 });
 app.get('/api/carritos-abandonados', authPerm('stats'), requiereFeature('marketing'), async (req,res)=>{ try{
   const recup = req.query.estado==='recuperados';
@@ -4548,7 +4656,7 @@ app.get('/api/carritos-abandonados', authPerm('stats'), requiereFeature('marketi
     FROM carritos_abandonados c LEFT JOIN usuarios u ON c.usuario_id=u.id LEFT JOIN secciones s ON c.seccion_id=s.id
     WHERE c.tenant_id=$1 AND ${recup ? "c.recuperado=true AND COALESCE(c.recuperado_at, c.created_at) > NOW() - INTERVAL '60 days'" : 'c.recuperado=false'}
     ORDER BY ${recup ? 'COALESCE(c.recuperado_at, c.created_at)' : 'c.created_at'} DESC LIMIT 200`, [req.tenantId]);
-  res.json(rows); }catch(e){ res.status(500).json({error:e.message}); } });
+  res.json(rows); }catch(e){ fallo(res,e); } });
 // Números de los últimos 30 días
 app.get('/api/carritos-abandonados/stats', authPerm('stats'), requiereFeature('marketing'), async (req,res)=>{ try{
   const {rows}=await pool.query(`SELECT
@@ -4561,10 +4669,10 @@ app.get('/api/carritos-abandonados/stats', authPerm('stats'), requiereFeature('m
     FROM carritos_abandonados WHERE tenant_id=$1 AND GREATEST(created_at, COALESCE(recuperado_at, created_at)) > NOW() - INTERVAL '30 days'`, [req.tenantId]);
   const r=rows[0]||{};
   res.json({ ...r, monto_dejado:Number(r.monto_dejado)||0, monto_recuperado:Number(r.monto_recuperado)||0, tasa: r.dejados ? Math.round(r.recuperados*100/r.dejados) : 0 });
-}catch(e){ res.status(500).json({error:e.message}); } });
+}catch(e){ fallo(res,e); } });
 app.post('/api/carritos-abandonados/:id/contactado', authPerm('stats'), requiereFeature('marketing'), async (req,res)=>{ try{
   const {rows}=await pool.query('UPDATE carritos_abandonados SET contactado_at=NOW(), contactos=COALESCE(contactos,0)+1 WHERE id=$1 AND tenant_id=$2 RETURNING contactado_at, contactos', [req.params.id, req.tenantId]);
-  res.json(rows[0]||{}); }catch(e){ res.status(500).json({error:e.message}); } });
+  res.json(rows[0]||{}); }catch(e){ fallo(res,e); } });
 // Cupón personal y por tiempo para cerrar un carrito: un solo uso, solo para ese cliente, vence en X horas
 app.post('/api/carritos-abandonados/:id/cupon', authPerm('config'), requiereFeature('marketing'), async (req,res)=>{ try{
   const pct=Math.round(Number(req.body?.porcentaje)*10)/10, horas=Number(req.body?.horas);
@@ -4588,9 +4696,9 @@ app.post('/api/carritos-abandonados/:id/cupon', authPerm('config'), requiereFeat
   if(cs[0].cupon_codigo && String(cs[0].cupon_codigo).toUpperCase()!==codigo) await pool.query("UPDATE cupones SET activo=false WHERE tenant_id=$1 AND UPPER(codigo)=UPPER($2) AND origen='carrito' AND COALESCE(usos_actuales,0)=0", [req.tenantId, cs[0].cupon_codigo]).catch(()=>{});
   const {rows}=await pool.query("UPDATE carritos_abandonados SET cupon_codigo=$1, cupon_vence=NOW() + ($2 || ' hours')::interval WHERE id=$3 AND tenant_id=$4 RETURNING cupon_codigo, cupon_vence", [codigo, String(horas), req.params.id, req.tenantId]);
   res.json({ codigo, vence_at: rows[0]?.cupon_vence, porcentaje: pct, horas });
-}catch(e){ res.status(500).json({error:e.message}); } });
-app.post('/api/carritos-abandonados/:id/recuperar', authPerm('stats'), requiereFeature('marketing'), async (req,res)=>{ try{ await pool.query("UPDATE carritos_abandonados SET recuperado=true, recuperado_at=NOW(), recuperado_por='manual' WHERE id=$1 AND tenant_id=$2", [req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
-app.delete('/api/carritos-abandonados/:id', authPerm('stats'), requiereFeature('marketing'), async (req,res)=>{ try{ await pool.query('DELETE FROM carritos_abandonados WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ res.status(500).json({error:e.message}); } });
+}catch(e){ fallo(res,e); } });
+app.post('/api/carritos-abandonados/:id/recuperar', authPerm('stats'), requiereFeature('marketing'), async (req,res)=>{ try{ await pool.query("UPDATE carritos_abandonados SET recuperado=true, recuperado_at=NOW(), recuperado_por='manual' WHERE id=$1 AND tenant_id=$2", [req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ fallo(res,e); } });
+app.delete('/api/carritos-abandonados/:id', authPerm('stats'), requiereFeature('marketing'), async (req,res)=>{ try{ await pool.query('DELETE FROM carritos_abandonados WHERE id=$1 AND tenant_id=$2', [req.params.id, req.tenantId]); res.json({ok:true}); }catch(e){ fallo(res,e); } });
 
 // ANDREANI V4 - fix env vars CLIENTE vs NRO_CLIENTE
 const ANDREANI_API = process.env.ANDREANI_API || 'https://apis.andreani.com';
@@ -4624,13 +4732,24 @@ app.post('/api/andreani/cotizar', andreaniLimiter, async (req,res)=>{
     // Normalizar respuesta para frontend tipo imagen ejemplo
     // Andreani devuelve array de tarifas - lo mapeamos a domicilio y sucursal
     res.json({origen, destino: cp_destino, tarifas: data, domicilio: data?.tarifas?.[0]||data, sucursal: data?.tarifas?.[1]||null, raw:data});
-  }catch(e){ res.status(500).json({error:e.message}); }
+  }catch(e){ fallo(res,e); }
 });
-app.get('/api/andreani/sucursales', andreaniLimiter, async (req,res)=>{ try{ if(Number(req.tenantId)!==1) return res.status(403).json({error:'Andreani todavía no está disponible para esta tienda'}); const {cp}=req.query; const token=await andreaniLogin(); if(!token) return res.status(503).json({error:'Andreani no configurado'}); const r=await fetch(`${ANDREANI_API}/v1/sucursales?codigoPostal=${encodeURIComponent(String(cp||'').replace(/\D/g,'').slice(0,8))}`, {headers:{'x-authorization-token':token}, signal: AbortSignal.timeout(10000)}); res.json(await r.json()); }catch(e){ res.status(500).json({error:e.message}); } });
-app.post('/api/andreani/orden', authPerm('pedidos'), async (req,res)=>{ try{ if(Number(req.tenantId)!==1) return res.status(403).json({error:'Andreani todavía no está disponible para esta tienda'}); const token=await andreaniLogin(); if(!token) return res.status(503).json({error:'Andreani no configurado'}); const r=await fetch(`${ANDREANI_API}/v1/ordenes-de-envio`, {method:'POST', headers:{'x-authorization-token':token, 'Content-Type':'application/json'}, body:JSON.stringify(req.body)}); res.json(await r.json()); }catch(e){ res.status(500).json({error:e.message}); } });
-app.get('/api/andreani/tracking/:envio', auth(), async (req,res)=>{ try{ if(Number(req.tenantId)!==1) return res.status(403).json({error:'Andreani todavía no está disponible para esta tienda'}); if(!(await esStaffPedidos(req))){ const {rows:mio}=await pool.query('SELECT 1 FROM pedidos WHERE tenant_id=$1 AND usuario_id=$2 AND codigo_seguimiento=$3 LIMIT 1', [req.tenantId, req.user.id, String(req.params.envio)]); if(!mio[0]) return res.status(404).json({error:'No encontramos ese envío en tus pedidos'}); } const token=await andreaniLogin(); if(!token) return res.status(503).json({error:'Andreani no configurado'}); const r=await fetch(`${ANDREANI_API}/v1/envios/${encodeURIComponent(req.params.envio)}/trazas`, {headers:{'x-authorization-token':token}}); res.json(await r.json()); }catch(e){ res.status(500).json({error:e.message}); } });
-app.get('/api/andreani/etiqueta/:envio', authPerm('pedidos'), async (req,res)=>{ try{ if(Number(req.tenantId)!==1) return res.status(403).json({error:'Andreani todavía no está disponible para esta tienda'}); const token=await andreaniLogin(); if(!token) return res.status(503).json({error:'Andreani no configurado'}); const r=await fetch(`${ANDREANI_API}/v1/ordenes-de-envio/${encodeURIComponent(req.params.envio)}/etiquetas`, {headers:{'x-authorization-token':token, Accept:'application/pdf'}}); res.set('Content-Type','application/pdf'); const buffer=await r.arrayBuffer(); res.send(Buffer.from(buffer)); }catch(e){ res.status(500).json({error:e.message}); } });
+app.get('/api/andreani/sucursales', andreaniLimiter, async (req,res)=>{ try{ if(Number(req.tenantId)!==1) return res.status(403).json({error:'Andreani todavía no está disponible para esta tienda'}); const {cp}=req.query; const token=await andreaniLogin(); if(!token) return res.status(503).json({error:'Andreani no configurado'}); const r=await fetch(`${ANDREANI_API}/v1/sucursales?codigoPostal=${encodeURIComponent(String(cp||'').replace(/\D/g,'').slice(0,8))}`, {headers:{'x-authorization-token':token}, signal: AbortSignal.timeout(10000)}); res.json(await r.json()); }catch(e){ fallo(res,e); } });
+app.post('/api/andreani/orden', authPerm('pedidos'), async (req,res)=>{ try{ if(Number(req.tenantId)!==1) return res.status(403).json({error:'Andreani todavía no está disponible para esta tienda'}); const token=await andreaniLogin(); if(!token) return res.status(503).json({error:'Andreani no configurado'}); const r=await fetch(`${ANDREANI_API}/v1/ordenes-de-envio`, {method:'POST', headers:{'x-authorization-token':token, 'Content-Type':'application/json'}, body:JSON.stringify(req.body)}); res.json(await r.json()); }catch(e){ fallo(res,e); } });
+app.get('/api/andreani/tracking/:envio', auth(), async (req,res)=>{ try{ if(Number(req.tenantId)!==1) return res.status(403).json({error:'Andreani todavía no está disponible para esta tienda'}); if(!(await esStaffPedidos(req))){ const {rows:mio}=await pool.query('SELECT 1 FROM pedidos WHERE tenant_id=$1 AND usuario_id=$2 AND codigo_seguimiento=$3 LIMIT 1', [req.tenantId, req.user.id, String(req.params.envio)]); if(!mio[0]) return res.status(404).json({error:'No encontramos ese envío en tus pedidos'}); } const token=await andreaniLogin(); if(!token) return res.status(503).json({error:'Andreani no configurado'}); const r=await fetch(`${ANDREANI_API}/v1/envios/${encodeURIComponent(req.params.envio)}/trazas`, {headers:{'x-authorization-token':token}}); res.json(await r.json()); }catch(e){ fallo(res,e); } });
+app.get('/api/andreani/etiqueta/:envio', authPerm('pedidos'), async (req,res)=>{ try{ if(Number(req.tenantId)!==1) return res.status(403).json({error:'Andreani todavía no está disponible para esta tienda'}); const token=await andreaniLogin(); if(!token) return res.status(503).json({error:'Andreani no configurado'}); const r=await fetch(`${ANDREANI_API}/v1/ordenes-de-envio/${encodeURIComponent(req.params.envio)}/etiquetas`, {headers:{'x-authorization-token':token, Accept:'application/pdf'}}); res.set('Content-Type','application/pdf'); const buffer=await r.arrayBuffer(); res.send(Buffer.from(buffer)); }catch(e){ fallo(res,e); } });
 
 // START
 const PORT=process.env.PORT||3000;
+// Último manejador de errores: siempre JSON y sin rastros internos (antes Express devolvía una página con el código del servidor)
+// eslint-disable-next-line no-unused-vars
+app.use((err, req, res, next) => {
+  if (err && err.name === 'MulterError') {
+    const m = { LIMIT_FILE_SIZE: 'El archivo es demasiado pesado.', LIMIT_FILE_COUNT: 'Son demasiados archivos juntos.', LIMIT_UNEXPECTED_FILE: 'Archivo no esperado.' };
+    return res.status(400).json({ error: m[err.code] || 'No se pudo subir el archivo.' });
+  }
+  if (err && /^Solo im[aá]genes/i.test(err.message || '')) return res.status(400).json({ error: 'Solo se pueden subir imágenes.' });
+  if (err && (err.type === 'entity.parse.failed' || err.type === 'entity.too.large')) return res.status(400).json({ error: err.type === 'entity.too.large' ? 'Los datos enviados son demasiado grandes.' : 'Los datos enviados no tienen un formato válido.' });
+  fallo(res, err);
+});
 migrate().then(()=>{ app.listen(PORT, ()=>console.log(`🚀 V4 running on ${PORT}`)); tareasSeo().catch(e=>console.log('tareas SEO warn', e.message)); repararPresupuestosSinPrecio().catch(e=>console.log('reparar presupuestos warn', e.message)); setInterval(vigilarBot, Number(process.env.VIGILAR_BOT_MS) || 5*60*1000); if (process.env.HEALTHCHECK_URL) { pingExterno(); setInterval(pingExterno, 5*60*1000); } }).catch(e=>{ console.error('Migration failed', e); process.exit(1); });
