@@ -2490,6 +2490,31 @@ app.post('/api/productos/:id/duplicar', authPerm('productos'), async (req,res)=>
   }catch(e){ await client.query('ROLLBACK').catch(()=>{}); fallo(res,e); }
   finally{ client.release(); }
 });
+// Corrige el costo guardado en las ventas ya hechas de esos productos (cada venta guarda el costo del momento).
+// Se usa cuando el costo estaba mal cargado: así la ganancia de lo ya vendido queda bien.
+async function aplicarCostoAVentas(db, tenantId, lista){
+  let n = 0;
+  for(const { id, costo } of lista){
+    const pid = parseInt(id, 10), c = Number(costo);
+    if(!(pid > 0) || !(c > 0)) continue;
+    const r = await db.query('UPDATE pedido_items SET costo_unitario=$1 WHERE producto_id=$2 AND tenant_id=$3 AND COALESCE(costo_unitario,0)<>$1', [c, pid, tenantId]);
+    n += r.rowCount;
+  }
+  return n;
+}
+// Productos cuyo costo es igual o mayor que el precio al que se venden (casi siempre un costo mal cargado)
+app.get('/api/productos/costo-sospechoso', authPermAlguno(['productos','stats']), async (req,res)=>{
+  try{
+    const {rows}=await pool.query(`SELECT p.id, p.nombre, p.modelo, p.categoria, p.imagen, p.precio_base, p.precio_oferta, p.precio_original, p.seccion_id, s.nombre AS seccion_nombre,
+        (SELECT COUNT(*)::int FROM pedido_items pi WHERE pi.producto_id=p.id AND pi.tenant_id=p.tenant_id AND COALESCE(pi.costo_unitario,0)>=pi.precio_unitario AND pi.precio_unitario>0) AS ventas_afectadas
+      FROM productos p LEFT JOIN secciones s ON s.id=p.seccion_id
+      WHERE p.tenant_id=$1 AND COALESCE(p.usa_variantes,false)=false AND p.precio_original>0
+        AND p.precio_original >= (CASE WHEN p.precio_oferta>0 AND p.precio_oferta<p.precio_base THEN p.precio_oferta ELSE p.precio_base END)
+        AND p.precio_base>0
+      ORDER BY p.categoria, p.nombre LIMIT 500`, [req.tenantId]);
+    res.json(rows);
+  }catch(e){ fallo(res,e); }
+});
 app.put('/api/productos/:id', authPerm('productos'), async (req,res)=>{
   try{
     const p=req.body;
@@ -2509,7 +2534,9 @@ app.put('/api/productos/:id', authPerm('productos'), async (req,res)=>{
     // La galería manda: si el producto tiene fotos en la galería, la principal (primera) es la imagen visible.
     // Evita que un guardado con imagen vacía (en edición se oculta el recuadro viejo) borre la foto.
     await syncImagenPrincipal(req.params.id, req.tenantId);
-    res.json({ok:true});
+    const ventas_corregidas = p.aplicar_costo_ventas && Number(p.precio_original) > 0
+      ? await aplicarCostoAVentas(pool, req.tenantId, [{ id: req.params.id, costo: p.precio_original }]) : 0;
+    res.json({ok:true, ventas_corregidas});
   }catch(e){ fallo(res,e); }
 });
 app.delete('/api/productos/:id', authPerm('productos'), async (req,res)=>{
@@ -2584,7 +2611,7 @@ app.post('/api/productos/bulk', authPerm('productos'), async (req,res)=>{
       vals.push(id, t);
       await pool.query(`UPDATE productos SET ${sets.join(', ')} WHERE id=$${vals.length-1} AND tenant_id=$${vals.length}`, vals);
     };
-    let insertados=0, actualizados=0, saltados=0, errores=0, primerError=null;
+    let insertados=0, actualizados=0, saltados=0, errores=0, primerError=null; const costosNuevos=[];
     const falloFila = (e, p) => { errores++; if(!primerError) primerError = `${S(p && (p.nombre || p.modelo), 80)}: ${String(e.message || e).slice(0,140)}`; };
 
     // Productos de la sección que ya NO vienen en el Excel → sin stock u ocultos (se llama una vez al final)
@@ -2641,10 +2668,12 @@ app.post('/api/productos/bulk', authPerm('productos'), async (req,res)=>{
         const ex = await buscar(p);
         if(modo==='solo_nuevos'){ if(ex){ saltados++; continue; } await insertar(p); insertados++; continue; }
         // crear_actualizar (por defecto)
-        if(ex){ await actualizar(ex.id, p); await extra(ex.id, p); actualizados++; } else { await insertar(p); insertados++; }
+        if(ex){ await actualizar(ex.id, p); await extra(ex.id, p); actualizados++; if(Number(p.precio_original) > 0) costosNuevos.push({ id: ex.id, costo: p.precio_original }); } else { await insertar(p); insertados++; }
       }catch(e){ falloFila(e, p); }
     }
-    res.json({ok:true, modo: modo || 'crear_actualizar', insertados, actualizados, saltados, errores, primer_error: primerError || undefined});
+    // Opcional: el costo nuevo también corrige las ventas ya hechas de esos productos
+    const ventas_corregidas = req.body.aplicar_costo_ventas && costosNuevos.length ? await aplicarCostoAVentas(pool, t, costosNuevos) : 0;
+    res.json({ok:true, modo: modo || 'crear_actualizar', insertados, actualizados, saltados, errores, ventas_corregidas, primer_error: primerError || undefined});
   }catch(e){ fallo(res,e); }
 });
 app.delete('/api/categorias/:categoria', authPerm('productos'), async (req,res)=>{ try{ const {mover_a}=req.query; const destino = mover_a || 'Sin categoría'; const r=await pool.query('UPDATE productos SET categoria=$1 WHERE categoria=$2 AND tenant_id=$3', [destino, req.params.categoria, req.tenantId]); await pool.query('DELETE FROM categorias_meta WHERE categoria=$1 AND tenant_id=$2', [req.params.categoria, req.tenantId]).catch(()=>{}); res.json({ok:true, movidos:r.rowCount, destino}); }catch(e){ fallo(res,e); } });
