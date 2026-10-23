@@ -2585,7 +2585,7 @@ app.post('/api/productos/bulk', authPerm('productos'), async (req,res)=>{
       await pool.query(`UPDATE productos SET ${sets.join(', ')} WHERE id=$${vals.length-1} AND tenant_id=$${vals.length}`, vals);
     };
     let insertados=0, actualizados=0, saltados=0, errores=0, primerError=null;
-    const fallo = (e, p) => { errores++; if(!primerError) primerError = `${S(p && (p.nombre || p.modelo), 80)}: ${String(e.message || e).slice(0,140)}`; };
+    const falloFila = (e, p) => { errores++; if(!primerError) primerError = `${S(p && (p.nombre || p.modelo), 80)}: ${String(e.message || e).slice(0,140)}`; };
 
     // Productos de la sección que ya NO vienen en el Excel → sin stock u ocultos (se llama una vez al final)
     if(modo==='marcar_faltantes'){
@@ -2617,7 +2617,7 @@ app.post('/api/productos/bulk', authPerm('productos'), async (req,res)=>{
           const ex = await buscar(p);
           if(ex){ await pool.query('UPDATE productos SET categoria=$1 WHERE id=$2 AND tenant_id=$3', [cat, ex.id, t]); actualizados++; await pool.query('INSERT INTO categorias_meta (tenant_id, categoria, orden, visible) VALUES ($2,$1,0,true) ON CONFLICT DO NOTHING', [cat, t]).catch(()=>{}); }
           else saltados++;
-        }catch(e){ fallo(e, p); }
+        }catch(e){ falloFila(e, p); }
       }
       return res.json({ok:true, modo, actualizados, saltados, noEncontrados: saltados, errores, primer_error: primerError || undefined});
     }
@@ -2642,7 +2642,7 @@ app.post('/api/productos/bulk', authPerm('productos'), async (req,res)=>{
         if(modo==='solo_nuevos'){ if(ex){ saltados++; continue; } await insertar(p); insertados++; continue; }
         // crear_actualizar (por defecto)
         if(ex){ await actualizar(ex.id, p); await extra(ex.id, p); actualizados++; } else { await insertar(p); insertados++; }
-      }catch(e){ fallo(e, p); }
+      }catch(e){ falloFila(e, p); }
     }
     res.json({ok:true, modo: modo || 'crear_actualizar', insertados, actualizados, saltados, errores, primer_error: primerError || undefined});
   }catch(e){ fallo(res,e); }
