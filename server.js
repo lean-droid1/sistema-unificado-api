@@ -1063,7 +1063,10 @@ app.get('/api/planes-publicos', async (req,res)=>{
 });
 // Registro self-service (público, con rate limit): crea una tienda nueva con 15 días gratis Full + su admin
 const SLUGS_RESERVADOS = new Set(['www','api','admin','panel','app','mail','smtp','ftp','comerciapp','principal','tienda','tiendas','soporte','ayuda','help','login','static','assets','cdn','img','blog','status']);
+// Apagado hasta lanzar ComerciApp: se habilita con la variable REGISTRO_TIENDAS=1 en Railway
+const registroTiendasAbierto = () => process.env.REGISTRO_TIENDAS === '1';
 app.post('/api/registro-tienda', authLimiter, async (req,res)=>{
+  if(!registroTiendasAbierto()) return res.status(403).json({error:'La creación de tiendas nuevas todavía no está habilitada. Escribinos por WhatsApp para más información.'});
   let client;
   try{
     client=await pool.connect();
